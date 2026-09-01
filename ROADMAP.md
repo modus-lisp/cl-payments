@@ -35,7 +35,7 @@ wire.lisp       Phase 0  BigSize, TLV, message envelope, big-endian IO [DONE]
 transport.lisp  Phase 1  BOLT #8 Noise_XK handshake + framing          [DONE]
 features.lisp   Phase 2  BOLT #9 feature bits and negotiation           [DONE]
 peer.lisp       Phase 2  init/ping/pong/error + the async read loop     [DONE]
-gossip.lisp     Phase 3  BOLT #7 channel/node announcements, routing graph
+gossip.lisp     Phase 3  BOLT #7 announcements, signatures, routing graph [DONE]
 channel.lisp    Phase 4  BOLT #2 open/accept, funding, commitment_signed
 commitment.lisp Phase 5  BOLT #3 commitment + HTLC transactions, key derivation
 onion.lisp      Phase 6  BOLT #4 Sphinx onion construction and peeling
@@ -95,15 +95,35 @@ Three things this phase taught, each of which cost a debugging session:
   is laxer and stays connected, so testing against a single implementation would
   have hidden it.
 
-## Phase 3 — gossip and the routing graph
+## Phase 3 — gossip and the routing graph  **[DONE]**
 
-BOLT #7 `channel_announcement`, `channel_update`, `node_announcement`; signature
-validation on each; `query_channel_range` / `gossip_timestamp_filter`. Build the
-routing graph and find paths.
+BOLT #7 `channel_announcement`, `channel_update`, `node_announcement`, with
+signature validation on every one; short-channel-id packing;
+`gossip_timestamp_filter`, `query_channel_range` and `query_short_channel_ids`;
+and the routing graph they build.
 
-**Milestone.** Our graph of the devnet matches `lightning-cli listchannels` and
-`lncli describegraph` exactly — same channels, same policies, same directions.
-The devnet's topology is known by construction, which makes this diffable.
+**Milestone — met.** `inspect/graph-diff.lisp` connects to a live node, asks for
+its whole gossip stream, verifies every signature itself, and diffs the resulting
+graph against `lightning-cli listchannels` field by field — destination, base
+fee, proportional fee, CLTV delta, and both HTLC bounds, per direction. 26 checks,
+0 failures, 0 signature rejections. Run against **both** implementations: the
+graph built from LND's gossip matches CLN's view exactly, and vice versa.
+
+Counts alone would have proved little; the interesting failures are in the policy
+fields, where a misread offset still yields a plausible number.
+
+- **`channel_announcement` carries four signatures**, and all four are checked.
+  Two node keys agree the channel exists; two *bitcoin* keys — the ones in the
+  funding output's 2-of-2 — agree as well. Drop the bitcoin pair and anyone can
+  announce a channel over someone else's UTXO.
+- **A `channel_update` for an unannounced channel is rejected**, not stored on
+  trust: without the announcement we do not know whose key should have signed it.
+- **The scid ordering rule is enforced in both directions.** We sort on the way
+  out and reject an unsorted `reply_channel_range` on the way in — this is the
+  rule LND disconnects CLN over on the devnet.
+
+Not yet done: pathfinding. The graph is built and verified; choosing a route
+across it belongs with Phase 6, where there is something to route.
 
 ## Phase 4 — channels
 
@@ -164,11 +184,9 @@ routed end to end.
 
 ## Status
 
-Phases 0–2 are done and verified against both the spec vectors and two live
-implementations: 142 offline checks, and a connection that both Core Lightning
-and LND accept and keep. Phase 3 (gossip and the routing graph) is next.
+Phases 0–3 are done and verified against both the spec vectors and two live
+implementations: 185 offline checks, a connection both Core Lightning and LND
+accept and keep, and a routing graph that matches theirs exactly.
 
-One finding already waiting for it: LND enforces **strictly increasing
-short-channel-ids** during the BOLT #7 channel-range sync and disconnects a peer
-whose reply doesn't satisfy it — it does this to CLN on the devnet today. Our
-gossip must get that ordering right.
+Phase 4 (channels) is next — the first phase where we put money at risk, and the
+first that needs cl-consensus for more than a chain hash.

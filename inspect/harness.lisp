@@ -8,7 +8,8 @@
   (:use #:cl)
   (:local-nicknames (#:c #:cl-payments.crypto) (#:w #:cl-payments.wire)
                     (#:tp #:cl-payments.transport)
-                    (#:f #:cl-payments.features) (#:p #:cl-payments.peer))
+                    (#:f #:cl-payments.features) (#:p #:cl-payments.peer)
+                    (#:gs #:cl-payments.gossip))
   (:export #:check #:check-equal #:check-bytes #:check-signals
            #:with-gate #:run-all #:*failures* #:*checks*
            #:hx #:report))

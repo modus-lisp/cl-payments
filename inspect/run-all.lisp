@@ -15,6 +15,7 @@
   (run-wire-tests)
   (run-transport-tests)
   (run-peer-tests)
+  (run-gossip-tests)
   (let ((ok (report)))
     (unless ok (uiop:quit 1))
     ok))

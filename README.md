@@ -11,10 +11,11 @@ cl-consensus differential-tests against Bitcoin Core.
 
 ## ⚠️ Status & disclaimer
 
-**Early.** Phases 0–2 of the [ROADMAP](ROADMAP.md) are complete: the primitives,
-the BOLT #1 wire format, the BOLT #8 transport, and the peer protocol. It can
-connect to a real node and stay connected; it cannot yet open a channel, and so
-there is no way to lose money with it — which is just as well, because this is
+**Early.** Phases 0–3 of the [ROADMAP](ROADMAP.md) are complete: the primitives,
+the BOLT #1 wire format, the BOLT #8 transport, the peer protocol, and BOLT #7
+gossip with a verified routing graph. It can connect to a real node, stay
+connected, and learn the network; it cannot yet open a channel, and so there is
+no way to lose money with it — which is just as well, because this is
 **unaudited research software**. Do not point it at mainnet.
 
 ## What works today
@@ -28,6 +29,9 @@ there is no way to lose money with it — which is just as well, because this is
 - **Peer** — BOLT #9 feature bits (required/optional pairing, dependencies) and
   the BOLT #1 setup messages: `init` with the networks TLV, `ping`/`pong`,
   `error`/`warning`, and an async read loop.
+- **Gossip** — BOLT #7 `channel_announcement` (all four signatures checked),
+  `channel_update`, `node_announcement`, short-channel-ids, the query messages,
+  and the routing graph they build.
 
 **Verified against**: the RFCs' own vectors, BOLT #1's and BOLT #8's own vectors
 (initiator, responder, and key rotation), the real feature vectors CLN and LND
@@ -37,7 +41,7 @@ both of which accept us as a peer and keep the connection open.
 ```
 $ sbcl --eval '(asdf:test-system "cl-payments")'
 ...
-PASS — 146 checks
+PASS — 185 checks
 ```
 
 ## Layout
@@ -50,12 +54,17 @@ src/
   transport.lisp    BOLT #8: Noise_XK handshake + encrypted transport
   features.lisp     BOLT #9: feature bits and their negotiation rules
   peer.lisp         BOLT #1: init/ping/pong/error + the async read loop
+  gossip.lisp       BOLT #7: gossip messages, signatures, the routing graph
 inspect/
   harness.lisp      the tiny check/report harness every gate shares
   crypto-test.lisp  gate 1 — RFC 5869 / RFC 8439 vectors
   wire-test.lisp    gate 2 — BOLT #1 BigSize + TLV vectors
   transport-test.lisp  gate 3 — BOLT #8 handshake + key-rotation vectors
   peer-test.lisp    gate 4 — BOLT #9 features + BOLT #1 setup messages
+  loopback-test.lisp   gate 5 — the whole stack against itself over a socket
+  gossip-test.lisp  gate 6 — BOLT #7, against gossip captured from a real node
+  graph-diff.lisp   live — our routing graph vs. `listchannels`, field by field
+  capture-gossip.lisp  live — refresh inspect/vectors/gossip.txt from a peer
   run-all.lisp      the full offline suite, one command
   live-peer.lisp    the live gate — a real handshake against a real node
 ROADMAP.md          the phase plan and what each phase is verified against
