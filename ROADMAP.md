@@ -151,9 +151,25 @@ exactly one check. That failure mode is the worst one available here — the
 channel works, states get revoked, and the punishment branch that gives
 revocation its meaning is silently unspendable.
 
-### 4b — commitment transactions
+### 4b — commitment transactions  **[IN PROGRESS]**
 
-BOLT #3's transaction construction, against Appendix C's vectors.
+`src/commitment.lisp`: the funding 2-of-2, `to_local` and `to_remote` scripts,
+the obscured commitment number, fees, dust, BIP69 ordering, and the commitment
+transaction itself.
+
+**Verified** byte-for-byte against Appendix C's "simple commitment tx with no
+HTLCs". That single equality covers script construction, key sorting, the
+commitment number hidden across the locktime and sequence, the fee, the dust
+rule and output ordering — any one wrong and the bytes differ.
+
+This is where **cl-consensus becomes a dependency**. Everything before it was
+Lightning's own wire format and could stand alone; a commitment is a Bitcoin
+transaction, and the premise of the project is that we validate it with our own
+consensus engine rather than trusting that what we built is spendable.
+
+Still to do here: HTLC outputs (offered and received scripts, and the trimming
+rules), signing the commitment via BIP143, and the HTLC-timeout/success
+transactions. Anchor outputs after that.
 
 ### 4c — the BOLT #2 messages, and a live channel open
 

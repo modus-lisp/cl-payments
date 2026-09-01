@@ -10,7 +10,8 @@
                     (#:tp #:cl-payments.transport)
                     (#:f #:cl-payments.features) (#:p #:cl-payments.peer)
                     (#:gs #:cl-payments.gossip)
-                    (#:k #:cl-payments.keys))
+                    (#:k #:cl-payments.keys)
+                    (#:m #:cl-payments.commitment))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*
            #:hx #:report))
@@ -83,9 +84,18 @@
        (error (e) (%fail ,label (format nil "signalled ~a: ~a" (type-of e) e)) nil))))
 
 (defmacro with-gate ((name) &body body)
+  "Run a group of checks, CONTAINING any error to this gate.
+
+   Without the handler, one unexpected signal anywhere in a gate aborts the
+   entire suite and it reports NO totals at all — so a single regression hides
+   every other result, including the checks that would have told you what broke.
+   An error is itself a failure; it should be recorded and the remaining gates
+   should still run."
   `(let ((*gate* ,name))
      (format t "~&~%  ~a~%" ,name)
-     ,@body))
+     (handler-case (progn ,@body)
+       (error (e)
+         (%fail "gate aborted" (format nil "unexpected ~a: ~a" (type-of e) e))))))
 
 (defun report ()
   (format t "~&~%~a~%" (make-string 62 :initial-element #\=))

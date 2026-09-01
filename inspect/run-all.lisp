@@ -17,6 +17,7 @@
   (run-peer-tests)
   (run-gossip-tests)
   (run-keys-tests)
+  (run-commitment-tests)
   (let ((ok (report)))
     (unless ok (uiop:quit 1))
     ok))

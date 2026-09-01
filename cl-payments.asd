@@ -7,7 +7,15 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-transport")
+  ;; cl-consensus arrives here, at BOLT #3.  Everything before this point was
+  ;; Lightning's own wire format and could stand alone; a commitment transaction
+  ;; is a BITCOIN transaction, and the premise of this project is that we
+  ;; validate it with our own consensus engine rather than trusting that what we
+  ;; built is spendable.  It brings a UTXO store and an HTTP server along with
+  ;; it, which is more than this needs, but a second serializer would be a second
+  ;; thing to be subtly wrong.
+  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-transport"
+               "cl-consensus")
   :serial t
   :components
   ((:module "src"
@@ -19,7 +27,8 @@
      (:file "features")    ; BOLT #9: feature bits and their negotiation rules
      (:file "peer")        ; BOLT #1: init/ping/pong/error + the async read loop
      (:file "gossip")      ; BOLT #7: gossip messages, signatures, routing graph
-     (:file "keys"))))     ; BOLT #3: per-commitment key derivation + revocation
+     (:file "keys")        ; BOLT #3: per-commitment key derivation + revocation
+     (:file "commitment"))))  ; BOLT #3: commitment transactions and their scripts
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
 (defsystem "cl-payments/test"
@@ -37,5 +46,6 @@
                              (:file "peer-test")
                              (:file "gossip-test")
                              (:file "keys-test")
+                             (:file "commitment-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))
