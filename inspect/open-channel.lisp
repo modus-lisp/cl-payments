@@ -85,8 +85,20 @@
          (temp-id (c:octets (ironclad:random-data 32)))
          (inbox (make-hash-table))
          (lock (bt:make-lock)) (cv (bt:make-condition-variable)))
-    (multiple-value-bind (our-node-key our-node-point) (c:generate-key)
-      (declare (ignore our-node-point))
+    ;; A PERSISTENT node key, from CL_PAYMENTS_NODE's directory.  Generating one
+    ;; per run leaves an un-reclaimable channel behind every time: the channel is
+    ;; a 2-of-2 with a specific counterparty, so a node that forgets its key can
+    ;; never reconnect to a channel it opened.
+    (let ((our-node-key
+            (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
+              (if dir
+                  (secp:bytes-to-int
+                   (c:hex->bytes
+                    (string-trim '(#\Newline #\Space)
+                                 (uiop:read-file-string
+                                  (merge-pathnames "node.key"
+                                                   (uiop:ensure-directory-pathname dir))))))
+                  (c:generate-key)))))
       (let ((peer (p:connect host port node-id our-node-key
                              :chain-hashes (list (w:chain-hash))
                              :log nil :read-loop nil)))
@@ -115,6 +127,8 @@
                         (gethash type inbox)))
 
                  (step! "connected to ~a" (subseq (c:bytes->hex node-id) 0 16))
+                 (note "our node id ~a"
+                       (c:bytes->hex (c:compressed-pubkey (c:pubkey-of our-node-key))))
 
                  ;; ---- open_channel -------------------------------------------
                  (step! "open_channel: ~d sat, nothing pushed" funding-sat)
@@ -138,7 +152,13 @@
                     :htlc-basepoint (pub (our-keys-htlc keys))
                     :first-per-commitment-point
                     (k:per-commitment-point (our-keys-seed keys) k:+max-commitment-index+)
-                    :channel-flags 0))
+                    ;; channel_flags bit 0 is `announce_channel`.  With it CLEAR
+                    ;; the channel is PRIVATE: the peer never sends
+                    ;; announcement_signatures, no channel_announcement is ever
+                    ;; produced, and the channel stays invisible to the routing
+                    ;; graph — usable by its two ends and by nobody else.  A node
+                    ;; that wants to ROUTE must ask to be announced.
+                    :channel-flags 1))
                   nil)
 
                  ;; ---- accept_channel -----------------------------------------

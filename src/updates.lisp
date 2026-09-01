@@ -35,7 +35,7 @@
   (:export
    #:+msg-update-add-htlc+ #:+msg-update-fulfill-htlc+ #:+msg-update-fail-htlc+
    #:+msg-commitment-signed+ #:+msg-revoke-and-ack+ #:+msg-update-fee+
-   #:+msg-update-fail-malformed-htlc+
+   #:+msg-update-fail-malformed-htlc+ #:+msg-channel-reestablish+
    #:+onion-packet-size+
    ;; messages
    #:update-add-htlc #:make-update-add-htlc #:encode-update-add-htlc #:parse-update-add-htlc
@@ -54,6 +54,11 @@
    #:raa-channel-id #:raa-per-commitment-secret #:raa-next-per-commitment-point
    #:update-fee #:make-update-fee #:encode-update-fee #:parse-update-fee
    #:uf-channel-id #:uf-feerate-per-kw
+   #:channel-reestablish #:make-channel-reestablish
+   #:encode-channel-reestablish #:parse-channel-reestablish
+   #:cre-channel-id #:cre-next-commitment-number #:cre-next-revocation-number
+   #:cre-your-last-per-commitment-secret #:cre-my-current-per-commitment-point
+   #:reestablish-for
    ;; state machine
    #:channel-state #:make-channel-state
    #:cst-local-commitment-number #:cst-remote-commitment-number
@@ -73,6 +78,7 @@
 (defconstant +msg-revoke-and-ack+ 133)
 (defconstant +msg-update-fee+ 134)
 (defconstant +msg-update-fail-malformed-htlc+ 135)
+(defconstant +msg-channel-reestablish+ 136)
 
 (defconstant +onion-packet-size+ 1366
   "BOLT #4's onion is a FIXED 1366 bytes regardless of route length — a shorter
@@ -341,3 +347,88 @@
    revoking first would leave us holding no signed state at all."
   (incf (cst-local-commitment-number state))
   state)
+
+
+;;; ----------------------------------------------------------------------------
+;;; channel_reestablish (136)
+;;;
+;;; Sent by BOTH sides immediately after reconnecting, before anything else on
+;;; the channel.  A Lightning connection is expected to drop — nodes restart,
+;;; networks blink — and when it comes back the two ends may disagree about how
+;;; far the channel got: a `commitment_signed` or a `revoke_and_ack` may have
+;;; been sent but never received.
+;;;
+;;; The message states, in effect, "here is what I am still waiting for", and the
+;;; two numbers are what let each side work out whether it must retransmit:
+;;;
+;;;   next_commitment_number   the commitment number of the next
+;;;                            `commitment_signed` I expect FROM YOU
+;;;   next_revocation_number   the number of the next `revoke_and_ack` I expect
+;;;
+;;; `your_last_per_commitment_secret` is the proof half.  Echoing back the last
+;;; secret the peer gave us demonstrates we really are the node that held this
+;;; channel — and a peer that finds we have a LATER secret than it thinks it
+;;; released knows its own state is stale and that continuing would risk
+;;; broadcasting a revoked commitment.
+;;;
+;;; Not answering at all is what cl-payments did before this existed: LND
+;;; tolerates the silence and stays connected, but the channel is never resynced,
+;;; so it is permanently unusable.
+;;; ----------------------------------------------------------------------------
+
+(defstruct (channel-reestablish (:conc-name cre-))
+  channel-id
+  next-commitment-number
+  next-revocation-number
+  your-last-per-commitment-secret
+  my-current-per-commitment-point
+  (tlvs nil))
+
+(defun encode-channel-reestablish (r)
+  (let ((wr (w:make-writer)))
+    (w:w-bytes wr (cre-channel-id r))
+    (w:w-u64 wr (cre-next-commitment-number r))
+    (w:w-u64 wr (cre-next-revocation-number r))
+    (w:w-bytes wr (cre-your-last-per-commitment-secret r))
+    (w:w-point wr (cre-my-current-per-commitment-point r))
+    (w:encode-message +msg-channel-reestablish+ (w:writer-bytes wr))))
+
+(defun parse-channel-reestablish (payload)
+  (handler-case
+      (let ((r (w:make-reader payload)))
+        (make-channel-reestablish
+         :channel-id (w:r-bytes r 32)
+         :next-commitment-number (w:r-u64 r)
+         :next-revocation-number (w:r-u64 r)
+         :your-last-per-commitment-secret (w:r-bytes r 32)
+         :my-current-per-commitment-point (w:r-point r)
+         :tlvs (unless (w:reader-eof-p r)
+                 (handler-case (w:r-tlv-stream r) (error () nil)))))
+    (error (e) (error 'update-error
+                      :detail (format nil "bad channel_reestablish: ~a" e)))))
+
+(defun reestablish-for (state)
+  "Build our `channel_reestablish` from the channel's current state.
+
+   Commitment numbers here count UP from 0, and the per-commitment SECRETS count
+   DOWN from 2^48-1, so the index conversion is not decoration — getting it
+   backwards hands the peer a secret for a state that was never revoked, which
+   is indistinguishable from leaking a live key."
+  (let* ((next-rev (cst-remote-commitment-number state))
+         (last-secret
+           ;; With nothing revoked yet the spec requires all zeroes rather than
+           ;; some arbitrary value: there IS no previous secret to prove.
+           (if (zerop next-rev)
+               (c:zeros 32)
+               (or (k:shachain-lookup (cst-revocations state)
+                                      (- k:+max-commitment-index+ (1- next-rev)))
+                   (c:zeros 32)))))
+    (make-channel-reestablish
+     :channel-id (cst-channel-id state)
+     :next-commitment-number (cst-local-commitment-number state)
+     :next-revocation-number next-rev
+     :your-last-per-commitment-secret last-secret
+     :my-current-per-commitment-point
+     (k:per-commitment-point (cst-seed state)
+                             (- k:+max-commitment-index+
+                                (cst-local-commitment-number state))))))

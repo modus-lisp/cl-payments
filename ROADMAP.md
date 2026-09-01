@@ -225,6 +225,26 @@ Two things the live run taught:
 `./mine.sh 6`, and have CLN report it as `CHANNELD_NORMAL`. Then the same
 against lnd1.
 
+### 4c-bis — LND interop and reconnection  **[DONE]**
+
+The milestone's "then the same against lnd1" clause. LND accepted our commitment
+signature first try, with parameters materially different from CLN's —
+`to_self_delay` 144 vs 6, `dust_limit` 354 vs 546 — which the commitment builder
+handled without change.
+
+`channel_reestablish` (type 136) is implemented. LND sends it on every reconnect
+to a channel; before this, cl-payments simply never answered. LND tolerates the
+silence and stays connected, but the channel is never resynced and so is
+permanently unusable. Exchanged successfully against LND: its
+`next_commitment_number 1`, `next_revocation_number 0`, secret all zeroes,
+exactly as the spec prescribes for a channel that has revoked nothing.
+
+**LND is a leaf, not a hop, and that is a config decision with a reason.** With
+graph sync on, LND disconnects CLN over short-channel-id ordering and every link
+flaps; with it off, LND never relays gossip and routes die at the LND hop. As a
+leaf with sync off the links are stable, which is what BOLT #8/#1/#2 interop
+needs.
+
 ### 4d — the HTLC lifecycle  **[PARTIAL]**
 
 `src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
