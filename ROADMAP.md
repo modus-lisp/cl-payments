@@ -151,7 +151,7 @@ exactly one check. That failure mode is the worst one available here — the
 channel works, states get revoked, and the punishment branch that gives
 revocation its meaning is silently unspendable.
 
-### 4b — commitment transactions  **[IN PROGRESS]**
+### 4b — commitment transactions  **[DONE]**
 
 `src/commitment.lisp`: the funding 2-of-2, `to_local` and `to_remote` scripts,
 the obscured commitment number, fees, dust, BIP69 ordering, and the commitment
@@ -167,9 +167,25 @@ Lightning's own wire format and could stand alone; a commitment is a Bitcoin
 transaction, and the premise of the project is that we validate it with our own
 consensus engine rather than trusting that what we built is spendable.
 
-Still to do here: HTLC outputs (offered and received scripts, and the trimming
-rules), signing the commitment via BIP143, and the HTLC-timeout/success
-transactions. Anchor outputs after that.
+HTLC outputs, trimming and signing are done too. Reproduced from Appendix C:
+the offered and received HTLC scripts, the five-HTLC commitment transaction
+(seven outputs, correct BIP69 order), and `local_signature` itself — which
+exercises BIP143 (with the funding amount in the digest) and RFC6979
+deterministic nonces at once, since a wrong digest or nonce gives a different
+but still valid signature.
+
+Trimming is not "amount below the dust limit". It is the amount **minus the fee
+of the second-stage transaction** that would claim it, and offered and received
+HTLCs use different weights (663 vs 703) — so the same amount can be trimmed in
+one direction and not the other.
+
+`build-commitment` now also returns the surviving HTLCs in **output order**.
+`commitment_signed` carries one signature per HTLC in that order, and two offered
+HTLCs with the same rounded amount and payment hash produce byte-identical
+outputs — so the order is only recoverable from the CLTV tiebreak, and the caller
+cannot reconstruct it.
+
+Still to do: the HTLC-timeout/success transactions, and anchor outputs.
 
 ### 4c — the BOLT #2 messages, and a live channel open
 

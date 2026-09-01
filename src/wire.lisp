@@ -40,7 +40,6 @@
    #:encode-message #:decode-message #:+max-message-size+
    ;; conditions
    #:wire-error #:truncated-error #:non-minimal-error #:tlv-order-error
-   #:unknown-even-type-error
    ;; network params
    #:*network* #:select-network #:net-name #:net-chain-hash #:net-port
    #:chain-hash))
@@ -72,11 +71,6 @@
   ((type :initarg :type :reader tlv-order-type))
   (:report (lambda (c s) (format s "TLV record type ~d out of order or duplicated"
                                  (tlv-order-type c)))))
-
-(define-condition unknown-even-type-error (wire-error)
-  ((type :initarg :type :reader unknown-even-type))
-  (:report (lambda (c s) (format s "unknown even TLV record type ~d (must fail)"
-                                 (unknown-even-type c)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Writer

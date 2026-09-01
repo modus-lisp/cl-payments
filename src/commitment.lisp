@@ -32,7 +32,7 @@
   (:use #:cl)
   (:local-nicknames (#:c #:cl-payments.crypto) (#:k #:cl-payments.keys)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
-                    (#:secp #:secp256k1-fast))
+                    (#:bs #:cl-consensus.script) (#:secp #:secp256k1-fast))
   (:nicknames #:ln-commitment)
   (:export
    ;; scripts
@@ -44,9 +44,13 @@
    #:commitment-locktime #:commitment-sequence
    ;; fees and weights
    #:+commit-weight-base+ #:+htlc-output-weight+
-   #:commitment-fee #:dust-p
+   #:+htlc-timeout-weight+ #:+htlc-success-weight+
+   #:commitment-fee #:dust-p #:htlc-trimmed-p
+   ;; HTLCs
+   #:htlc #:make-htlc #:htlc-direction #:htlc-amount-msat #:htlc-expiry
+   #:htlc-payment-hash #:offered-htlc-script #:received-htlc-script
    ;; the transaction
-   #:build-commitment #:commitment-tx #:commitment-outputs
+   #:build-commitment #:sign-commitment #:commitment-sighash
    #:commitment-error))
 
 (in-package #:cl-payments.commitment)
@@ -171,12 +175,34 @@
   "Weight of a commitment transaction with no HTLC outputs (BOLT #3 Appendix A).")
 (defconstant +htlc-output-weight+ 172
   "Each untrimmed HTLC output adds this much weight.")
+(defconstant +htlc-timeout-weight+ 663
+  "Weight of the second-stage HTLC-timeout transaction (no option_anchors).")
+(defconstant +htlc-success-weight+ 703
+  "Weight of the second-stage HTLC-success transaction (no option_anchors).")
 
 (defun commitment-fee (feerate-per-kw num-htlcs)
   "Fee in satoshis.  Note `per_kw` is per 1000 WEIGHT units, not per 1000 bytes,
    and the result is truncated."
   (floor (* feerate-per-kw (+ +commit-weight-base+ (* num-htlcs +htlc-output-weight+)))
          1000))
+
+(defun htlc-trimmed-p (amount-msat direction feerate-per-kw dust-limit)
+  "Whether an HTLC output is dropped from the commitment.
+
+   The test is NOT the HTLC amount against the dust limit.  It is the amount
+   MINUS THE FEE OF THE SECOND-STAGE TRANSACTION that would claim it — an HTLC
+   worth slightly more than dust is still worthless if redeeming it costs more
+   than it is worth.  Offered and received HTLCs use different weights (663 vs
+   703), so the same amount can be trimmed in one direction and not the other,
+   and the two sides can hold different dust limits.
+
+   Both parties must trim EXACTLY the same set: a disagreement means different
+   transactions, and neither side's signature validates against the other's."
+  (let* ((weight (ecase direction
+                   (:offered +htlc-timeout-weight+)
+                   (:received +htlc-success-weight+)))
+         (second-stage-fee (floor (* feerate-per-kw weight) 1000)))
+    (< (- (floor amount-msat 1000) second-stage-fee) dust-limit)))
 
 (defun dust-p (amount-sat dust-limit)
   "An output below the dust limit is not created at all — its value goes to fees
@@ -185,32 +211,138 @@
   (< amount-sat dust-limit))
 
 ;;; ----------------------------------------------------------------------------
+;;; HTLC output scripts
+;;;
+;;; Both scripts have the same three-way shape: the counterparty sweeps it
+;;; immediately with the revocation key if this commitment was revoked; otherwise
+;;; one party takes it with the preimage and the other after a timeout.  Which
+;;; party gets which branch is the only difference, and it is the difference
+;;; between offered and received.
+;;;
+;;; The `OP_SIZE 32 OP_EQUAL` test is what distinguishes the two spending paths
+;;; without a separate flag: a preimage is exactly 32 bytes, so pushing anything
+;;; else selects the other branch.
+;;; ----------------------------------------------------------------------------
+
+(defstruct htlc
+  direction          ; :offered (we pay) or :received (we are paid)
+  amount-msat
+  expiry             ; cltv_expiry
+  payment-hash)      ; 32 bytes
+
+(defun %ripemd160 (bytes) (ironclad:digest-sequence :ripemd-160 (c:octets bytes)))
+
+(defun offered-htlc-script (revocation-pubkey remote-htlc-pubkey local-htlc-pubkey
+                            payment-hash)
+  "An HTLC WE offered: the remote takes it with the preimage, we reclaim it
+   through a timelocked HTLC-timeout transaction."
+  (bytes (vector #x76 #xa9)                                   ; OP_DUP OP_HASH160
+         (script-push (%ripemd160 (c:sha256 (c:octets revocation-pubkey))))
+         (vector #x87 #x63)                                   ; OP_EQUAL OP_IF
+         (vector #xac)                                        ;   OP_CHECKSIG
+         (vector #x67)                                        ; OP_ELSE
+         (script-push (c:octets remote-htlc-pubkey))
+         (vector #x7c #x82 #x01 #x20 #x87)                    ; OP_SWAP OP_SIZE 32 OP_EQUAL
+         (vector #x64)                                        ; OP_NOTIF
+         (vector #x75 #x52 #x7c)                              ;   OP_DROP 2 OP_SWAP
+         (script-push (c:octets local-htlc-pubkey))
+         (vector #x52 #xae)                                   ;   2 OP_CHECKMULTISIG
+         (vector #x67)                                        ; OP_ELSE
+         (vector #xa9)                                        ;   OP_HASH160
+         (script-push (%ripemd160 payment-hash))
+         (vector #x88 #xac)                                   ;   OP_EQUALVERIFY OP_CHECKSIG
+         (vector #x68 #x68)))                                 ; OP_ENDIF OP_ENDIF
+
+(defun received-htlc-script (revocation-pubkey remote-htlc-pubkey local-htlc-pubkey
+                             payment-hash cltv-expiry)
+  "An HTLC we RECEIVED: we take it with the preimage via an HTLC-success
+   transaction, the remote reclaims it after `cltv_expiry`."
+  (bytes (vector #x76 #xa9)                                   ; OP_DUP OP_HASH160
+         (script-push (%ripemd160 (c:sha256 (c:octets revocation-pubkey))))
+         (vector #x87 #x63)                                   ; OP_EQUAL OP_IF
+         (vector #xac)                                        ;   OP_CHECKSIG
+         (vector #x67)                                        ; OP_ELSE
+         (script-push (c:octets remote-htlc-pubkey))
+         (vector #x7c #x82 #x01 #x20 #x87)                    ; OP_SWAP OP_SIZE 32 OP_EQUAL
+         (vector #x63)                                        ; OP_IF
+         (vector #xa9)                                        ;   OP_HASH160
+         (script-push (%ripemd160 payment-hash))
+         (vector #x88)                                        ;   OP_EQUALVERIFY
+         (vector #x52 #x7c)                                   ;   2 OP_SWAP
+         (script-push (c:octets local-htlc-pubkey))
+         (vector #x52 #xae)                                   ;   2 OP_CHECKMULTISIG
+         (vector #x67)                                        ; OP_ELSE
+         (vector #x75)                                        ;   OP_DROP
+         (script-number cltv-expiry)
+         (vector #xb1 #x75)                                   ;   OP_CLTV OP_DROP
+         (vector #xac)                                        ;   OP_CHECKSIG
+         (vector #x68 #x68)))                                 ; OP_ENDIF OP_ENDIF
+
+;;; ----------------------------------------------------------------------------
 ;;; The transaction
 ;;; ----------------------------------------------------------------------------
 
-(defun %bip69-sort (outputs)
-  "BIP69: ascending by amount, then by scriptPubKey.  A canonical order is what
-   lets both parties build byte-identical transactions independently."
-  (sort (copy-list outputs)
-        (lambda (a b)
-          (let ((va (btx:txout-value a)) (vb (btx:txout-value b)))
-            (if (/= va vb)
-                (< va vb)
-                (string< (c:bytes->hex (btx:txout-script a))
-                         (c:bytes->hex (btx:txout-script b))))))))
+(defun %bip69-sort (entries)
+  "BOLT #3 output ordering: by value, then scriptPubKey, then — for HTLC outputs
+   only — by increasing `cltv_expiry`.
+
+   The CLTV tiebreak exists for a specific case: two offered HTLCs with the same
+   rounded amount and the same payment hash produce IDENTICAL outputs even though
+   their expiries differ.  The peers exchange `htlc_signatures` in this order and
+   the second-stage transactions are not identical, so without an agreed tiebreak
+   they would attach the signatures to the wrong HTLCs.
+
+   ENTRIES are (txout . cltv-or-nil); the cltv is carried alongside because it
+   does not appear in the output itself."
+  (sort (copy-list entries)
+        (lambda (x y)
+          (let* ((a (car x)) (b (car y))
+                 (va (btx:txout-value a)) (vb (btx:txout-value b)))
+            (cond
+              ((/= va vb) (< va vb))
+              ((not (equalp (btx:txout-script a) (btx:txout-script b)))
+               ;; memcmp over the common prefix; if one is a prefix of the
+               ;; other, the shorter sorts first.
+               (let* ((sa (btx:txout-script a)) (sb (btx:txout-script b))
+                      (n (min (length sa) (length sb)))
+                      (diff (loop for i from 0 below n
+                                  when (/= (aref sa i) (aref sb i)) return i)))
+                 (if diff
+                     (< (aref sa diff) (aref sb diff))
+                     (< (length sa) (length sb)))))
+              ;; Identical outputs: only an HTLC can reach here, and then the
+              ;; expiry decides.  Without this the two peers can order such a
+              ;; pair differently, attach each other's htlc_signatures to the
+              ;; wrong HTLC, and neither signature verifies.
+              ((and (cdr x) (cdr y)) (< (car (cdr x)) (car (cdr y))))
+              (t nil))))))
 
 (defun build-commitment (&key funding-txid funding-output-index funding-amount-sat
                               commitment-number obscuring
                               to-local-msat to-remote-msat
                               local-feerate-per-kw dust-limit-sat
                               revocation-pubkey to-self-delay delayed-pubkey
-                              remote-pubkey (opener :local))
-  "Build one commitment transaction.  Returns (values tx outputs-description).
+                              remote-pubkey (opener :local)
+                              htlcs local-htlc-pubkey remote-htlc-pubkey)
+  "Build one commitment transaction.  Returns (values tx description htlc-order).
+
+   HTLC-ORDER is the surviving HTLCs in OUTPUT order, which the caller needs and
+   cannot recompute: `commitment_signed` carries one signature per HTLC in the
+   order of the HTLC outputs, and two offered HTLCs with the same rounded amount
+   and payment hash produce IDENTICAL outputs — so the order is only recoverable
+   from the CLTV tiebreak applied here.
 
    OPENER says whose balance the fee comes out of.  The fee is NOT split: the
    channel opener pays all of it, for the life of the channel."
   (let* ((obscured (obscured-commitment-number commitment-number obscuring))
-         (fee (commitment-fee local-feerate-per-kw 0))
+         ;; Trim FIRST: a trimmed HTLC contributes no output and therefore no
+         ;; weight, so the fee depends on how many survive.
+         (live-htlcs (remove-if (lambda (h)
+                                  (htlc-trimmed-p (htlc-amount-msat h)
+                                                  (htlc-direction h)
+                                                  local-feerate-per-kw dust-limit-sat))
+                                htlcs))
+         (fee (commitment-fee local-feerate-per-kw (length live-htlcs)))
          (to-local-sat (floor to-local-msat 1000))
          (to-remote-sat (floor to-remote-msat 1000)))
     ;; Deduct the fee from whoever opened, before dust is considered — an output
@@ -225,24 +357,80 @@
            (outputs '())
            (described '()))
       (unless (dust-p to-remote-sat dust-limit-sat)
-        (push (btx:make-txout :value to-remote-sat
-                              :script (to-remote-scriptpubkey remote-pubkey))
+        (push (cons (btx:make-txout :value to-remote-sat
+                                    :script (to-remote-scriptpubkey remote-pubkey))
+                    nil)
               outputs)
         (push (list :to-remote to-remote-sat) described))
       (unless (dust-p to-local-sat dust-limit-sat)
-        (push (btx:make-txout :value to-local-sat :script (p2wsh local-script)) outputs)
+        (push (cons (btx:make-txout :value to-local-sat :script (p2wsh local-script)) nil)
+              outputs)
         (push (list :to-local to-local-sat local-script) described))
-      (let ((tx (btx:make-tx
+      (dolist (h live-htlcs)
+        (let* ((script (ecase (htlc-direction h)
+                         (:offered (offered-htlc-script revocation-pubkey
+                                                        remote-htlc-pubkey
+                                                        local-htlc-pubkey
+                                                        (htlc-payment-hash h)))
+                         (:received (received-htlc-script revocation-pubkey
+                                                          remote-htlc-pubkey
+                                                          local-htlc-pubkey
+                                                          (htlc-payment-hash h)
+                                                          (htlc-expiry h)))))
+               ;; The millisatoshi remainder is dropped, not rounded — and it is
+               ;; dropped for the ORDERING comparison too.
+               (sat (floor (htlc-amount-msat h) 1000)))
+          (push (cons (btx:make-txout :value sat :script (p2wsh script))
+                      (cons (htlc-expiry h) h))
+                outputs)
+          (push (list :htlc (htlc-direction h) sat (htlc-expiry h) script) described)))
+      (let* ((sorted (%bip69-sort outputs))
+             (htlc-order (loop for e in sorted when (cdr e) collect (cdr (cdr e))))
+             (tx (btx:make-tx
                  :version 2
                  :inputs (list (btx:make-txin
                                 :prev-hash (c:octets funding-txid)
                                 :prev-index funding-output-index
                                 :script #()
                                 :sequence (commitment-sequence obscured)))
-                 :outputs (%bip69-sort outputs)
+                 :outputs (mapcar #'car sorted)
                  :witnesses (list nil)
                  :locktime (commitment-locktime obscured)
                  :segwit-p nil)))
         (declare (ignorable funding-amount-sat))
         (values (btx:parse-tx (bw:make-reader (btx:serialize-tx tx)))
-                (nreverse described))))))
+                (nreverse described)
+                htlc-order)))))
+
+;;; ----------------------------------------------------------------------------
+;;; Signing
+;;;
+;;; A commitment spends the funding output, which is a P2WSH 2-of-2 — so the
+;;; digest is BIP143's, with the funding witness script as the scriptCode and the
+;;; funding amount included.  Including the amount is the point of BIP143: it is
+;;; what stopped a signer being lied to about how much it was spending.
+;;;
+;;; `funding_created` and `commitment_signed` both carry exactly this signature,
+;;; over the transaction the COUNTERPARTY holds.  You never sign your own
+;;; commitment — you sign theirs, and they sign yours, which is why either side
+;;; can publish but neither can publish alone.
+;;; ----------------------------------------------------------------------------
+
+(defun commitment-sighash (tx local-funding-pubkey remote-funding-pubkey funding-amount-sat)
+  "The BIP143 digest a commitment signature covers.  SIGHASH_ALL only —
+   Lightning has no use for any other mode here, and accepting one would let a
+   counterparty reuse a signature against different outputs."
+  (bs:bip143-sighash tx 0
+                     (funding-script local-funding-pubkey remote-funding-pubkey)
+                     funding-amount-sat
+                     bs:+sighash-all+))
+
+(defun sign-commitment (tx funding-privkey local-funding-pubkey remote-funding-pubkey
+                        funding-amount-sat)
+  "Sign a commitment transaction, returning the 64-byte compact (r ‖ s) form the
+   Lightning wire uses.  Bitcoin would want DER here; BOLT #1 does not, so the
+   conversion happens at the boundary rather than in the message encoder."
+  (let ((hash (commitment-sighash tx local-funding-pubkey remote-funding-pubkey
+                                  funding-amount-sat)))
+    (multiple-value-bind (r s) (secp:ecdsa-sign-raw funding-privkey hash)
+      (bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s)))))

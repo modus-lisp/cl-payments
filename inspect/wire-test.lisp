@@ -57,6 +57,40 @@
       (check-equal "r-u32" (w:r-u32 r) #x01020304)
       (check-equal "r-u64" (w:r-u64 r) #x0102030405060708))))
 
+(defun %tu-bytes (n width)
+  (let ((wr (w:make-writer))) (w:w-tu wr n width) (w:writer-bytes wr)))
+
+(defun test-truncated-integers ()
+  (with-gate ("BOLT #1 — truncated integers (tu16/tu32/tu64)")
+    ;; A `tu` is a big-endian integer with LEADING ZERO BYTES STRIPPED.  It only
+    ;; appears inside TLV records, where the record length already says how many
+    ;; bytes there are — so the value carries no width of its own and zero
+    ;; encodes as nothing at all.
+    (check-bytes "zero encodes as the empty string" (%tu-bytes 0 8) (hx ""))
+    (check-bytes "one byte stays one byte" (%tu-bytes 1 8) (hx "01"))
+    (check-bytes "255 stays one byte" (%tu-bytes 255 8) (hx "ff"))
+    (check-bytes "256 needs two" (%tu-bytes 256 8) (hx "0100"))
+    (check-bytes "a tu16 at its maximum" (%tu-bytes #xffff 2) (hx "ffff"))
+    (check-bytes "a tu32 strips three leading zeros" (%tu-bytes 1 4) (hx "01"))
+    (check-bytes "a full-width tu64" (%tu-bytes #x0102030405060708 8) (hx "0102030405060708"))
+    ;; Reading consumes the REST of the reader, since the length is external.
+    (flet ((rd (hex width) (w:r-tu (w:make-reader (hx hex)) width)))
+      (check-equal "empty reads as zero" (rd "" 8) 0)
+      (check-equal "one byte" (rd "ff" 8) 255)
+      (check-equal "two bytes" (rd "0100" 8) 256)
+      (check-equal "round-trips at full width" (rd "0102030405060708" 8) #x0102030405060708)
+      ;; A leading zero byte is a NON-MINIMAL encoding: the same value could have
+      ;; been written shorter, so two byte strings would mean one number.  In a
+      ;; TLV stream that reaches a signature, that is malleability.
+      (check-signals "a leading zero byte is rejected" w:non-minimal-error (rd "0001" 8))
+      ;; And a value wider than its declared type is not that type.
+      (check-signals "more bytes than the width allows is rejected" w:truncated-error
+        (rd "010203" 2)))
+    ;; Round-trip over the range where the width boundary sits.
+    (check "encode/decode round-trips across a byte boundary"
+           (loop for n in '(0 1 127 128 255 256 65535 65536 16777215 16777216)
+                 always (= n (w:r-tu (w:make-reader (%tu-bytes n 8)) 8))))))
+
 (defun test-tlv ()
   (with-gate ("BOLT #1 — TLV streams")
     (let* ((recs (list (w:make-tlv-record :type 1   :value (hx "2a"))
@@ -115,6 +149,7 @@
   (test-bigsize)
   (test-bigsize-rejects)
   (test-endianness)
+  (test-truncated-integers)
   (test-tlv)
   (test-message-envelope)
   (test-chain-hash))

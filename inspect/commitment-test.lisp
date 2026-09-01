@@ -172,9 +172,243 @@
         (apply #'m:build-commitment :obscuring obs
                :to-local-msat 1000 :to-remote-msat 3000000000 :opener :local common)))))
 
+(defparameter *c-local-htlc-pubkey*
+  "030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e7")
+(defparameter *c-remote-htlc-pubkey*
+  "0394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b")
+(defparameter *c-local-funding-privkey*
+  "30ff4956bbdd3222d44cc5e8a1261dab1e07957bdac5ae88fe3261ef321f3749")
+
+(defun %preimage-hash (hex) (c:sha256 (hx hex)))
+
+(defun test-htlc-scripts ()
+  (with-gate ("BOLT #3 — HTLC output scripts (Appendix C)")
+    ;; Both scripts share a three-way shape: the counterparty sweeps immediately
+    ;; with the revocation key if this commitment was revoked; otherwise one side
+    ;; takes it with the preimage and the other after a timeout.  Which side gets
+    ;; which branch is the whole difference between offered and received.
+    (check-bytes "offered HTLC (#2)"
+                 (m:offered-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                        (hx *c-local-htlc-pubkey*)
+                                        (%preimage-hash "0202020202020202020202020202020202020202020202020202020202020202"))
+                 (hx "76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a914b43e1b38138a41b37f7cd9a1d274bc63e3a9b5d188ac6868"))
+    (check-bytes "received HTLC (#0, expiry 500)"
+                 (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                         (hx *c-local-htlc-pubkey*)
+                                         (%preimage-hash "0000000000000000000000000000000000000000000000000000000000000000")
+                                         500)
+                 (hx "76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f401b175ac6868"))
+    ;; The expiry is IN the received script, so two HTLCs differing only in
+    ;; expiry get different outputs — offered ones do not, which is exactly why
+    ;; the ordering needs a CLTV tiebreak.
+    (check "a received script depends on its expiry"
+           (not (equalp (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                                (hx *c-local-htlc-pubkey*) (%preimage-hash "00") 500)
+                        (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                                (hx *c-local-htlc-pubkey*) (%preimage-hash "00") 501))))
+    (check "an offered script does NOT depend on any expiry"
+           (equalp (m:offered-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                          (hx *c-local-htlc-pubkey*) (%preimage-hash "00"))
+                   (m:offered-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                          (hx *c-local-htlc-pubkey*) (%preimage-hash "00"))))
+    (check "offered and received scripts differ"
+           (not (equalp (m:offered-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                               (hx *c-local-htlc-pubkey*) (%preimage-hash "00"))
+                        (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                                (hx *c-local-htlc-pubkey*) (%preimage-hash "00") 500))))))
+
+(defun test-htlc-trimming ()
+  (with-gate ("BOLT #3 — HTLC trimming")
+    ;; The test is NOT the amount against the dust limit.  It is the amount MINUS
+    ;; the fee of the second-stage transaction that would claim it: an HTLC worth
+    ;; a little over dust is still worthless if redeeming it costs more.
+    (check-equal "timeout weight" m:+htlc-timeout-weight+ 663)
+    (check-equal "success weight" m:+htlc-success-weight+ 703)
+    (check "at zero feerate nothing is trimmed by the second stage"
+           (not (m:htlc-trimmed-p 1000000 :offered 0 546)))
+    ;; At 15000/kw an offered HTLC must clear 546 + 9945 sat.
+    (let ((offered-fee (floor (* 15000 663) 1000))
+          (success-fee (floor (* 15000 703) 1000)))
+      (check "an HTLC just under the threshold is trimmed"
+             (m:htlc-trimmed-p (* 1000 (+ 546 offered-fee -1)) :offered 15000 546))
+      (check "an HTLC just over it is not"
+             (not (m:htlc-trimmed-p (* 1000 (+ 546 offered-fee)) :offered 15000 546)))
+      ;; Offered and received use DIFFERENT weights, so the same amount can be
+      ;; trimmed one way and not the other.
+      (check "the two directions have different thresholds" (/= offered-fee success-fee))
+      (let ((between (* 1000 (+ 546 offered-fee))))
+        (check "an amount between the thresholds trims as received but not offered"
+               (and (not (m:htlc-trimmed-p between :offered 15000 546))
+                    (m:htlc-trimmed-p between :received 15000 546)))))))
+
+(defun test-five-htlc-commitment ()
+  (with-gate ("BOLT #3 — commitment with five HTLCs (Appendix C)")
+    (let* ((expected
+             (with-open-file (f (asdf:system-relative-pathname
+                                 "cl-payments" "inspect/vectors/commitment-five-htlcs.txt")
+                                :if-does-not-exist nil)
+               (when f (loop for line = (read-line f nil)
+                             while line
+                             unless (or (zerop (length line)) (char= (char line 0) #\#))
+                               return (string-trim '(#\Space #\Return) line)))))
+           (obs (m:obscuring-factor (hx *c-local-payment-basepoint*)
+                                    (hx *c-remote-payment-basepoint*)))
+           (htlcs (list (m:make-htlc :direction :received :amount-msat 1000000 :expiry 500
+                                     :payment-hash (%preimage-hash "0000000000000000000000000000000000000000000000000000000000000000"))
+                        (m:make-htlc :direction :received :amount-msat 2000000 :expiry 501
+                                     :payment-hash (%preimage-hash "0101010101010101010101010101010101010101010101010101010101010101"))
+                        (m:make-htlc :direction :offered  :amount-msat 2000000 :expiry 502
+                                     :payment-hash (%preimage-hash "0202020202020202020202020202020202020202020202020202020202020202"))
+                        (m:make-htlc :direction :offered  :amount-msat 3000000 :expiry 503
+                                     :payment-hash (%preimage-hash "0303030303030303030303030303030303030303030303030303030303030303"))
+                        (m:make-htlc :direction :received :amount-msat 4000000 :expiry 504
+                                     :payment-hash (%preimage-hash "0404040404040404040404040404040404040404040404040404040404040404")))))
+      (unless (check "the five-HTLC vector is present" expected)
+        (return-from test-five-htlc-commitment))
+      (let ((tx (m:build-commitment
+                 :funding-txid (cl-consensus.wire:hex->hash *c-funding-txid*)
+                 :funding-output-index 0 :funding-amount-sat 10000000
+                 :commitment-number 42 :obscuring obs
+                 :to-local-msat 6988000000 :to-remote-msat 3000000000
+                 :local-feerate-per-kw 0 :dust-limit-sat 546
+                 :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                 :delayed-pubkey (hx *c-delayed-pubkey*)
+                 :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local
+                 :htlcs htlcs
+                 :local-htlc-pubkey (hx *c-local-htlc-pubkey*)
+                 :remote-htlc-pubkey (hx *c-remote-htlc-pubkey*))))
+        (check-bytes "the unsigned five-HTLC commitment"
+                     (cl-consensus.tx:serialize-tx tx) (hx expected))
+        (check-equal "seven outputs: two balances and five HTLCs"
+                     (length (cl-consensus.tx:tx-outputs tx)) 7)
+        ;; At feerate 0 nothing is trimmed; at a high feerate the small ones go.
+        (let ((trimmed (m:build-commitment
+                        :funding-txid (cl-consensus.wire:hex->hash *c-funding-txid*)
+                        :funding-output-index 0 :funding-amount-sat 10000000
+                        :commitment-number 42 :obscuring obs
+                        :to-local-msat 6988000000 :to-remote-msat 3000000000
+                        :local-feerate-per-kw 15000 :dust-limit-sat 546
+                        :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                        :delayed-pubkey (hx *c-delayed-pubkey*)
+                        :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local
+                        :htlcs htlcs
+                        :local-htlc-pubkey (hx *c-local-htlc-pubkey*)
+                        :remote-htlc-pubkey (hx *c-remote-htlc-pubkey*))))
+          (check "a high feerate trims the small HTLCs away"
+                 (< (length (cl-consensus.tx:tx-outputs trimmed)) 7)))))))
+
+(defun test-cltv-tiebreak ()
+  "Two offered HTLCs with the same ROUNDED amount and the same payment hash
+   produce byte-identical outputs.  The spec calls this case out explicitly: the
+   only thing that orders them is `cltv_expiry`, and the peers must agree,
+   because `commitment_signed` sends one signature per HTLC in output order.
+   Order them differently and each side attaches the other's signatures to the
+   wrong HTLC — both then fail to verify, for no visible reason."
+  (with-gate ("BOLT #3 — the CLTV tiebreak for identical HTLC outputs")
+    (let* ((obs (m:obscuring-factor (hx *c-local-payment-basepoint*)
+                                    (hx *c-remote-payment-basepoint*)))
+           ;; Appendix C's HTLCs 5 and 6: same preimage, and 5000000 / 5000001
+           ;; msat both round DOWN to 5000 sat.  Different expiries.
+           (hash5 (%preimage-hash "0505050505050505050505050505050505050505050505050505050505050505"))
+           (later   (m:make-htlc :direction :offered :amount-msat 5000000 :expiry 506
+                                 :payment-hash hash5))
+           (earlier (m:make-htlc :direction :offered :amount-msat 5000001 :expiry 505
+                                 :payment-hash hash5)))
+      (flet ((order-for (htlcs)
+               (nth-value 2 (m:build-commitment
+                             :funding-txid (cl-consensus.wire:hex->hash *c-funding-txid*)
+                             :funding-output-index 0 :funding-amount-sat 10000000
+                             :commitment-number 42 :obscuring obs
+                             :to-local-msat 6988000000 :to-remote-msat 3000000000
+                             :local-feerate-per-kw 0 :dust-limit-sat 546
+                             :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                             :delayed-pubkey (hx *c-delayed-pubkey*)
+                             :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local
+                             :htlcs htlcs
+                             :local-htlc-pubkey (hx *c-local-htlc-pubkey*)
+                             :remote-htlc-pubkey (hx *c-remote-htlc-pubkey*)))))
+        (let ((tx (m:build-commitment
+                   :funding-txid (cl-consensus.wire:hex->hash *c-funding-txid*)
+                   :funding-output-index 0 :funding-amount-sat 10000000
+                   :commitment-number 42 :obscuring obs
+                   :to-local-msat 6988000000 :to-remote-msat 3000000000
+                   :local-feerate-per-kw 0 :dust-limit-sat 546
+                   :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                   :delayed-pubkey (hx *c-delayed-pubkey*)
+                   :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local
+                   :htlcs (list later earlier)
+                   :local-htlc-pubkey (hx *c-local-htlc-pubkey*)
+                   :remote-htlc-pubkey (hx *c-remote-htlc-pubkey*))))
+          (let ((htlc-outs (remove 5000 (cl-consensus.tx:tx-outputs tx)
+                                   :key #'cl-consensus.tx:txout-value :test #'/=)))
+            (check-equal "both HTLCs are present" (length htlc-outs) 2)
+            ;; The premise: they really are indistinguishable in the transaction,
+            ;; so the ORDER is the only thing carrying the distinction.
+            (check "the two HTLC outputs are byte-identical"
+                   (equalp (cl-consensus.tx:txout-script (first htlc-outs))
+                           (cl-consensus.tx:txout-script (second htlc-outs))))))
+        ;; The property that matters: BOTH peers must arrive at the same order,
+        ;; and they assemble their HTLC lists independently.  So the output order
+        ;; must not depend on the input order — testing only one permutation
+        ;; passes even with no tiebreak at all, because the list happens to
+        ;; arrive already sorted.
+        (check-equal "input order (later, earlier) sorts by expiry"
+                     (mapcar #'m:htlc-expiry (order-for (list later earlier))) '(505 506))
+        (check-equal "input order (earlier, later) sorts the same way"
+                     (mapcar #'m:htlc-expiry (order-for (list earlier later))) '(505 506))
+        (check "the two permutations agree"
+               (equal (mapcar #'m:htlc-expiry (order-for (list later earlier)))
+                      (mapcar #'m:htlc-expiry (order-for (list earlier later)))))))))
+
+(defun test-commitment-signing ()
+  (with-gate ("BOLT #3 — signing the commitment (Appendix C)")
+    (let* ((obs (m:obscuring-factor (hx *c-local-payment-basepoint*)
+                                    (hx *c-remote-payment-basepoint*)))
+           (tx (m:build-commitment
+                :funding-txid (cl-consensus.wire:hex->hash *c-funding-txid*)
+                :funding-output-index 0 :funding-amount-sat 10000000
+                :commitment-number 42 :obscuring obs
+                :to-local-msat 7000000000 :to-remote-msat 3000000000
+                :local-feerate-per-kw 15000 :dust-limit-sat 546
+                :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                :delayed-pubkey (hx *c-delayed-pubkey*)
+                :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local))
+           (sig (m:sign-commitment tx
+                                   (secp256k1-fast:bytes-to-int (hx *c-local-funding-privkey*))
+                                   (hx *c-local-funding-pubkey*) (hx *c-remote-funding-pubkey*)
+                                   10000000)))
+      ;; Reproducing the spec's signature exercises BIP143 (with the funding
+      ;; amount in the digest) AND RFC6979 deterministic nonce generation at
+      ;; once — a wrong digest or a wrong nonce gives a different, still-valid
+      ;; signature, so only an exact match proves both.
+      (check-bytes "local_signature matches the spec"
+                   sig
+                   (hx "616210b2cc4d3afb601013c373bbd8aac54febd9f15400379a8cb65ce7deca6034236c010991beb7ff770510561ae8dc885b8d38d1947248c38f2ae055647142"))
+      (check-equal "signatures are 64 bytes on the wire, never DER" (length sig) 64)
+      ;; And it must verify under the signing key.
+      (let ((hash (m:commitment-sighash tx (hx *c-local-funding-pubkey*)
+                                        (hx *c-remote-funding-pubkey*) 10000000)))
+        (check "the signature verifies against the funding pubkey"
+               (secp256k1-fast:ecdsa-verify
+                (c:parse-pubkey (hx *c-local-funding-pubkey*))
+                (c:octets hash)
+                (secp256k1-fast:bytes-to-int (subseq sig 0 32))
+                (secp256k1-fast:bytes-to-int (subseq sig 32 64))))
+        ;; The funding AMOUNT is part of the BIP143 digest — that is the whole
+        ;; reason BIP143 exists, and signing the wrong amount must be detectable.
+        (check "a different funding amount gives a different digest"
+               (not (equalp hash (m:commitment-sighash tx (hx *c-local-funding-pubkey*)
+                                                       (hx *c-remote-funding-pubkey*)
+                                                       10000001))))))))
+
 (defun run-commitment-tests ()
   (test-commitment-scripts)
   (test-obscured-commitment-number)
   (test-commitment-fees)
   (test-commitment-vector)
-  (test-commitment-structure))
+  (test-commitment-structure)
+  (test-htlc-scripts)
+  (test-htlc-trimming)
+  (test-five-htlc-commitment)
+  (test-cltv-tiebreak)
+  (test-commitment-signing))
