@@ -18,7 +18,8 @@
      (:file "transport")   ; BOLT #8: Noise_XK handshake + encrypted transport
      (:file "features")    ; BOLT #9: feature bits and their negotiation rules
      (:file "peer")        ; BOLT #1: init/ping/pong/error + the async read loop
-     (:file "gossip"))))   ; BOLT #7: gossip messages, signatures, routing graph
+     (:file "gossip")      ; BOLT #7: gossip messages, signatures, routing graph
+     (:file "keys"))))     ; BOLT #3: per-commitment key derivation + revocation
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
 (defsystem "cl-payments/test"
@@ -35,5 +36,6 @@
                              (:file "transport-test")
                              (:file "peer-test")
                              (:file "gossip-test")
+                             (:file "keys-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))

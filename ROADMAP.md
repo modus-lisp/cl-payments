@@ -37,7 +37,8 @@ features.lisp   Phase 2  BOLT #9 feature bits and negotiation           [DONE]
 peer.lisp       Phase 2  init/ping/pong/error + the async read loop     [DONE]
 gossip.lisp     Phase 3  BOLT #7 announcements, signatures, routing graph [DONE]
 channel.lisp    Phase 4  BOLT #2 open/accept, funding, commitment_signed
-commitment.lisp Phase 5  BOLT #3 commitment + HTLC transactions, key derivation
+keys.lisp       Phase 4  BOLT #3 per-commitment key derivation           [DONE]
+commitment.lisp Phase 5  BOLT #3 commitment + HTLC transactions
 onion.lisp      Phase 6  BOLT #4 Sphinx onion construction and peeling
 invoice.lisp    Phase 7  BOLT #11 invoice encode/decode
 onchain.lisp    Phase 8  BOLT #5 force-close, penalty, HTLC timeout/success
@@ -130,6 +131,31 @@ across it belongs with Phase 6, where there is something to route.
 BOLT #2: `open_channel`/`accept_channel`, `funding_created`/`funding_signed`,
 `channel_ready`, then the HTLC lifecycle (`update_add_htlc`,
 `commitment_signed`, `revoke_and_ack`) and `shutdown`/`closing_signed`.
+
+**The phase ordering below was wrong and has been corrected in practice.** BOLT
+#2 sits *on top of* BOLT #3, not beside it: `funding_created` carries a signature
+over the peer's first commitment transaction, so the commitment keys and the
+transaction itself must exist before the message can be sent at all. BOLT #3 is
+therefore being built first, starting with key derivation.
+
+### 4a — key derivation  **[DONE]**
+
+`src/keys.lisp`: per-commitment blinding, the revocation key, per-commitment
+secret generation, and the O(log n) store for revoked secrets.
+
+**Verified** against BOLT #3's published vectors (Appendices D and E) — all five
+reproduce. But the vectors only pin PUBLIC values, so the gate also checks the
+algebra: that each private key actually inverts its public counterpart. Breaking
+only `derive-revocation-privkey` passes every published vector and is caught by
+exactly one check. That failure mode is the worst one available here — the
+channel works, states get revoked, and the punishment branch that gives
+revocation its meaning is silently unspendable.
+
+### 4b — commitment transactions
+
+BOLT #3's transaction construction, against Appendix C's vectors.
+
+### 4c — the BOLT #2 messages, and a live channel open
 
 **Milestone.** Open a channel from cl-payments to cln1, confirm it with
 `./mine.sh 6`, and have CLN report it as `CHANNELD_NORMAL`. Then the same
