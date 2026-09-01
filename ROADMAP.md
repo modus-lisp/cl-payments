@@ -23,8 +23,9 @@ one's reading of the spec. Every phase below has a milestone checkable against
 *both*.
 
 The devnet mines on demand (`./mine.sh 6` ≈ 2 seconds), so the confirmation
-waits that dominate Lightning testing cost seconds instead of hours. See
-`/mnt/lisp/signet/README.md`.
+waits that dominate Lightning testing cost seconds instead of hours. cl-consensus
+validates this chain natively (signet + BIP325), so the same chain is ground truth
+for both projects. See `/mnt/lisp/signet/README.md`.
 
 ## Layers
 
