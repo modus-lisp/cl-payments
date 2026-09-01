@@ -11,7 +11,8 @@
                     (#:f #:cl-payments.features) (#:p #:cl-payments.peer)
                     (#:gs #:cl-payments.gossip)
                     (#:k #:cl-payments.keys)
-                    (#:m #:cl-payments.commitment))
+                    (#:m #:cl-payments.commitment)
+                    (#:ch #:cl-payments.channel))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*
            #:hx #:report))

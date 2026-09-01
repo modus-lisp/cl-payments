@@ -194,7 +194,32 @@ punishable.
 Not done: anchor outputs (`option_anchors`), which is a feature we do not
 negotiate. BOLT #3 is otherwise complete.
 
-### 4c — the BOLT #2 messages, and a live channel open
+### 4c — the BOLT #2 messages, and a live channel open  **[DONE]**
+
+`src/channel.lisp`: `open_channel`, `accept_channel`, `funding_created`,
+`funding_signed`, `channel_ready`, and the channel id derivation.
+
+**Milestone — met.** `inspect/open-channel.lisp` opens a real channel against
+Core Lightning, which then reports `CHANNELD_NORMAL`. CLN verifies our signature
+over the commitment transaction *it* will hold, so every piece of BOLT #3 —
+key derivation, output construction, the fee, the obscured commitment number,
+the BIP143 digest — is checked by an independent implementation at once.
+
+The funding transaction is built but **not broadcast** until `funding_signed`
+arrives. That ordering is the opener's only protection: the funding output is a
+2-of-2, so broadcasting before holding a signature that returns the money lets an
+uncooperative counterparty strand it forever.
+
+Two things the live run taught:
+
+- **`channel_type` is not optional.** A peer that advertises
+  `option_channel_type` — CLN and LND both do — rejects an `open_channel`
+  without the TLV, with `Did not set channel_type in open_channel message`. We
+  send `option_static_remotekey`, which is what the commitment builder
+  implements.
+- **`option_static_remotekey` changes `to_remote`**: it is the payment basepoint
+  verbatim, with no per-commitment blinding, so the peer can sweep it even from
+  an outdated state.
 
 **Milestone.** Open a channel from cl-payments to cln1, confirm it with
 `./mine.sh 6`, and have CLN report it as `CHANNELD_NORMAL`. Then the same

@@ -28,7 +28,8 @@
      (:file "peer")        ; BOLT #1: init/ping/pong/error + the async read loop
      (:file "gossip")      ; BOLT #7: gossip messages, signatures, routing graph
      (:file "keys")        ; BOLT #3: per-commitment key derivation + revocation
-     (:file "commitment"))))  ; BOLT #3: commitment transactions and their scripts
+     (:file "commitment")  ; BOLT #3: commitment transactions and their scripts
+     (:file "channel"))))  ; BOLT #2: opening a channel
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
 (defsystem "cl-payments/test"
@@ -47,5 +48,6 @@
                              (:file "gossip-test")
                              (:file "keys-test")
                              (:file "commitment-test")
+                             (:file "channel-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))
