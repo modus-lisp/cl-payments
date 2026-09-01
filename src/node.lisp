@@ -212,6 +212,7 @@
   port
   (peers (make-hash-table :test 'equal))     ; hex node id -> peer
   (channels (make-hash-table :test 'equal))  ; hex channel id -> stored-channel
+  (pending (make-hash-table :test 'equal))   ; hex temporary channel id -> pending-open
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -447,18 +448,239 @@
           (error (e) (nlog node "could not re-advertise ~a: ~a"
                            (gs:scid-string (sc-scid sc)) e)))))))
 
+
+;;; ----------------------------------------------------------------------------
+;;; Accepting a channel
+;;;
+;;; The other half of BOLT #2.  Everything so far has had us OPEN channels, which
+;;; only ever tests the code paths we happen to drive.  Accepting exercises the
+;;; mirror image, and the two are not symmetric in the way that matters: as the
+;;; opener we choose the funding transaction and can simply refuse to broadcast
+;;; if something looks wrong, whereas as the ACCEPTER we are told about a funding
+;;; output that already exists and our only protection is checking their
+;;; signature over our commitment before we agree to anything.
+;;;
+;;; It also fixes an asymmetry in liquidity.  A channel we funded is
+;;; outbound-only: the peer holds nothing, so nobody can route a payment TOWARD
+;;; us over it.  Channels opened toward us are the only ones we can receive over.
+;;; ----------------------------------------------------------------------------
+
+(defstruct (pending-open (:conc-name po-))
+  temporary-channel-id keys open-msg)
+
+(defun next-key-index (node)
+  "One past the highest index in use.  Reusing an index reuses a funding key
+   across two channels, so a revocation secret leaked on one would apply to the
+   other."
+  (let ((n 0))
+    (maphash (lambda (id sc) (declare (ignore id))
+               (setf n (max n (1+ (sc-key-index sc)))))
+             (node-channels node))
+    n))
+
+(defun their-channel-type (oc)
+  "The channel_type the peer actually put on the wire (TLV 1), or NIL."
+  (let ((raw (and (ch:oc-tlvs oc) (w:tlv-get (ch:oc-tlvs oc) 1))))
+    (and raw (f:bytes->features raw))))
+
+(defun handle-open-channel (node peer payload)
+  "Answer `open_channel` with `accept_channel`.
+
+   The checks here are deliberately about OUR exposure, not about whether their
+   parameters are sensible for them.  We are not putting funds in, so a large
+   funding amount is their risk; what we refuse is a channel we could not
+   safely hold — one on the wrong chain, or one whose to_self_delay would lock
+   our own funds up for an unreasonable time if we had to force-close."
+  (handler-case
+      (let ((oc (ch:parse-open-channel payload)))
+        (nlog node "open_channel from ~a: ~d sat, ~d msat pushed to us~@[, announce~]"
+              (subseq (%hex (p:peer-node-id peer)) 0 16)
+              (ch:oc-funding-satoshis oc) (ch:oc-push-msat oc)
+              (logtest (ch:oc-channel-flags oc) 1))
+        (cond
+          ((not (equalp (c:octets (ch:oc-chain-hash oc)) (c:octets (w:chain-hash))))
+           (nlog node "  wrong chain — refusing"))
+          ;; to_self_delay is how long OUR funds are frozen after we force-close.
+          ;; The peer chooses it, so an absurd value is an attack on us.
+          ((> (ch:oc-to-self-delay oc) 2016)
+           (nlog node "  to_self_delay ~d is too long — refusing" (ch:oc-to-self-delay oc)))
+          (t
+           (let* ((index (next-key-index node))
+                  (keys (derive-channel-keys (node-privkey node) index))
+                  (po (make-pending-open
+                       :temporary-channel-id (ch:oc-temporary-channel-id oc)
+                       :keys keys :open-msg oc)))
+             (setf (gethash (%hex (ch:oc-temporary-channel-id oc)) (node-pending node)) po)
+             (p:send-message
+              peer
+              (ch:encode-accept-channel
+               (ch:make-accept-channel
+                :temporary-channel-id (ch:oc-temporary-channel-id oc)
+                :dust-limit-satoshis 546
+                :max-htlc-value-in-flight-msat (* 1000 (ch:oc-funding-satoshis oc))
+                ;; Their reserve: the amount they may never spend below, so they
+                ;; always have something to lose by cheating.  1% is the usual
+                ;; choice; zero would make revocation punishment worthless.
+                :channel-reserve-satoshis (max 546 (floor (ch:oc-funding-satoshis oc) 100))
+                :htlc-minimum-msat 1
+                ;; One confirmation is fine on a devnet we mine ourselves.
+                :minimum-depth 1
+                :to-self-delay 144
+                :max-accepted-htlcs 30
+                :funding-pubkey (ck-pub (ck-funding keys))
+                :revocation-basepoint (ck-pub (ck-revocation keys))
+                :payment-basepoint (ck-pub (ck-payment keys))
+                :delayed-payment-basepoint (ck-pub (ck-delayed keys))
+                :htlc-basepoint (ck-pub (ck-htlc keys))
+                :first-per-commitment-point
+                (k:per-commitment-point (ck-seed keys) k:+max-commitment-index+)
+                ;; Echo back exactly what they OFFERED, read off the wire.
+                ;; OC-CHANNEL-TYPE would be the struct's default here, not their
+                ;; choice — parse-open-channel leaves TLVs raw — and answering a
+                ;; type they did not ask for is a counter-offer, which
+                ;; accept_channel cannot express.  If they sent none, we send
+                ;; none.
+                :channel-type (their-channel-type oc)))
+              nil)
+             (nlog node "  accept_channel sent (key index ~d)" index)))))
+    (error (e) (nlog node "bad open_channel: ~a" e))))
+
+(defun handle-funding-created (node peer payload)
+  "Verify their signature over OUR first commitment, then sign THEIRS.
+
+   Order matters and is not a style choice.  Their signature is what lets us
+   spend the funding output unilaterally; if we sent `funding_signed` first and
+   theirs turned out to be invalid, they could broadcast a funding transaction
+   we can never claim from.  So: check theirs, and only then produce ours."
+  (handler-case
+      (let* ((fc (ch:parse-funding-created payload))
+             (po (gethash (%hex (ch:fc-temporary-channel-id fc)) (node-pending node))))
+        (unless po
+          (nlog node "funding_created for a channel we never accepted — ignoring")
+          (return-from handle-funding-created nil))
+        (let* ((oc (po-open-msg po))
+               (keys (po-keys po))
+               (funding-sat (ch:oc-funding-satoshis oc))
+               (push-msat (ch:oc-push-msat oc))
+               (their-pcp (ch:oc-first-per-commitment-point oc))
+               (our-pcp-seed (ck-seed keys))
+               (obscuring (m:obscuring-factor (ch:oc-payment-basepoint oc)
+                                              (ck-pub (ck-payment keys))))
+               (our-funding-pub (ck-pub (ck-funding keys)))
+               (their-funding-pub (ch:oc-funding-pubkey oc))
+               ;; OUR commitment: to_local is what we hold (the push), behind our
+               ;; delayed key and THEIR revocation key.  They opened, so the fee
+               ;; comes off their side.
+               (our-pcp (k:per-commitment-point our-pcp-seed k:+max-commitment-index+))
+               (our-commitment
+                 (m:build-commitment
+                  :funding-txid (ch:fc-funding-txid fc)
+                  :funding-output-index (ch:fc-funding-output-index fc)
+                  :funding-amount-sat funding-sat
+                  :commitment-number 0 :obscuring obscuring
+                  :to-local-msat push-msat
+                  :to-remote-msat (- (* funding-sat 1000) push-msat)
+                  :local-feerate-per-kw (ch:oc-feerate-per-kw oc)
+                  :dust-limit-sat (ch:oc-dust-limit-satoshis oc)
+                  ;; The revocation key in OUR commitment comes from THEIR
+                  ;; revocation basepoint: it exists so THEY can punish US.
+                  :revocation-pubkey
+                  (k:derive-revocation-pubkey (ch:oc-revocation-basepoint oc) our-pcp)
+                  :to-self-delay (ch:oc-to-self-delay oc)
+                  :delayed-pubkey (k:derive-pubkey (ck-pub (ck-delayed keys)) our-pcp)
+                  :remote-pubkey (ch:oc-payment-basepoint oc)
+                  :opener :remote)))
+          (unless (m:verify-commitment our-commitment (ch:fc-signature fc)
+                                       our-funding-pub their-funding-pub
+                                       funding-sat their-funding-pub)
+            (nlog node "  their signature over OUR commitment does not verify — refusing")
+            (return-from handle-funding-created nil))
+          (nlog node "  their signature over our commitment verifies")
+
+          ;; Now THEIR commitment, which we sign.  The mirror: to_local is their
+          ;; balance behind their delayed key and OUR revocation key.
+          (let* ((their-commitment
+                   (m:build-commitment
+                    :funding-txid (ch:fc-funding-txid fc)
+                    :funding-output-index (ch:fc-funding-output-index fc)
+                    :funding-amount-sat funding-sat
+                    :commitment-number 0 :obscuring obscuring
+                    :to-local-msat (- (* funding-sat 1000) push-msat)
+                    :to-remote-msat push-msat
+                    :local-feerate-per-kw (ch:oc-feerate-per-kw oc)
+                    :dust-limit-sat (ch:oc-dust-limit-satoshis oc)
+                    :revocation-pubkey
+                    (k:derive-revocation-pubkey (ck-pub (ck-revocation keys)) their-pcp)
+                    :to-self-delay 144
+                    :delayed-pubkey
+                    (k:derive-pubkey (ch:oc-delayed-payment-basepoint oc) their-pcp)
+                    :remote-pubkey (ck-pub (ck-payment keys))
+                    :opener :local))
+                 (sig (m:sign-commitment their-commitment (ck-funding keys)
+                                         our-funding-pub their-funding-pub funding-sat))
+                 (cid (ch:channel-id (ch:fc-funding-txid fc)
+                                     (ch:fc-funding-output-index fc))))
+            (p:send-message peer
+                            (ch:encode-funding-signed
+                             (ch:make-funding-signed :channel-id cid :signature sig))
+                            nil)
+            (remhash (%hex (ch:fc-temporary-channel-id fc)) (node-pending node))
+            (setf (gethash (%hex cid) (node-channels node))
+                  (make-stored-channel
+                   :channel-id cid
+                   :peer-id (p:peer-node-id peer)
+                   :funding-txid (ch:fc-funding-txid fc)
+                   :funding-index (ch:fc-funding-output-index fc)
+                   :capacity-sat funding-sat
+                   :local-msat push-msat
+                   :remote-msat (- (* funding-sat 1000) push-msat)
+                   :key-index (ck-index keys)
+                   :remote-funding-pubkey their-funding-pub))
+            (save-channels node)
+            (nlog node "  funding_signed sent — channel ~a accepted, ~d msat ours"
+                  (subseq (%hex cid) 0 16) push-msat))))
+    (error (e) (nlog node "bad funding_created: ~a" e))))
+
+(defun handle-channel-ready (node peer payload)
+  "Answer `channel_ready` with our own.
+
+   Both ends must send it; a channel where only one side has is stuck in
+   AWAITING_LOCKIN forever, which looks exactly like an unconfirmed funding
+   transaction even though the funding has six confirmations.  There is no
+   retry and no error — the peer simply waits.
+
+   Sent unconditionally rather than once: `channel_ready` is idempotent, and a
+   peer that reconnects and re-sends it needs an answer again."
+  (handler-case
+      (let* ((cr (ch:parse-channel-ready payload))
+             (cid (ch:cr-channel-id cr))
+             (sc (gethash (%hex cid) (node-channels node))))
+        (nlog node "channel_ready for ~a" (subseq (%hex cid) 0 16))
+        (if (null sc)
+            (nlog node "  no record of that channel — not replying")
+            (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+              (p:send-message
+               peer
+               (ch:encode-channel-ready
+                (ch:make-channel-ready
+                 :channel-id cid
+                 :second-per-commitment-point
+                 (k:per-commitment-point (ck-seed keys) (1- k:+max-commitment-index+))))
+               nil)
+              (nlog node "  our channel_ready sent"))))
+    (error (e) (nlog node "bad channel_ready: ~a" e))))
+
 (defun install-handlers (node peer)
+  (p:on peer ch:+msg-open-channel+
+        (lambda (pr payload) (handle-open-channel node pr payload)))
+  (p:on peer ch:+msg-funding-created+
+        (lambda (pr payload) (handle-funding-created node pr payload)))
   (p:on peer u:+msg-channel-reestablish+
         (lambda (pr payload) (handle-reestablish node pr payload)))
   (p:on peer +msg-announcement-signatures+
         (lambda (pr payload) (handle-announcement-signatures node pr payload)))
   (p:on peer ch:+msg-channel-ready+
-        (lambda (pr payload) (declare (ignore pr))
-          (handler-case
-              (let ((cr (ch:parse-channel-ready payload)))
-                (nlog node "channel_ready for ~a"
-                      (subseq (%hex (ch:cr-channel-id cr)) 0 16)))
-            (error () nil))))
+        (lambda (pr payload) (handle-channel-ready node pr payload)))
   ;; Gossip is accepted and ignored for now; the point of logging it is that a
   ;; silent daemon is indistinguishable from a wedged one.
   (p:on peer gs:+msg-channel-announcement+ (lambda (pr pl) (declare (ignore pr pl)) nil))

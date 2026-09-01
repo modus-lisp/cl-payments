@@ -273,6 +273,36 @@ torn down when its creating thread exits, so `on-inbound` ends in
 `run-read-loop` — becoming the connection's owner — rather than spawning a
 reader and returning.
 
+### 4f — announcing, and 4g — accepting  **[DONE]**
+
+Our channels are in the routing graph, and Core Lightning can open channels TO
+us.
+
+`gossip.lisp` could only parse and verify; it now encodes `channel_announcement`,
+`channel_update` and `node_announcement` too.  The asymmetry is the point: a
+lenient parser accepts junk, but a wrong ENCODER gets you silently ignored by
+the whole network — nobody replies "your announcement was malformed", the
+channel simply never appears in anyone's graph.
+
+`node.lisp` answers `open_channel` with `accept_channel`, verifies the
+counterparty's signature over OUR first commitment before producing ours, and
+replies to `channel_ready`.  Order matters there: their signature is what lets
+us spend the funding output unilaterally, so sending `funding_signed` first
+would risk a funding transaction we can never claim from.
+
+Verified against Core Lightning on the devnet:
+
+- `273x1x1` (we opened) and `291x1x0` (CLN opened to us) are both announced,
+  with both directions active on nodes three hops away that have never spoken
+  to us.  A real implementation checked our node signature AND our bitcoin
+  signature and relayed the announcement on our behalf.
+- `getroute` from cln1 finds a 3-hop path terminating at our node.
+  cl-payments is a routable destination.
+
+Channel keys are derived from the node key and an index rather than generated
+randomly — `open-channel.lisp` had been generating them fresh, which made the
+script the only thing holding half of a 2-of-2 over real funds.
+
 ### 4d — the HTLC lifecycle  **[PARTIAL]**
 
 `src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,

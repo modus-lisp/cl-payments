@@ -50,7 +50,7 @@
    #:htlc #:make-htlc #:htlc-direction #:htlc-amount-msat #:htlc-expiry
    #:htlc-payment-hash #:offered-htlc-script #:received-htlc-script
    ;; the transaction
-   #:build-commitment #:sign-commitment #:commitment-sighash
+   #:build-commitment #:sign-commitment #:verify-commitment #:commitment-sighash
    ;; second-stage HTLC transactions
    #:htlc-tx-script #:build-htlc-tx #:htlc-tx-fee #:sign-htlc-tx #:htlc-tx-sighash
    #:commitment-error))
@@ -426,6 +426,25 @@
                      (funding-script local-funding-pubkey remote-funding-pubkey)
                      funding-amount-sat
                      bs:+sighash-all+))
+
+(defun verify-commitment (tx signature local-funding-pubkey remote-funding-pubkey
+                          funding-amount-sat signer-pubkey)
+  "Check a counterparty's 64-byte signature over a commitment transaction.
+
+   This is the check that decides whether it is safe to have money in a channel
+   at all.  Accepting a funding output without a valid remote signature over OUR
+   commitment means we hold a 2-of-2 we can never unilaterally spend: the funds
+   are gone the moment the peer stops cooperating, and nothing on the wire
+   distinguishes that from a healthy channel until you try to close it.
+
+   Returns NIL rather than signalling, so a caller can refuse politely."
+  (handler-case
+      (let ((hash (commitment-sighash tx local-funding-pubkey remote-funding-pubkey
+                                      funding-amount-sat))
+            (r (secp:bytes-to-int (subseq signature 0 32)))
+            (s (secp:bytes-to-int (subseq signature 32 64))))
+        (and (secp:ecdsa-verify (c:parse-pubkey signer-pubkey) hash r s) t))
+    (error () nil)))
 
 (defun sign-commitment (tx funding-privkey local-funding-pubkey remote-funding-pubkey
                         funding-amount-sat)

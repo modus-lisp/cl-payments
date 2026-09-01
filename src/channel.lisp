@@ -48,6 +48,7 @@
    #:ac-revocation-basepoint #:ac-payment-basepoint #:ac-delayed-payment-basepoint
    #:ac-htlc-basepoint #:ac-first-per-commitment-point
    #:ac-max-htlc-value-in-flight-msat #:ac-channel-reserve-satoshis #:ac-htlc-minimum-msat
+   #:ac-channel-type #:ac-tlvs
    #:funding-created #:make-funding-created
    #:encode-funding-created #:parse-funding-created
    #:fc-temporary-channel-id #:fc-funding-txid #:fc-funding-output-index #:fc-signature
@@ -174,6 +175,11 @@
   to-self-delay max-accepted-htlcs
   funding-pubkey revocation-basepoint payment-basepoint
   delayed-payment-basepoint htlc-basepoint first-per-commitment-point
+  ;; `accept_channel` must ECHO the channel_type it was offered.  A peer that
+  ;; advertises option_channel_type treats a reply without it as a protocol
+  ;; error and aborts the open — the exact mirror of the rule that bit us as the
+  ;; opener, and it fails just as opaquely from the other side.
+  (channel-type nil)
   (tlvs nil))
 
 (defun encode-accept-channel (a)
@@ -192,6 +198,10 @@
     (w:w-point wr (ac-delayed-payment-basepoint a))
     (w:w-point wr (ac-htlc-basepoint a))
     (w:w-point wr (ac-first-per-commitment-point a))
+    (when (ac-channel-type a)
+      (w:w-tlv-stream wr (list (w:make-tlv-record
+                                :type 1
+                                :value (f:features->bytes (ac-channel-type a))))))
     (w:encode-message +msg-accept-channel+ (w:writer-bytes wr))))
 
 (defun parse-accept-channel (payload)

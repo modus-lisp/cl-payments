@@ -206,3 +206,93 @@
       (check "the framed payload still parses"
                (gs:verify-channel-update
                 (gs:parse-channel-update (subseq framed 2)) (ge-pub k))))))
+
+;;; ----------------------------------------------------------------------------
+;;; Phase 4g — accepting a channel.
+;;;
+;;; These live here rather than in channel-test.lisp because they are about the
+;;; RESPONDER side specifically, which nothing exercised until the daemon could
+;;; accept an open.  Both checks below correspond to a failure seen against Core
+;;; Lightning, and neither produced a useful error at the time.
+;;; ----------------------------------------------------------------------------
+
+(defun run-accept-tests ()
+  (w:select-network :signet)
+  (with-gate ("channel: accept_channel echoes channel_type")
+    (let* ((k (ge-key 20))
+           (ty (f:features-from '((:static-remotekey . :required))))
+           (a (ch:make-accept-channel
+               :temporary-channel-id (c:zeros 32)
+               :dust-limit-satoshis 546 :max-htlc-value-in-flight-msat 1000000
+               :channel-reserve-satoshis 5000 :htlc-minimum-msat 1
+               :minimum-depth 1 :to-self-delay 144 :max-accepted-htlcs 30
+               :funding-pubkey (ge-pub k) :revocation-basepoint (ge-pub (ge-key 21))
+               :payment-basepoint (ge-pub (ge-key 22))
+               :delayed-payment-basepoint (ge-pub (ge-key 23))
+               :htlc-basepoint (ge-pub (ge-key 24))
+               :first-per-commitment-point (ge-pub (ge-key 25))
+               :channel-type ty))
+           ;; The encoders frame the message; strip the 2-byte type to parse.
+           (parsed (ch:parse-accept-channel (subseq (ch:encode-accept-channel a) 2))))
+      ;; A peer advertising option_channel_type — both CLN and LND do — aborts
+      ;; the open if accept_channel carries no channel_type, with an error that
+      ;; names the message and not the missing field.
+      (check "channel_type is present as TLV 1"
+             (equalp (f:features->bytes ty) (w:tlv-get (ch:ac-tlvs parsed) 1)))
+      (check "the other fields still parse after the TLV"
+             (and (= 1 (ch:ac-minimum-depth parsed))
+                  (= 144 (ch:ac-to-self-delay parsed))
+                  (equalp (ge-pub k) (ch:ac-funding-pubkey parsed))))
+      ;; Omitting it must produce a message with NO trailing TLV, not one with an
+      ;; empty record — a peer that does not want a typed channel must not be
+      ;; told it is getting one.
+      (let* ((plain (ch:make-accept-channel
+                     :temporary-channel-id (c:zeros 32)
+                     :dust-limit-satoshis 546 :max-htlc-value-in-flight-msat 1000000
+                     :channel-reserve-satoshis 5000 :htlc-minimum-msat 1
+                     :minimum-depth 1 :to-self-delay 144 :max-accepted-htlcs 30
+                     :funding-pubkey (ge-pub k) :revocation-basepoint (ge-pub (ge-key 21))
+                     :payment-basepoint (ge-pub (ge-key 22))
+                     :delayed-payment-basepoint (ge-pub (ge-key 23))
+                     :htlc-basepoint (ge-pub (ge-key 24))
+                     :first-per-commitment-point (ge-pub (ge-key 25))
+                     :channel-type nil))
+             (p2 (ch:parse-accept-channel (subseq (ch:encode-accept-channel plain) 2))))
+        (check "no channel_type means no TLV at all" (null (ch:ac-tlvs p2))))))
+
+  (with-gate ("commitment: a counterparty signature is actually checked")
+    ;; Accepting a funding output without a valid remote signature over OUR
+    ;; commitment leaves us holding a 2-of-2 we can never unilaterally spend.
+    ;; Nothing on the wire distinguishes that from a healthy channel until you
+    ;; try to close it, so this check is the whole safety of accepting an open.
+    (let* ((ours (ge-key 30)) (theirs (ge-key 31))
+           (our-pub (ge-pub ours)) (their-pub (ge-pub theirs))
+           (amount 500000)
+           (tx (m:build-commitment
+                :funding-txid (c:sha256 (c:ascii->bytes "funding"))
+                :funding-output-index 0
+                :funding-amount-sat amount
+                :commitment-number 0
+                :obscuring (m:obscuring-factor (ge-pub (ge-key 32)) (ge-pub (ge-key 33)))
+                :to-local-msat 100000000
+                :to-remote-msat (- (* amount 1000) 100000000)
+                :local-feerate-per-kw 2500 :dust-limit-sat 546
+                :revocation-pubkey (ge-pub (ge-key 34))
+                :to-self-delay 144
+                :delayed-pubkey (ge-pub (ge-key 35))
+                :remote-pubkey (ge-pub (ge-key 36))
+                :opener :remote))
+           (sig (m:sign-commitment tx theirs our-pub their-pub amount)))
+      (check "their genuine signature verifies"
+             (m:verify-commitment tx sig our-pub their-pub amount their-pub))
+      (check "a signature by the wrong key is rejected"
+             (not (m:verify-commitment tx sig our-pub their-pub amount our-pub)))
+      (let ((tampered (copy-seq (c:octets sig))))
+        (setf (aref tampered 10) (logxor (aref tampered 10) 1))
+        (check "a tampered signature is rejected"
+               (not (m:verify-commitment tx tampered our-pub their-pub amount their-pub))))
+      ;; A signature over a DIFFERENT amount must fail: the funding amount is part
+      ;; of the BIP143 sighash, and accepting a mismatch would mean signing away a
+      ;; channel whose real capacity is not what we think.
+      (check "a signature over a different funding amount is rejected"
+             (not (m:verify-commitment tx sig our-pub their-pub (1+ amount) their-pub))))))

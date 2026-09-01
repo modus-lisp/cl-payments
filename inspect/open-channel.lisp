@@ -185,7 +185,14 @@
                    (ch:make-open-channel
                     :chain-hash (w:chain-hash)
                     :temporary-channel-id temp-id
-                    :funding-satoshis funding-sat :push-msat 0
+                    :funding-satoshis funding-sat
+                    ;; Push a quarter of the channel to them.  A channel funded
+                    ;; entirely by us is outbound-only: the peer holds nothing, so
+                    ;; nobody can route a payment TOWARD us over it and the
+                    ;; channel is half useless the moment it is announced.  Real
+                    ;; nodes solve this by buying inbound liquidity; on a devnet,
+                    ;; pushing at open is the honest equivalent.
+                    :push-msat (* 1000 (floor funding-sat 4))
                     :dust-limit-satoshis 546
                     :max-htlc-value-in-flight-msat (* funding-sat 1000)
                     :channel-reserve-satoshis (floor funding-sat 100)
@@ -353,8 +360,9 @@
                                         :funding-txid (btx:tx-txid ftx)
                                         :funding-index fidx
                                         :capacity-sat funding-sat
-                                        :local-msat (* 1000 funding-sat)
-                                        :remote-msat 0
+                                        :local-msat (* 1000 (- funding-sat
+                                                               (floor funding-sat 4)))
+                                        :remote-msat (* 1000 (floor funding-sat 4))
                                         :key-index key-index
                                         :scid scid
                                         :remote-funding-pubkey (ch:ac-funding-pubkey acc)))
