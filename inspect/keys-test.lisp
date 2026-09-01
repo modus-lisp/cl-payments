@@ -160,9 +160,90 @@
         (k:shachain-insert chain (1- k:+max-commitment-index+)
                            (k:generate-from-seed seed-b (1- k:+max-commitment-index+)))))))
 
+(defun test-commitment-key-set ()
+  "DERIVE-COMMITMENT-KEYS assembles every key that appears in one commitment.
+   It had no coverage at all — the individual derivations were tested and the
+   function that actually calls them was not, which is the gap most likely to
+   put a correct key in the wrong slot."
+  (with-gate ("BOLT #3 — the full key set for a commitment")
+    (let* ((seed (hx (make-string 64 :initial-element #\7)))
+           (pcp (k:per-commitment-point seed 42))
+           ;; Six independent basepoints, so a transposed slot cannot pass by
+           ;; coincidence — with shared basepoints, swapping two fields would be
+           ;; invisible.
+           (payment      (c:compressed-pubkey (c:pubkey-of 11111)))
+           (delayed      (c:compressed-pubkey (c:pubkey-of 22222)))
+           (htlc         (c:compressed-pubkey (c:pubkey-of 33333)))
+           (revocation   (c:compressed-pubkey (c:pubkey-of 44444)))
+           (r-payment    (c:compressed-pubkey (c:pubkey-of 55555)))
+           (r-htlc       (c:compressed-pubkey (c:pubkey-of 66666)))
+           (keys (k:derive-commitment-keys
+                  :per-commitment-point pcp
+                  :payment-basepoint payment
+                  :delayed-payment-basepoint delayed
+                  :htlc-basepoint htlc
+                  :revocation-basepoint revocation
+                  :remote-payment-basepoint r-payment
+                  :remote-htlc-basepoint r-htlc)))
+      ;; Each slot must hold the key derived from ITS OWN basepoint.
+      (check-bytes "local key comes from the payment basepoint"
+                   (k:ck-local keys) (k:derive-pubkey payment pcp))
+      (check-bytes "delayed key comes from the delayed basepoint"
+                   (k:ck-delayed keys) (k:derive-pubkey delayed pcp))
+      (check-bytes "local htlc key comes from the htlc basepoint"
+                   (k:ck-local-htlc keys) (k:derive-pubkey htlc pcp))
+      (check-bytes "remote key comes from the remote payment basepoint"
+                   (k:ck-remote keys) (k:derive-pubkey r-payment pcp))
+      (check-bytes "remote htlc key comes from the remote htlc basepoint"
+                   (k:ck-remote-htlc keys) (k:derive-pubkey r-htlc pcp))
+      ;; The revocation key is NOT an ordinary blinded key, and must not be
+      ;; derived like one — that mistake yields a spendable-looking key with no
+      ;; punishment property at all.
+      (check-bytes "revocation key uses the revocation construction"
+                   (k:ck-revocation keys) (k:derive-revocation-pubkey revocation pcp))
+      (check "revocation key is not the ordinary blinding of its basepoint"
+             (not (equalp (k:ck-revocation keys) (k:derive-pubkey revocation pcp))))
+      ;; Every slot distinct: a duplicate means two roles share a key.
+      (let ((all (list (k:ck-local keys) (k:ck-remote keys) (k:ck-delayed keys)
+                       (k:ck-revocation keys) (k:ck-local-htlc keys) (k:ck-remote-htlc keys))))
+        (check "all six keys are distinct"
+               (= 6 (length (remove-duplicates all :test #'equalp)))))
+      ;; The remote fields are optional; absent input must give NIL rather than
+      ;; silently reusing a local key.
+      (let ((partial (k:derive-commitment-keys
+                      :per-commitment-point pcp
+                      :payment-basepoint payment
+                      :delayed-payment-basepoint delayed
+                      :htlc-basepoint htlc
+                      :revocation-basepoint revocation)))
+        (check "absent remote basepoints give NIL, not a stand-in"
+               (and (null (k:ck-remote partial)) (null (k:ck-remote-htlc partial))))))))
+
+(defun test-shachain-sequence ()
+  "BOLT #3's storage test walks a real revocation sequence, not one insertion."
+  (with-gate ("BOLT #3 — a full revocation sequence")
+    (let* ((seed (hx (make-string 64 :initial-element #\f)))
+           (chain (k:make-shachain))
+           (n 64))
+      ;; Secrets arrive in DECREASING index order, as they do on a live channel.
+      (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
+            do (k:shachain-insert chain i (k:generate-from-seed seed i)))
+      (check "every secret in the sequence is reproducible"
+             (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
+                   always (equalp (c:octets (k:shachain-lookup chain i))
+                                  (c:octets (k:generate-from-seed seed i)))))
+      ;; A state that has NOT been revoked must not be derivable — if it were,
+      ;; we could punish a commitment the counterparty is still entitled to use.
+      (check "an index that has not been revoked yet returns NIL"
+             (null (k:shachain-lookup chain (- k:+max-commitment-index+ n 1))))
+      (check "storage stays bounded across the whole sequence"
+             (<= (count-if-not #'null (k::shachain-known chain)) 49)))))
+
 (defun run-keys-tests ()
   (test-key-derivation-vectors)
   (test-generate-from-seed)
   (test-derivation-algebra)
   (test-hash-argument-order)
-  (test-shachain))
+  (test-shachain)
+  (test-shachain-sequence)
+  (test-commitment-key-set))
