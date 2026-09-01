@@ -15,6 +15,7 @@
                     (#:ch #:cl-payments.channel)
                     (#:u #:cl-payments.updates)
                     (#:n #:cl-payments.node)
+                    (#:fw #:cl-payments.forward)
                     (#:secp #:secp256k1-fast))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*

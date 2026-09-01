@@ -18,6 +18,7 @@
   (run-gossip-tests)
   (run-gossip-encode-tests)
   (run-accept-tests)
+  (run-forward-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)

@@ -303,6 +303,40 @@ Channel keys are derived from the node key and an index rather than generated
 randomly — `open-channel.lisp` had been generating them fresh, which made the
 script the only thing holding half of a 2-of-2 over real funds.
 
+### 5a — the forwarding decision  **[DONE]**
+
+`src/forward.lisp`: BOLT #4 failure codes, our fee/CLTV policy, and the check
+that decides whether to forward an HTLC.  No onion yet — peeling a layer tells
+us WHAT the sender asked for, but whether that request is acceptable is a
+policy question about our own channel, and it is the half where the money is.
+
+Every check exists because skipping it loses funds:
+
+- **Fee.** Our fee is the DIFFERENCE between the two HTLCs, fixed the instant we
+  forward.  There is no later opportunity to collect, so an underpaying sender
+  is asking us to subsidise them.
+- **CLTV.** We must have strictly more time to claim the incoming HTLC than the
+  downstream node has to claim the outgoing one.  Reverse that and they can sit
+  on the preimage until our incoming HTLC expires and only then claim the
+  outgoing one — we have paid and cannot collect.  That margin is exactly what
+  `cltv_expiry_delta` is for.
+- **Expiry vs the tip.** An HTLC near its deadline cannot be safely claimed
+  on-chain, because a force-close needs confirmations we do not have time for.
+  One far in the future locks our liquidity for weeks at no cost to the sender.
+
+The failure FLAGS matter as much as the codes.  Marking a transient failure PERM
+tells every sender to stop using our channel; omitting UPDATE on a fee change
+means senders keep retrying with the old fee and never learn why.  The flags are
+read off the code rather than tabulated, so a new code cannot be classified
+inconsistently with its own number.
+
+Validated against Core Lightning: `getroute` through our node pays 1001001 msat
+to forward 1000000 with a CLTV margin of 40 — exactly what our formula says, and
+the baseline every test in `forward-test.lisp` perturbs.
+
+66 checks, 13 mutations, 13 killed — including "forward everything", which fails
+24 of them.
+
 ### 4d — the HTLC lifecycle  **[PARTIAL]**
 
 `src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
