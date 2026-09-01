@@ -24,7 +24,7 @@
   (:nicknames #:ln-peer)
   (:export
    #:peer #:peer-p #:peer-node-id #:peer-session #:peer-features
-   #:peer-alive-p #:peer-connected-at #:peer-their-init #:peer-log
+   #:peer-alive-p #:peer-connected-at #:peer-their-init #:peer-log #:peer-last-error
    #:connect #:accept #:disconnect #:send-message #:on
    #:start-read-loop #:run-read-loop
    #:ping #:send-warning #:send-error #:pong-required-p #:+max-pong-bytes+
@@ -76,6 +76,10 @@
   (handlers (make-hash-table))
   (alive-p t)
   (connected-at 0)
+  ;; Why the read loop stopped.  Without this a dropped connection is a silent
+  ;; NIL — the loop catches everything so one bad peer can't take the node down,
+  ;; which also means the reason has nowhere to go unless it is recorded.
+  last-error
   thread
   (log-stream *standard-output*)
   (lock (bt:make-lock "peer")))
@@ -299,8 +303,15 @@
   (tp:noise-clear-timeout (peer-session p))
   (setf (peer-thread p)
         (bt:make-thread (lambda ()
-                          (handler-case (run-read-loop p)
-                            (error (e) (peer-log p "read loop ended: ~a" e))))
+                          ;; Each peer thread needs its OWN EC scratch: gossip
+                          ;; signature checks (Phase 3) run here, and sharing the
+                          ;; backend's global buffers across threads silently
+                          ;; corrupts results.
+                          (c:with-ec-scratch
+                           (handler-case (run-read-loop p)
+                             (error (e)
+                               (setf (peer-last-error p) e)
+                               (peer-log p "read loop ended: ~a" e)))))
                         :name "ln-peer-read-loop"))
   p)
 
@@ -333,7 +344,14 @@
 (defun accept (stream local-privkey
                &key closer (features f:*default-features*) chain-hashes
                     (log *standard-output*) (read-loop t))
-  "Responder side, on an already-accepted STREAM."
+  "Responder side, on an already-accepted STREAM.
+
+   THE CALLER'S THREAD MUST OUTLIVE THE CONNECTION.  In SBCL a socket created by
+   a thread is torn down when that thread exits, so a listener callback that
+   accepts here, lets READ-LOOP spawn a thread, and then returns leaves the
+   stream with a NIL buffer — the next write dies deep inside SB-IMPL with a type
+   error that says nothing about threads.  From a short-lived callback, pass
+   :READ-LOOP NIL and call RUN-READ-LOOP so that thread becomes the owner."
   (let ((session (tp:accept-peer stream local-privkey :closer closer)))
     (let ((p (%wrap session :features features :chain-hashes chain-hashes :log log)))
       (when read-loop (start-read-loop p))

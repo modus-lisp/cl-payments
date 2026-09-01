@@ -31,7 +31,7 @@
    #:encrypt-with-ad #:decrypt-with-ad #:aead-auth-error
    ;; keys / ECDH
    #:compressed-pubkey #:parse-pubkey #:pubkey-of #:generate-key #:valid-privkey-p
-   #:ecdh))
+   #:ecdh #:with-ec-scratch))
 
 (in-package #:cl-payments.crypto)
 
@@ -214,6 +214,37 @@
   (loop for k = (secp:bytes-to-int (ic:random-data 32))
         when (valid-privkey-p k)
           return (values k (pubkey-of k))))
+
+(defmacro with-ec-scratch (&body body)
+  "Bind secp256k1-fast's scalar-multiplication scratch space for this thread.
+
+   The fast limb backend keeps its working buffers in GLOBAL special variables —
+   fine single-threaded, and actively wrong otherwise: two threads doing point
+   arithmetic at the same time overwrite each other's intermediates and the
+   result comes back as the point at infinity or, worse, a valid-looking wrong
+   point.  ANY thread that touches ECDH or key derivation must be inside this.
+
+   A node talks to many peers at once, so this is not a corner case — it is the
+   normal operating condition.  Expands to nothing on builds without the limb
+   backend, where the portable path has no shared state."
+  ;; Resolved with FIND-SYMBOL rather than written as SECP256K1-FAST:... — a
+  ;; package-qualified symbol is read before the COND ever runs, so naming a
+  ;; macro that an older secp256k1-fast doesn't export makes this file fail to
+  ;; COMPILE rather than fall back.
+  ;;
+  ;; WITH-FRESH-CT-SCRATCH covers the constant-time base multiply (behind
+  ;; SECP-PUBKEY and both signature schemes) AND the field arithmetic beneath it.
+  ;; WITH-FRESH-SCRATCH alone covers only the latter, which is not enough — it is
+  ;; accepted here so the system still builds, with a warning, but such a build
+  ;; corrupts keys under concurrent load.
+  (let ((ct (find-symbol "WITH-FRESH-CT-SCRATCH" "SECP256K1-FAST"))
+        (fs (find-symbol "WITH-FRESH-SCRATCH" "SECP256K1-FAST")))
+    (cond ((and ct (macro-function ct)) `(,ct ,@body))
+          ((and fs (macro-function fs))
+           (warn "secp256k1-fast has no WITH-FRESH-CT-SCRATCH: concurrent key ~
+                  derivation will silently corrupt. Update the dependency.")
+           `(,fs ,@body))
+          (t `(progn ,@body)))))
 
 (defun ecdh (point privkey)
   "BOLT #8 ECDH: SHA-256 of the *compressed* shared point.  The hash is part of

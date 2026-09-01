@@ -262,7 +262,13 @@
   remote-node-id            ; their 33-byte static pubkey
   sk sn s-ck                ; sending key / nonce / chaining key
   rk rn r-ck                ; receiving key / nonce / chaining key
-  (lock (bordeaux-threads:make-lock "noise")))
+  ;; TWO locks, not one.  The directions are fully independent — separate keys,
+  ;; nonces and chaining keys — and NOISE-RECV blocks on the socket for as long
+  ;; as the peer stays quiet, which is most of the time.  A single lock would let
+  ;; a reader parked in RECV hold off every send on that connection: the read
+  ;; loop takes it, blocks, and the first thing that tries to write deadlocks.
+  (send-lock (bordeaux-threads:make-lock "noise-send"))
+  (recv-lock (bordeaux-threads:make-lock "noise-recv")))
 
 (defun %make-session (hs sk rk)
   (%make-noise :remote-node-id (handshake-remote-static hs)
@@ -305,7 +311,7 @@
 (defun noise-send (n payload)
   "Frame and send one Lightning message.  PAYLOAD is the already-encoded message
    (type ‖ body) from the wire layer."
-  (bordeaux-threads:with-lock-held ((noise-lock n))
+  (bordeaux-threads:with-lock-held ((noise-send-lock n))
     (let ((frame (%frame n payload)))
       (write-sequence frame (noise-stream n))
       (force-output (noise-stream n))
@@ -322,7 +328,7 @@
 
 (defun noise-recv (n)
   "Read one Lightning message.  Returns the decrypted payload (type ‖ body)."
-  (bordeaux-threads:with-lock-held ((noise-lock n))
+  (bordeaux-threads:with-lock-held ((noise-recv-lock n))
     (%maybe-rotate (noise-r-ck n) (noise-rk n) (noise-rn n))
     (let* ((header (%read-exactly (noise-stream n) +header-size+))
            (len-bytes (handler-case
@@ -365,7 +371,8 @@
 
 (defun handshake-as-initiator (stream local-privkey remote-node-id)
   "Run acts one through three as the dialer.  Returns a NOISE session."
-  (let ((hs (make-initiator-handshake local-privkey remote-node-id)))
+  (c:with-ec-scratch
+   (let ((hs (make-initiator-handshake local-privkey remote-node-id)))
     (write-sequence (act-one-write hs) stream)
     (force-output stream)
     (act-two-read hs (%read-exactly stream +act-two-size+))
@@ -373,18 +380,19 @@
       (write-sequence msg stream)
       (force-output stream)
       (setf (noise-stream session) stream)
-      session)))
+      session))))
 
 (defun handshake-as-responder (stream local-privkey)
   "Run acts one through three as the listener.  Returns a NOISE session whose
    REMOTE-NODE-ID is the identity the initiator revealed in act three."
-  (let ((hs (make-responder-handshake local-privkey)))
+  (c:with-ec-scratch
+   (let ((hs (make-responder-handshake local-privkey)))
     (act-one-read hs (%read-exactly stream +act-one-size+))
     (write-sequence (act-two-write hs) stream)
     (force-output stream)
     (let ((session (act-three-read hs (%read-exactly stream +act-three-size+))))
       (setf (noise-stream session) stream)
-      session)))
+      session))))
 
 (defun connect-peer (host port remote-node-id local-privkey
                      &key (transport :direct) (timeout 10))

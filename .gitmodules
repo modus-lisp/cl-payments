@@ -1,0 +1,6 @@
+[submodule "deps/secp256k1-fast"]
+	path = deps/secp256k1-fast
+	url = https://github.com/modus-lisp/secp256k1-fast.git
+[submodule "deps/cl-transport"]
+	path = deps/cl-transport
+	url = https://github.com/modus-lisp/cl-transport.git

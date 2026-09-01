@@ -73,9 +73,44 @@ A strict subset of cl-consensus's, deliberately — `secp256k1-fast` (the crypto
 Notably absent: `pagetree`, `usocket`, `jzon`, `hunchentoot` — nothing here needs
 a UTXO store or an HTTP server yet.
 
+`secp256k1-fast` and `cl-transport` are not on Quicklisp, so they are vendored as
+submodules under `deps/`:
+
 ```sh
+git clone --recursive <url>       # already cloned?  git submodule update --init
 export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD\") :inherit-configuration)"
 ```
+
+**`secp256k1-fast` must be at a commit with `WITH-FRESH-CT-SCRATCH`.** Without
+it, concurrent key derivation silently returns wrong points — see the note under
+Testing. The build warns loudly if the dependency is too old.
+
+## Testing
+
+```sh
+inspect/run-all.sh        # everything offline, in one command
+```
+
+Two kinds of gate. The **vector** gates check each layer against the RFCs' and
+BOLTs' own published vectors. The **loopback** gate stands the whole stack up
+against itself over a real socket — our initiator against our own responder —
+and drives handshake, init, ping/pong, oversized payloads, key rotation past the
+1000-message boundary, an idle period, and error propagation.
+
+The loopback gate exists because every published vector is one-sided: BOLT #8
+pins what an initiator *sends*, and nothing in it proves our responder can read
+what our initiator writes. It found three bugs on its first run —
+
+- **concurrent key derivation returning wrong points**, because
+  `secp256k1-fast`'s constant-time scratch is module-level and the macro that
+  looked like it protected them covers a disjoint set of buffers (fixed
+  upstream; 1600/1600 wrong before, 0 after);
+- **a socket torn down when its creating thread exited**, surfacing as a NIL
+  buffer deep inside SBCL rather than anything about threads;
+- **`noise-recv` holding the session lock while blocked on the socket**, so a
+  read loop waiting for a message — i.e. nearly always — deadlocked every send.
+
+`inspect/live-peer.lisp` is separate and needs a real node; CI does not run it.
 
 ## Quick start
 
