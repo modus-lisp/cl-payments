@@ -1,0 +1,8 @@
+# BOLT #3 Appendix C, from the "all five HTLCs untrimmed (minimum feerate)" vector.
+# The spec publishes the SIGNED (segwit) HTLC transactions; these are the same
+# transactions without their witnesses, which is what BUILD-HTLC-TX produces.
+# The signatures are checked separately by reproducing them.
+#
+# <name> <hex>
+htlc_success_0 0200000001ab84ff284f162cfbfef241f853b47d4368d171f9e2a1445160cd591c4c7d882b00000000000000000001e8030000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e00000000
+htlc_timeout_2 0200000001ab84ff284f162cfbfef241f853b47d4368d171f9e2a1445160cd591c4c7d882b01000000000000000001d0070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80ef6010000

@@ -51,6 +51,8 @@
    #:htlc-payment-hash #:offered-htlc-script #:received-htlc-script
    ;; the transaction
    #:build-commitment #:sign-commitment #:commitment-sighash
+   ;; second-stage HTLC transactions
+   #:htlc-tx-script #:build-htlc-tx #:htlc-tx-fee #:sign-htlc-tx #:htlc-tx-sighash
    #:commitment-error))
 
 (in-package #:cl-payments.commitment)
@@ -433,4 +435,82 @@
   (let ((hash (commitment-sighash tx local-funding-pubkey remote-funding-pubkey
                                   funding-amount-sat)))
     (multiple-value-bind (r s) (secp:ecdsa-sign-raw funding-privkey hash)
+      (bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s)))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; Second-stage HTLC transactions
+;;;
+;;; An HTLC output on a commitment cannot simply be swept.  Claiming it needs a
+;;; SECOND transaction — HTLC-success with the preimage, HTLC-timeout after the
+;;; expiry — and that transaction pays into the same delayed, revocable script
+;;; the `to_local` output uses.  So an HTLC you win still sits behind
+;;; `to_self_delay`, and is still punishable if the commitment it came from was
+;;; revoked.
+;;;
+;;; Both transactions are pre-signed by the counterparty at the time the HTLC is
+;;; added: you receive their signature and can only ever complete the one whose
+;;; condition you can satisfy.  That is why the timeout transaction's locktime is
+;;; `cltv_expiry` — the signature exists from the start, and the timelock is what
+;;; stops it being used early.
+
+(defun htlc-tx-script (revocation-pubkey to-self-delay delayed-pubkey)
+  "The output script of an HTLC transaction — identical to `to_local`.  Winning
+   an HTLC does not get you the money immediately; it gets you the same delayed,
+   revocable output."
+  (to-local-script revocation-pubkey to-self-delay delayed-pubkey))
+
+(defun htlc-tx-fee (feerate-per-kw direction)
+  "The second-stage fee, which is what makes a small HTLC not worth claiming and
+   therefore trimmed from the commitment in the first place."
+  (floor (* feerate-per-kw (ecase direction
+                             (:offered +htlc-timeout-weight+)
+                             (:received +htlc-success-weight+)))
+         1000))
+
+(defun build-htlc-tx (&key commitment-txid output-index htlc-amount-msat direction
+                           cltv-expiry feerate-per-kw
+                           revocation-pubkey to-self-delay delayed-pubkey)
+  "The HTLC-success (:received) or HTLC-timeout (:offered) transaction spending
+   one HTLC output of a commitment.
+
+   The locktime is the difference: 0 for success — the preimage is proof enough,
+   there is nothing to wait for — and `cltv_expiry` for timeout, which is what
+   stops the offerer reclaiming the HTLC before it has actually expired."
+  (let* ((fee (htlc-tx-fee feerate-per-kw direction))
+         (amount (- (floor htlc-amount-msat 1000) fee)))
+    (when (minusp amount)
+      (error 'commitment-error
+             :detail (format nil "HTLC of ~d msat cannot pay its ~d sat second-stage fee"
+                             htlc-amount-msat fee)))
+    (let ((tx (btx:make-tx
+               :version 2
+               :inputs (list (btx:make-txin
+                              :prev-hash (c:octets commitment-txid)
+                              :prev-index output-index
+                              :script #()
+                              ;; 0 without option_anchors; 1 with it.
+                              :sequence 0))
+               :outputs (list (btx:make-txout
+                               :value amount
+                               :script (p2wsh (htlc-tx-script revocation-pubkey
+                                                              to-self-delay
+                                                              delayed-pubkey))))
+               :witnesses (list nil)
+               :locktime (ecase direction
+                           (:received 0)
+                           (:offered cltv-expiry))
+               :segwit-p nil)))
+      (btx:parse-tx (bw:make-reader (btx:serialize-tx tx))))))
+
+(defun htlc-tx-sighash (tx htlc-witness-script htlc-amount-sat)
+  "BIP143 digest for an HTLC transaction.  The scriptCode is the HTLC output's
+   own witness script — the offered/received script from the commitment, not the
+   HTLC transaction's output script."
+  (bs:bip143-sighash tx 0 htlc-witness-script htlc-amount-sat bs:+sighash-all+))
+
+(defun sign-htlc-tx (tx privkey htlc-witness-script htlc-amount-sat)
+  "Sign an HTLC transaction, returning the 64-byte compact form."
+  (let ((hash (htlc-tx-sighash tx htlc-witness-script htlc-amount-sat)))
+    (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey hash)
       (bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s)))))

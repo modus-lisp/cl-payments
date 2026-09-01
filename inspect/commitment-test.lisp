@@ -401,6 +401,109 @@
                                                        (hx *c-remote-funding-pubkey*)
                                                        10000001))))))))
 
+(defun htlc-tx-vector (name)
+  (with-open-file (f (asdf:system-relative-pathname "cl-payments" "inspect/vectors/htlc-txs.txt")
+                     :if-does-not-exist nil)
+    (when f
+      (loop for line = (read-line f nil)
+            while line
+            for l = (string-trim '(#\Space #\Return) line)
+            unless (or (zerop (length l)) (char= (char l 0) #\#))
+              do (let ((sp (position #\Space l)))
+                   (when (string= (subseq l 0 sp) name)
+                     (return (subseq l (1+ sp)))))))))
+
+(defun test-htlc-transactions ()
+  "The SECOND-stage transactions.  Winning an HTLC does not hand you the money —
+   it hands you another delayed, revocable output, so an HTLC claimed from a
+   revoked commitment is still punishable."
+  (with-gate ("BOLT #3 — HTLC-success and HTLC-timeout transactions (Appendix C)")
+    (let ((commitment-txid
+            (hx "ab84ff284f162cfbfef241f853b47d4368d171f9e2a1445160cd591c4c7d882b")))
+      ;; HTLC-success: locktime 0.  The preimage is proof enough; there is
+      ;; nothing to wait for.
+      (let ((tx (m:build-htlc-tx
+                 :commitment-txid commitment-txid :output-index 0
+                 :htlc-amount-msat 1000000 :direction :received
+                 :cltv-expiry 500 :feerate-per-kw 0
+                 :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                 :delayed-pubkey (hx *c-delayed-pubkey*))))
+        (check-bytes "htlc_success_tx (htlc #0)"
+                     (cl-consensus.tx:serialize-tx tx) (hx (htlc-tx-vector "htlc_success_0")))
+        (check-equal "success locktime is 0" (cl-consensus.tx:tx-locktime tx) 0))
+      ;; HTLC-timeout: locktime is the expiry.  The counterparty signed this
+      ;; transaction when the HTLC was added, so the timelock is the ONLY thing
+      ;; preventing the offerer from reclaiming the HTLC immediately.
+      (let ((tx (m:build-htlc-tx
+                 :commitment-txid commitment-txid :output-index 1
+                 :htlc-amount-msat 2000000 :direction :offered
+                 :cltv-expiry 502 :feerate-per-kw 0
+                 :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                 :delayed-pubkey (hx *c-delayed-pubkey*))))
+        (check-bytes "htlc_timeout_tx (htlc #2)"
+                     (cl-consensus.tx:serialize-tx tx) (hx (htlc-tx-vector "htlc_timeout_2")))
+        (check-equal "timeout locktime is the cltv_expiry"
+                     (cl-consensus.tx:tx-locktime tx) 502))
+      ;; The output pays into the SAME script as to_local — delay and all.
+      (check-bytes "the HTLC tx output script is the to_local script"
+                   (m:htlc-tx-script (hx *c-revocation-pubkey*) 144 (hx *c-delayed-pubkey*))
+                   (m:to-local-script (hx *c-revocation-pubkey*) 144 (hx *c-delayed-pubkey*)))
+      ;; Fees: the two directions differ, and at a high enough feerate the HTLC
+      ;; cannot pay for its own claim — which is exactly why it would have been
+      ;; trimmed from the commitment.
+      (check-equal "timeout fee at 15000/kw" (m:htlc-tx-fee 15000 :offered) (floor (* 15000 663) 1000))
+      (check-equal "success fee at 15000/kw" (m:htlc-tx-fee 15000 :received) (floor (* 15000 703) 1000))
+      (check "success costs more than timeout"
+             (> (m:htlc-tx-fee 15000 :received) (m:htlc-tx-fee 15000 :offered)))
+      (check-signals "an HTLC too small to pay its own second-stage fee is refused"
+          m:commitment-error
+        (m:build-htlc-tx :commitment-txid commitment-txid :output-index 0
+                         :htlc-amount-msat 1000 :direction :received
+                         :cltv-expiry 500 :feerate-per-kw 15000
+                         :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                         :delayed-pubkey (hx *c-delayed-pubkey*))))))
+
+(defun test-htlc-signatures ()
+  "Reproduce the spec's htlc_signature values.  The scriptCode for an HTLC
+   transaction is the HTLC OUTPUT's witness script — the offered/received script
+   from the commitment — not the HTLC transaction's own output script.  Using the
+   wrong one produces a valid signature over the wrong thing."
+  (with-gate ("BOLT #3 — HTLC transaction signatures (Appendix C)")
+    (let* ((commitment-txid
+             (hx "ab84ff284f162cfbfef241f853b47d4368d171f9e2a1445160cd591c4c7d882b"))
+           (local-htlc-privkey
+             ;; From local_htlc_basepoint_secret via the per-commitment point;
+             ;; the spec lists the derived key directly.
+             (k:derive-privkey
+              (secp256k1-fast:bytes-to-int
+               (hx "1111111111111111111111111111111111111111111111111111111111111111"))
+              (hx "025f7117a78150fe2ef97db7cfc83bd57b2e2c0d0dd25eaf467a4a1c2a45ce1486")))
+           (witness-script
+             (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)
+                                     (hx *c-local-htlc-pubkey*)
+                                     (%preimage-hash "0000000000000000000000000000000000000000000000000000000000000000")
+                                     500))
+           (tx (m:build-htlc-tx
+                :commitment-txid commitment-txid :output-index 0
+                :htlc-amount-msat 1000000 :direction :received
+                :cltv-expiry 500 :feerate-per-kw 0
+                :revocation-pubkey (hx *c-revocation-pubkey*) :to-self-delay 144
+                :delayed-pubkey (hx *c-delayed-pubkey*)))
+           (sig (m:sign-htlc-tx tx local-htlc-privkey witness-script 1000)))
+      (check-bytes "local_htlc_signature for HTLC #0 matches the spec"
+                   sig
+                   (hx "636de5682ef0c5b61f124ec74e8aa2461a69777521d6998295dcea36bc333811165285594b23c50b28b82df200234566628a27bcd17f7f14404bd865354eb3ce"))
+      ;; The HTLC amount is in the BIP143 digest too.
+      (check "a different HTLC amount gives a different digest"
+             (not (equalp (m:htlc-tx-sighash tx witness-script 1000)
+                          (m:htlc-tx-sighash tx witness-script 1001))))
+      ;; And the scriptCode must be the HTLC output's script, not the tx's own.
+      (check "using the wrong scriptCode gives a different digest"
+             (not (equalp (m:htlc-tx-sighash tx witness-script 1000)
+                          (m:htlc-tx-sighash tx (m:htlc-tx-script (hx *c-revocation-pubkey*)
+                                                                  144 (hx *c-delayed-pubkey*))
+                                             1000)))))))
+
 (defun run-commitment-tests ()
   (test-commitment-scripts)
   (test-obscured-commitment-number)
@@ -411,4 +514,6 @@
   (test-htlc-trimming)
   (test-five-htlc-commitment)
   (test-cltv-tiebreak)
-  (test-commitment-signing))
+  (test-commitment-signing)
+  (test-htlc-transactions)
+  (test-htlc-signatures))

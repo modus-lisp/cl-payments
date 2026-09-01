@@ -185,7 +185,14 @@ HTLCs with the same rounded amount and payment hash produce byte-identical
 outputs — so the order is only recoverable from the CLTV tiebreak, and the caller
 cannot reconstruct it.
 
-Still to do: the HTLC-timeout/success transactions, and anchor outputs.
+The second-stage HTLC transactions are done as well — HTLC-success and
+HTLC-timeout both reproduce from Appendix C, and so does `local_htlc_signature`.
+Winning an HTLC does not hand you the money: it hands you another delayed,
+revocable output, so an HTLC claimed from a revoked commitment is still
+punishable.
+
+Not done: anchor outputs (`option_anchors`), which is a feature we do not
+negotiate. BOLT #3 is otherwise complete.
 
 ### 4c — the BOLT #2 messages, and a live channel open
 
