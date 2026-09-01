@@ -245,6 +245,34 @@ flaps; with it off, LND never relays gossip and routes die at the LND hop. As a
 leaf with sync off the links are stable, which is what BOLT #8/#1/#2 interop
 needs.
 
+### 4e — the daemon  **[DONE]**
+
+`src/node.lisp` and `bin/cl-payments.lisp`: a process that listens, accepts
+inbound connections, holds a peer registry, persists channel state, and answers
+`channel_reestablish` and `announcement_signatures`.
+
+Three things needed this and could not be faked with a script:
+
+- **Inbound.** Core Lightning now dials *us*. That is the first time cl-payments
+  has been the BOLT #8 responder against a real implementation rather than the
+  initiator.
+- **Reconnection.** The daemon answers `channel_reestablish` for an existing
+  channel and CLN accepts it, replying `channel_ready` — the channel is resynced
+  across a reconnect.
+- **`announcement_signatures`.** Received for `258x1x0`. They arrive once the
+  funding is buried, to a CONNECTED peer, so a script that exits after
+  `channel_ready` can never see them. This was the concrete blocker on
+  cl-payments ever being routable, and it is now cleared.
+
+Channel state is written as s-expressions via a temp-file-and-rename, so a crash
+mid-write leaves the previous good file: losing channel state means losing the
+ability to claim your own money.
+
+The thread rule from the loopback gate is load-bearing here. In SBCL a socket is
+torn down when its creating thread exits, so `on-inbound` ends in
+`run-read-loop` — becoming the connection's owner — rather than spawning a
+reader and returning.
+
 ### 4d — the HTLC lifecycle  **[PARTIAL]**
 
 `src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,

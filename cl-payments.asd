@@ -30,7 +30,8 @@
      (:file "keys")        ; BOLT #3: per-commitment key derivation + revocation
      (:file "commitment")  ; BOLT #3: commitment transactions and their scripts
      (:file "channel")     ; BOLT #2: opening a channel
-     (:file "updates"))))  ; BOLT #2: the HTLC lifecycle and its state machine
+     (:file "updates")     ; BOLT #2: the HTLC lifecycle and its state machine
+     (:file "node"))))     ; the daemon: listener, peer registry, channel state
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
 (defsystem "cl-payments/test"
