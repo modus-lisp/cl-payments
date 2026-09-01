@@ -33,7 +33,8 @@ for both projects. See `/mnt/lisp/signet/README.md`.
 crypto.lisp     Phase 0  HKDF, ChaCha20-Poly1305, ECDH                 [DONE]
 wire.lisp       Phase 0  BigSize, TLV, message envelope, big-endian IO [DONE]
 transport.lisp  Phase 1  BOLT #8 Noise_XK handshake + framing          [DONE]
-peer.lisp       Phase 2  init/ping/pong, feature bits, the message loop
+features.lisp   Phase 2  BOLT #9 feature bits and negotiation           [DONE]
+peer.lisp       Phase 2  init/ping/pong/error + the async read loop     [DONE]
 gossip.lisp     Phase 3  BOLT #7 channel/node announcements, routing graph
 channel.lisp    Phase 4  BOLT #2 open/accept, funding, commitment_signed
 commitment.lisp Phase 5  BOLT #3 commitment + HTLC transactions, key derivation
@@ -63,18 +64,36 @@ reproduce exactly (`inspect/transport-test.lisp`), *and* `inspect/live-peer.lisp
 completes a real handshake against both cln1 and lnd1, exchanging BOLT #1 `init`
 and decoding CLN's gossip that follows.
 
-## Phase 2 — the peer protocol
+## Phase 2 — the peer protocol  **[DONE]**
 
-`init` with real feature bits, `ping`/`pong` with the BOLT #1 length rules,
-`error`/`warning` handling, and an async read loop in the shape of
-cl-consensus's `peer.lisp`.
+BOLT #9 feature bits with the required/optional pairing and dependency rules;
+`init` with the networks TLV; `ping`/`pong` with the length rules;
+`error`/`warning`; and an async read loop in the shape of cl-consensus's
+`peer.lisp`.
 
-Feature negotiation is the immediate blocker: LND currently **hangs up on us**
-after `init` because we advertise nothing. Working out the minimum acceptable
-feature vector for each implementation is the first task.
+**Milestone — met.** cl-payments stays connected to both cln1 and lnd1, answers
+pings, and `lightning-cli listpeers` shows it as a connected peer.
 
-**Milestone.** Stay connected to cln1 and lnd1 indefinitely, answering pings,
-with both nodes listing us as a peer.
+Three things this phase taught, each of which cost a debugging session:
+
+- **Advertising no features is not neutral, it is fatal.** LND closes the
+  connection immediately after `init` and says nothing. We now advertise the five
+  both implementations mark required — `data_loss_protect`, `var_onion_optin`,
+  `static_remotekey`, `payment_secret`, `channel_type` — as *odd* bits: honest
+  about what we can speak, without demanding the peer treat any of it as
+  mandatory.
+
+- **The connect-time socket timeout must be cleared before the read loop.** A
+  Lightning connection is idle most of the time, so an inherited read timeout
+  kills the loop on the first quiet gap — and it presents as *the peer dropped
+  us* when in fact we dropped the peer. cl-consensus's peer layer has the same
+  fix for the same reason.
+
+- **The `networks` TLV is load-bearing.** Send the wrong chain hash and CLN
+  rejects the connection with `No common network`. That is the TLV working: a
+  clear failure at `init` rather than a confusing one at the first channel. LND
+  is laxer and stays connected, so testing against a single implementation would
+  have hidden it.
 
 ## Phase 3 — gossip and the routing graph
 
@@ -145,5 +164,11 @@ routed end to end.
 
 ## Status
 
-Phases 0 and 1 are done and verified against both the spec vectors and two live
-implementations. Phase 2 is next, starting with feature-bit negotiation.
+Phases 0–2 are done and verified against both the spec vectors and two live
+implementations: 142 offline checks, and a connection that both Core Lightning
+and LND accept and keep. Phase 3 (gossip and the routing graph) is next.
+
+One finding already waiting for it: LND enforces **strictly increasing
+short-channel-ids** during the BOLT #7 channel-range sync and disconnects a peer
+whose reply doesn't satisfy it — it does this to CLN on the devnet today. Our
+gossip must get that ordering right.

@@ -14,6 +14,7 @@
   (run-crypto-tests)
   (run-wire-tests)
   (run-transport-tests)
+  (run-peer-tests)
   (let ((ok (report)))
     (unless ok (uiop:quit 1))
     ok))

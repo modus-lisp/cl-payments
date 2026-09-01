@@ -36,7 +36,7 @@
    ;; the encrypted transport
    #:noise #:noise-p #:noise-remote-node-id #:noise-stream #:noise-closer
    #:noise-sk #:noise-rk #:noise-sn #:noise-rn
-   #:noise-send #:noise-recv #:noise-close
+   #:noise-send #:noise-recv #:noise-close #:noise-clear-timeout
    ;; driving it over a stream
    #:handshake-as-initiator #:handshake-as-responder
    #:connect-peer #:accept-peer
@@ -339,6 +339,19 @@
                           (error 'transport-error)))))
         (incf (noise-rn n))
         payload))))
+
+(defun noise-clear-timeout (n)
+  "Drop the connect-time input timeout from the underlying stream.
+
+   cl-transport/usocket sets a read timeout derived from the DIAL timeout, which
+   is right for the handshake and wrong forever after: a healthy Lightning
+   connection is idle most of the time, so a steady-state read loop that inherits
+   it dies on the first quiet gap.  The failure looks exactly like the peer
+   dropping us — it is us dropping the peer — so this is called before entering
+   the read loop.  (cl-consensus's peer layer does the same thing for the same
+   reason.)"
+  #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (noise-stream n)) nil))
+  n)
 
 (defun noise-close (n)
   (when (noise-closer n)
