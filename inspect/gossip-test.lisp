@@ -178,6 +178,136 @@
                          (sort ts #'<))))
             (check-equal "replaying the whole stream changes nothing" after before)))))))
 
+(defun expected-graph ()
+  "CLN's own reading of the same gossip, recorded alongside the vectors."
+  (with-open-file (f (asdf:system-relative-pathname
+                      "cl-payments" "inspect/vectors/graph-expected.txt")
+                     :if-does-not-exist nil)
+    (unless f (return-from expected-graph nil))
+    (loop for line = (read-line f nil)
+          while line
+          for l = (string-trim '(#\Space #\Return) line)
+          unless (or (zerop (length l)) (char= (char l 0) #\#))
+            collect (let ((p (uiop:split-string l :separator " ")))
+                      (list :scid (first p) :source (second p) :dest (third p)
+                            :base (parse-integer (fourth p))
+                            :ppm (parse-integer (fifth p))
+                            :delay (parse-integer (sixth p))
+                            :hmin (parse-integer (seventh p))
+                            :hmax (parse-integer (eighth p)))))))
+
+(defun our-graph-edges (router)
+  "Our graph flattened to one entry per DIRECTION, in CLN's shape."
+  (let ((out '()))
+    (maphash
+     (lambda (k ch)
+       (declare (ignore k))
+       (dolist (dir '(0 1))
+         (let ((pol (if (zerop dir) (gs:channel-policy-1 ch) (gs:channel-policy-2 ch))))
+           (when pol
+             (push (list :scid (gs:scid-string (gs:channel-scid ch))
+                         :source (c:bytes->hex (if (zerop dir) (gs:channel-node-1 ch)
+                                                   (gs:channel-node-2 ch)))
+                         :dest (c:bytes->hex (if (zerop dir) (gs:channel-node-2 ch)
+                                                 (gs:channel-node-1 ch)))
+                         :base (gs:chan-upd-fee-base-msat pol)
+                         :ppm (gs:chan-upd-fee-proportional-millionths pol)
+                         :delay (gs:chan-upd-cltv-expiry-delta pol)
+                         :hmin (gs:chan-upd-htlc-minimum-msat pol)
+                         :hmax (or (gs:chan-upd-htlc-maximum-msat pol) 0))
+                   out)))))
+     (gs:router-channels router))
+    out))
+
+(defun test-graph-vs-recorded ()
+  "Diff our graph against Core Lightning's reading of the SAME gossip, offline.
+
+   This is the check that would otherwise only exist in the live gate.  Every
+   other offline test here is structural — it proves we parse something, not that
+   we parse it CORRECTLY — and a misread field offset still yields a perfectly
+   plausible fee.  Comparing against an independent implementation's values is
+   the only thing that catches that without a node attached."
+  (with-gate ("BOLT #7 — graph vs. Core Lightning's own reading (recorded)")
+    (let ((theirs (expected-graph)))
+      (unless (check "recorded expectation is present" theirs) (return-from test-graph-vs-recorded))
+      (let ((r (gs:make-router)))
+        (dolist (m (load-gossip-vectors)) (gs:ingest r (car m) (cdr m)))
+        (let ((ours (our-graph-edges r)))
+          (check-equal "same number of directed edges" (length ours) (length theirs))
+          (dolist (want theirs)
+            (let ((got (find-if (lambda (e)
+                                  (and (string= (getf e :scid) (getf want :scid))
+                                       (string-equal (getf e :source) (getf want :source))))
+                                ours)))
+              (if (null got)
+                  (check (format nil "~a from ~a" (getf want :scid)
+                                 (subseq (getf want :source) 0 12)) nil)
+                  (dolist (field '(:dest :base :ppm :delay :hmin :hmax))
+                    (let ((a (getf got field)) (b (getf want field)))
+                      (check (format nil "~a ~a ~(~a~)" (getf want :scid)
+                                     (subseq (getf want :source) 0 12) field)
+                             (if (stringp b) (string-equal a b) (eql a b))
+                             (format nil "ours ~a, theirs ~a" a b))))))))))))
+
+(defun %rebuild-update (payload &key message-flags channel-flags)
+  "A channel_update with its flag bytes rewritten, and htlc_maximum_msat dropped
+   when MESSAGE-FLAGS clears bit 0.
+
+   Synthetic rather than captured, deliberately: this is a test about FIELD
+   OFFSETS, not signatures, and no peer on the devnet emits these variants.  The
+   signature will not verify afterwards, which is fine — the parser is what is
+   under test."
+  (let* ((raw (copy-seq payload))
+         ;; layout: sig(64) chain(32) scid(8) timestamp(4) message_flags(1) channel_flags(1)
+         (mf-off (+ 64 32 8 4))
+         (cf-off (1+ mf-off))
+         (had-max (logtest (aref raw mf-off) 1)))
+    (when message-flags (setf (aref raw mf-off) message-flags))
+    (when channel-flags (setf (aref raw cf-off) channel-flags))
+    (if (and had-max message-flags (not (logtest message-flags 1)))
+        (subseq raw 0 (- (length raw) 8))    ; drop the now-absent htlc_maximum_msat
+        raw)))
+
+(defun test-channel-update-variants ()
+  (with-gate ("BOLT #7 — channel_update field variants")
+    (let ((upd (first (gossip-of-type gs:+msg-channel-update+))))
+      (unless (check "a captured update to derive from" upd)
+        (return-from test-channel-update-variants))
+      (let ((base (cdr upd)))
+        ;; Every captured update sets message_flags bit 0, so the branch where
+        ;; htlc_maximum_msat is ABSENT is never exercised by real vectors.  It is
+        ;; the older-peer path, and reading the field unconditionally would run
+        ;; off the end of the message.
+        (let ((old (check-no-signal "message_flags=0 parses (htlc_maximum absent)"
+                     (gs:parse-channel-update (%rebuild-update base :message-flags 0)))))
+          (check-equal "…and htlc_maximum_msat is nil"
+                       (and old (gs:chan-upd-htlc-maximum-msat old)) nil)
+          ;; The fields BEFORE the optional one must be unaffected — that is what
+          ;; a desync would corrupt.
+          (let ((new (gs:parse-channel-update base)))
+            (check-equal "…fee base still reads correctly"
+                         (and old (gs:chan-upd-fee-base-msat old))
+                         (gs:chan-upd-fee-base-msat new))
+            (check-equal "…cltv delta still reads correctly"
+                         (and old (gs:chan-upd-cltv-expiry-delta old))
+                         (gs:chan-upd-cltv-expiry-delta new))))
+        ;; channel_flags packs direction (bit 0) and disabled (bit 1) into ONE
+        ;; byte.  No captured update is disabled, so without this the predicate
+        ;; that decides whether to route over a channel is never seen true.
+        (let ((d0 (gs:parse-channel-update (%rebuild-update base :channel-flags 0)))
+              (d1 (gs:parse-channel-update (%rebuild-update base :channel-flags 1)))
+              (x0 (gs:parse-channel-update (%rebuild-update base :channel-flags 2)))
+              (x1 (gs:parse-channel-update (%rebuild-update base :channel-flags 3))))
+          (check-equal "flags 0 -> direction 0" (gs:chan-upd-direction d0) 0)
+          (check-equal "flags 1 -> direction 1" (gs:chan-upd-direction d1) 1)
+          (check "flags 0 -> enabled"  (not (gs:chan-upd-disabled-p d0)))
+          (check "flags 2 -> disabled" (gs:chan-upd-disabled-p x0))
+          (check-equal "flags 2 -> still direction 0" (gs:chan-upd-direction x0) 0)
+          ;; Both bits at once: the two must be read independently, not as one
+          ;; small integer.
+          (check "flags 3 -> disabled" (gs:chan-upd-disabled-p x1))
+          (check-equal "flags 3 -> direction 1" (gs:chan-upd-direction x1) 1))))))
+
 (defun test-query-messages ()
   (with-gate ("BOLT #7 — queries and scid ordering")
     (let ((chain (w:chain-hash)))
@@ -239,4 +369,6 @@
   (test-parse-real-gossip)
   (test-signature-verification)
   (test-router-ingest)
+  (test-graph-vs-recorded)
+  (test-channel-update-variants)
   (test-query-messages))

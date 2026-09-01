@@ -10,7 +10,7 @@
                     (#:tp #:cl-payments.transport)
                     (#:f #:cl-payments.features) (#:p #:cl-payments.peer)
                     (#:gs #:cl-payments.gossip))
-  (:export #:check #:check-equal #:check-bytes #:check-signals
+  (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*
            #:hx #:report))
 
@@ -67,6 +67,19 @@
        (,condition-type () (format t "~&    ok    ~a~%" ,label) t)
        (error (e) (%fail ,label (format nil "expected ~a, got ~a: ~a"
                                         ',condition-type (type-of e) e))))))
+
+(defmacro check-no-signal (label &body body)
+  "Assert BODY completes without signalling, and return its value.
+
+   Needed because a parser under test signals on malformed input, and a raw call
+   in a gate would abort the WHOLE SUITE rather than failing one check — turning
+   a one-line regression into a run with no results at all."
+  `(progn
+     (incf *checks*)
+     (handler-case (let ((v (progn ,@body)))
+                     (format t "~&    ok    ~a~%" ,label)
+                     v)
+       (error (e) (%fail ,label (format nil "signalled ~a: ~a" (type-of e) e)) nil))))
 
 (defmacro with-gate ((name) &body body)
   `(let ((*gate* ,name))

@@ -1,0 +1,14 @@
+# The routing graph as Core Lightning reports it (`lightning-cli listchannels`),
+# captured at the same moment as gossip.txt and describing the same network.
+#
+# This is what makes the offline gate a real check rather than a self-consistency
+# test: our graph is built from raw gossip bytes and compared against an
+# INDEPENDENT implementation's reading of the same messages.  Regenerate the two
+# files together — a gossip.txt from one network and a graph here from another
+# would fail for reasons that have nothing to do with the code.
+#
+# scid source dest base_msat ppm cltv_delta htlc_min_msat htlc_max_msat
+143x1x0 026b634fe0f43ee44c642d2ebe1f23db22f646232e1aa66bb481350d07aa91af21 028ec1fe8b1ef66a03c4ab47b0eca633f63d654c637e1ed8077ae61fbe4ee4e656 1000 1 80 1000 1000000000
+143x1x0 028ec1fe8b1ef66a03c4ab47b0eca633f63d654c637e1ed8077ae61fbe4ee4e656 026b634fe0f43ee44c642d2ebe1f23db22f646232e1aa66bb481350d07aa91af21 1 10 6 1 990000000
+143x2x0 028ec1fe8b1ef66a03c4ab47b0eca633f63d654c637e1ed8077ae61fbe4ee4e656 029fcdcf2646a8654c778a56c565d24703ce940642a2ef53a1cdced2ea254b48c9 1 10 6 0 990000000
+143x2x0 029fcdcf2646a8654c778a56c565d24703ce940642a2ef53a1cdced2ea254b48c9 028ec1fe8b1ef66a03c4ab47b0eca633f63d654c637e1ed8077ae61fbe4ee4e656 1 10 6 0 990000000
