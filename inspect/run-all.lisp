@@ -16,6 +16,7 @@
   (run-transport-tests)
   (run-peer-tests)
   (run-gossip-tests)
+  (run-gossip-encode-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)

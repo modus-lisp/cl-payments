@@ -13,7 +13,9 @@
                     (#:k #:cl-payments.keys)
                     (#:m #:cl-payments.commitment)
                     (#:ch #:cl-payments.channel)
-                    (#:u #:cl-payments.updates))
+                    (#:u #:cl-payments.updates)
+                    (#:n #:cl-payments.node)
+                    (#:secp #:secp256k1-fast))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*
            #:hx #:report))

@@ -13,6 +13,7 @@
 ;;;;     sbcl --load bin/cl-payments.lisp
 
 (require :asdf)
+(require :sb-posix)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-payments"))
 
 (defun env (name &optional default) (or (uiop:getenv name) default))
@@ -23,6 +24,14 @@
 (let* ((dir (or (env "CLP_DIR") (error "set CLP_DIR")))
        (port (parse-integer (env "CLP_PORT" "9935")))
        (node (cl-payments.node:make-node :dir dir :port port)))
+  ;; Write our OWN pid, rather than letting the launching shell record what it
+  ;; thinks it started.  `setsid nohup sbcl & echo $!` records setsid's pid, and
+  ;; setsid forks — so the recorded pid belongs to a process that has already
+  ;; exited, `kill` hits nothing, and the next start dies on address-in-use with
+  ;; the previous daemon still holding the port.
+  (with-open-file (s (merge-pathnames "clp.pid" (uiop:ensure-directory-pathname dir))
+                     :direction :output :if-exists :supersede)
+    (format s "~d~%" (sb-posix:getpid)))
   (cl-payments.node:start node)
   (let ((uri (env "CLP_CONNECT")))
     (when uri

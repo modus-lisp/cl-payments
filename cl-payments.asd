@@ -48,6 +48,7 @@
                              (:file "transport-test")
                              (:file "peer-test")
                              (:file "gossip-test")
+                             (:file "gossip-encode-test")
                              (:file "keys-test")
                              (:file "commitment-test")
                              (:file "channel-test")

@@ -40,8 +40,14 @@
    #:node-peers #:node-channels #:node-dir #:node-port #:node-log-stream
    #:connect-to #:node-peer-count #:node-channel-count
    #:save-channels #:load-channels
-   #:stored-channel #:sc-channel-id #:sc-peer-id #:sc-funding-txid
+   #:stored-channel #:make-stored-channel
+   #:sc-channel-id #:sc-peer-id #:sc-funding-txid
    #:sc-funding-index #:sc-capacity-sat #:sc-announced-p
+   #:sc-key-index #:sc-scid #:sc-remote-funding-pubkey
+   #:sc-local-msat #:sc-remote-msat
+   #:sc-local-commitment-number #:sc-remote-commitment-number
+   #:channel-keys #:derive-channel-keys #:ck-pub
+   #:ck-index #:ck-funding #:ck-revocation #:ck-payment #:ck-delayed #:ck-htlc #:ck-seed
    #:node-error))
 
 (in-package #:cl-payments.node)
@@ -63,7 +69,66 @@
   channel-id peer-id funding-txid funding-index capacity-sat
   (local-msat 0) (remote-msat 0)
   (local-commitment-number 0) (remote-commitment-number 0)
-  (announced-p nil))
+  (announced-p nil)
+  ;; KEY-INDEX names the deterministic key family this channel uses; see
+  ;; DERIVE-CHANNEL-KEYS.  The remaining fields are what announcing the channel
+  ;; needs and nothing else knows: where the funding output landed, the peer's
+  ;; funding pubkey (the other half of the 2-of-2), and the two signatures the
+  ;; peer contributed.
+  (key-index 0)
+  scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig)
+
+;;; ----------------------------------------------------------------------------
+;;; Channel keys
+;;;
+;;; Every key a channel uses is DERIVED from the node's static key and a small
+;;; integer, rather than generated randomly and stored.  The difference is
+;;; whether a channel can survive the loss of its state file: with random keys,
+;;; the funding output is a 2-of-2 whose other half exists nowhere but in that
+;;; one file, and losing it is losing the money.  Derived keys can be
+;;; regenerated from the node key alone, so the state file only has to remember
+;;; WHICH index a channel used — a number that is cheap to recover by scanning
+;;; a few candidates, unlike 32 bytes of entropy.
+;;;
+;;; The index has to be the thing keys hang off because the funding pubkey goes
+;;; into `open_channel`, which is sent before the funding transaction exists —
+;;; so the channel id, which is derived from the funding outpoint, is not
+;;; available yet.  This is why real implementations keep a monotonic counter.
+;;; ----------------------------------------------------------------------------
+
+(defstruct (channel-keys (:conc-name ck-))
+  index funding revocation payment delayed htlc seed)
+
+(defun %derive-scalar (privkey index role)
+  "One private key, as an integer, from the node key and a labelled index.
+   Rejects the astronomically-unlikely out-of-range result rather than silently
+   producing an invalid key."
+  (let* ((salt (c:ascii->bytes "cl-payments channel keys"))
+         (okm (c:hkdf salt (secp:int-to-bytes32 privkey)
+                      :info (c:ascii->bytes (format nil "~a/~d" role index))
+                      :length 32)))
+    (let ((n (secp:bytes-to-int okm)))
+      (unless (c:valid-privkey-p n)
+        (error 'node-error :detail (format nil "derived invalid key for ~a/~d" role index)))
+      n)))
+
+(defun derive-channel-keys (privkey index)
+  "The full key family for channel INDEX.  Same node key and index always give
+   the same channel keys, on any machine, after any crash."
+  (make-channel-keys
+   :index index
+   :funding    (%derive-scalar privkey index "funding")
+   :revocation (%derive-scalar privkey index "revocation")
+   :payment    (%derive-scalar privkey index "payment")
+   :delayed    (%derive-scalar privkey index "delayed")
+   :htlc       (%derive-scalar privkey index "htlc")
+   ;; The shachain seed is bytes, not a scalar — it is hashed, never multiplied.
+   :seed (c:hkdf (c:ascii->bytes "cl-payments channel keys")
+                 (secp:int-to-bytes32 privkey)
+                 :info (c:ascii->bytes (format nil "seed/~d" index))
+                 :length 32)))
+
+(defun ck-pub (scalar) (c:compressed-pubkey (c:pubkey-of scalar)))
 
 (defun %hex (b) (c:bytes->hex b))
 (defun %unhex (s) (c:hex->bytes s))
@@ -88,7 +153,17 @@
                                 :remote-msat (sc-remote-msat sc)
                                 :local-commitment-number (sc-local-commitment-number sc)
                                 :remote-commitment-number (sc-remote-commitment-number sc)
-                                :announced-p (sc-announced-p sc))
+                                :announced-p (sc-announced-p sc)
+                                :key-index (sc-key-index sc)
+                                :scid (let ((s (sc-scid sc)))
+                                        (and s (gs:scid-string s)))
+                                :remote-funding-pubkey
+                                (let ((k (sc-remote-funding-pubkey sc)))
+                                  (and k (%hex k)))
+                                :remote-node-sig
+                                (let ((k (sc-remote-node-sig sc))) (and k (%hex k)))
+                                :remote-bitcoin-sig
+                                (let ((k (sc-remote-bitcoin-sig sc))) (and k (%hex k))))
                           s)
                    (terpri s))
                  (node-channels node))))
@@ -111,7 +186,18 @@
                             :remote-msat (getf form :remote-msat)
                             :local-commitment-number (getf form :local-commitment-number)
                             :remote-commitment-number (getf form :remote-commitment-number)
-                            :announced-p (getf form :announced-p))))
+                            :announced-p (getf form :announced-p)
+                            :key-index (or (getf form :key-index) 0)
+                            :scid (let ((v (getf form :scid)))
+                                    (and v (gs:parse-scid-string v)))
+                            :remote-funding-pubkey
+                            (let ((v (getf form :remote-funding-pubkey)))
+                              (and v (%unhex v)))
+                            :remote-node-sig
+                            (let ((v (getf form :remote-node-sig))) (and v (%unhex v)))
+                            :remote-bitcoin-sig
+                            (let ((v (getf form :remote-bitcoin-sig)))
+                              (and v (%unhex v))))))
                    (setf (gethash (%hex (sc-channel-id sc)) (node-channels node)) sc)))))
     (hash-table-count (node-channels node))))
 
@@ -204,28 +290,167 @@
           (ignore-errors
            (p:send-message peer (u:encode-channel-reestablish ours) nil)))))))
 
-(defun handle-announcement-signatures (node peer payload)
-  "`announcement_signatures` is the peer offering to make the channel public.
+(defconstant +msg-announcement-signatures+ 259)
 
-   Receiving it at all is the thing a script could never do: it arrives once the
-   funding is buried, to a CONNECTED peer.  We record that the channel is
-   announceable; producing our own half needs the node and bitcoin key signatures
-   over the channel announcement, which is Phase 4f."
-  (declare (ignore peer))
+(defun encode-announcement-signatures (channel-id scid node-sig bitcoin-sig)
+  (let ((wr (w:make-writer)))
+    (w:w-bytes wr (c:octets channel-id))
+    (w:w-u64 wr (gs:scid->u64 scid))
+    (w:w-sig wr node-sig)
+    (w:w-sig wr bitcoin-sig)
+    (w:writer-bytes wr)))
+
+(defun announcement-body-for (node sc)
+  "The bytes both ends sign to announce SC.  Returns (values body we-are-node-1-p),
+   or NIL if we do not know the peer's funding pubkey.
+
+   Both ends must produce byte-identical bodies or all four signatures are over
+   different messages and the announcement is simply invalid — so the BOLT #7
+   ordering is applied here, once, rather than assumed anywhere."
+  (let ((remote-funding (sc-remote-funding-pubkey sc))
+        (scid (sc-scid sc)))
+    (when (and remote-funding scid)
+      (let ((local-funding (ck-pub (ck-funding (derive-channel-keys (node-privkey node)
+                                                                   (sc-key-index sc))))))
+        (multiple-value-bind (n1 n2 we-are-1) (gs:node-order (node-id node) (sc-peer-id sc))
+          (values (gs:channel-announcement-body
+                   :features 0
+                   :chain-hash (w:chain-hash)
+                   :scid scid
+                   :node-1 n1 :node-2 n2
+                   ;; The bitcoin keys follow the NODE ordering, not their own.
+                   :bitcoin-1 (if we-are-1 local-funding remote-funding)
+                   :bitcoin-2 (if we-are-1 remote-funding local-funding))
+                  we-are-1))))))
+
+(defun broadcast-announcement (node peer sc)
+  "Assemble the four-signature `channel_announcement` and send it, followed by our
+   `channel_update` for our own direction.
+
+   The announcement alone makes the channel VISIBLE; it does not make it usable.
+   Routing needs a policy — fees and a CLTV delta — per direction, and a channel
+   with no update from us is one no sender will ever route through, because there
+   is no way to know what we would charge."
+  (multiple-value-bind (body we-are-1) (announcement-body-for node sc)
+    (unless body (return-from broadcast-announcement nil))
+    (let* ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc)))
+           (our-node-sig (gs:sign-gossip (node-privkey node) body))
+           (our-btc-sig  (gs:sign-gossip (ck-funding keys) body))
+           (ann (gs:encode-channel-announcement
+                 body
+                 :node-sig-1    (if we-are-1 our-node-sig (sc-remote-node-sig sc))
+                 :node-sig-2    (if we-are-1 (sc-remote-node-sig sc) our-node-sig)
+                 :bitcoin-sig-1 (if we-are-1 our-btc-sig (sc-remote-bitcoin-sig sc))
+                 :bitcoin-sig-2 (if we-are-1 (sc-remote-bitcoin-sig sc) our-btc-sig))))
+      ;; Verify our own work before putting it on the wire.  A malformed
+      ;; announcement is not rejected with an error — it is silently dropped by
+      ;; every peer, which is indistinguishable from never having sent it.
+      (if (gs:verify-channel-announcement (gs:parse-channel-announcement ann))
+          (progn
+            (p:send-message peer gs:+msg-channel-announcement+ ann)
+            (send-channel-update node peer sc we-are-1)
+            (setf (sc-announced-p sc) t)
+            (save-channels node)
+            (nlog node "announced ~a — channel_announcement + channel_update sent"
+                  (gs:scid-string (sc-scid sc)))
+            t)
+          (progn (nlog node "refusing to send channel_announcement for ~a: it does not verify"
+                       (gs:scid-string (sc-scid sc)))
+                 nil)))))
+
+(defun send-channel-update (node peer sc we-are-1)
+  "Our routing policy for our own direction of SC.
+
+   The announcement makes the channel VISIBLE; this makes it USABLE.  A channel
+   with no update from us is one no sender will route through, because there is
+   no way to know what we would charge.  It is sent separately from the
+   announcement because a reconnecting peer does not repeat its
+   `announcement_signatures` — it already has ours — so a node that only ever
+   emitted its policy alongside the announcement would advertise it exactly once
+   and then go quiet forever."
+  (let* ((upd-body (gs:channel-update-body
+                    :chain-hash (w:chain-hash)
+                    :scid (sc-scid sc)
+                    :timestamp (- (get-universal-time)
+                                  (encode-universal-time 0 0 0 1 1 1970 0))
+                    ;; Bit 0 of channel_flags is the DIRECTION, and it must
+                    ;; match our position in the node ordering.
+                    :channel-flags (if we-are-1 0 1)
+                    :htlc-maximum-msat (* 1000 (sc-capacity-sat sc))))
+         (upd (gs:encode-channel-update (node-privkey node) upd-body)))
+    (p:send-message peer gs:+msg-channel-update+ upd)))
+
+(defun handle-announcement-signatures (node peer payload)
+  "`announcement_signatures` is the peer offering to make the channel public: it
+   is their half of the four signatures a `channel_announcement` needs.
+
+   Receiving it at all is the thing a script could never do — it arrives once the
+   funding is buried, to a CONNECTED peer.  We check their half, contribute ours,
+   and then assemble and broadcast the announcement."
   (handler-case
       (let* ((r (w:make-reader payload))
              (cid (w:r-bytes r 32))
-             (scid (gs:u64->scid (w:r-u64 r))))
-        (let ((sc (gethash (%hex cid) (node-channels node))))
-          (when sc (setf (sc-announced-p sc) t) (save-channels node))
-          (nlog node "announcement_signatures for ~a (scid ~a) — channel is announceable"
-                (subseq (%hex cid) 0 16) (gs:scid-string scid))))
+             (scid (gs:u64->scid (w:r-u64 r)))
+             (their-node-sig (w:r-sig r))
+             (their-btc-sig (w:r-sig r))
+             (sc (gethash (%hex cid) (node-channels node))))
+        (nlog node "announcement_signatures for ~a (scid ~a)"
+              (subseq (%hex cid) 0 16) (gs:scid-string scid))
+        (cond
+          ((null sc)
+           (nlog node "  no record of that channel — ignoring"))
+          (t
+           (setf (sc-scid sc) scid
+                 (sc-remote-node-sig sc) their-node-sig
+                 (sc-remote-bitcoin-sig sc) their-btc-sig)
+           (multiple-value-bind (body we-are-1) (announcement-body-for node sc)
+             (declare (ignore we-are-1))
+             (cond
+               ((null body)
+                (nlog node "  no remote funding pubkey on record — cannot announce")
+                (save-channels node))
+               ;; Their signatures are checked before ours go out.  A peer whose
+               ;; signatures do not verify is either buggy or trying to get us to
+               ;; publish an announcement that names our key on a channel we
+               ;; cannot prove — either way, do not co-sign it.
+               ((not (and (gs:verify-gossip-sig their-node-sig body (sc-peer-id sc))
+                          (gs:verify-gossip-sig their-btc-sig body
+                                                (sc-remote-funding-pubkey sc))))
+                (nlog node "  their signatures do not verify — refusing to announce"))
+               (t
+                (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+                  (p:send-message
+                   peer +msg-announcement-signatures+
+                   (encode-announcement-signatures
+                    cid scid
+                    (gs:sign-gossip (node-privkey node) body)
+                    (gs:sign-gossip (ck-funding keys) body))))
+                (nlog node "  sent our announcement_signatures")
+                (broadcast-announcement node peer sc)))))))
     (error (e) (nlog node "bad announcement_signatures: ~a" e))))
+
+(defun readvertise (node peer)
+  "Re-send our policy for every already-announced channel with this peer.
+
+   Gossip is not retained forever by anyone, and a peer that reconnects does not
+   re-send `announcement_signatures` for a channel it has already announced.  So
+   the only moment we would otherwise ever advertise a policy is the single
+   instant the channel was first announced — after which our direction of the
+   channel quietly ages out of the network and stops being routable."
+  (dolist (sc (channels-with node (p:peer-node-id peer)))
+    (when (and (sc-announced-p sc) (sc-scid sc) (sc-remote-funding-pubkey sc))
+      (multiple-value-bind (body we-are-1) (announcement-body-for node sc)
+        (declare (ignore body))
+        (handler-case
+            (progn (send-channel-update node peer sc we-are-1)
+                   (nlog node "re-advertised our policy for ~a" (gs:scid-string (sc-scid sc))))
+          (error (e) (nlog node "could not re-advertise ~a: ~a"
+                           (gs:scid-string (sc-scid sc)) e)))))))
 
 (defun install-handlers (node peer)
   (p:on peer u:+msg-channel-reestablish+
         (lambda (pr payload) (handle-reestablish node pr payload)))
-  (p:on peer 259
+  (p:on peer +msg-announcement-signatures+
         (lambda (pr payload) (handle-announcement-signatures node pr payload)))
   (p:on peer ch:+msg-channel-ready+
         (lambda (pr payload) (declare (ignore pr))
@@ -266,6 +491,7 @@
         (nlog node "inbound peer ~a (~d channel~:p with them)"
               (subseq (%hex (p:peer-node-id peer)) 0 16)
               (length (channels-with node (p:peer-node-id peer))))
+        (readvertise node peer)
         (unwind-protect (p:run-read-loop peer)
           (unregister-peer node peer)
           (nlog node "peer ~a disconnected" (subseq (%hex (p:peer-node-id peer)) 0 16))))
@@ -287,6 +513,7 @@
       (install-handlers node peer)
       (register-peer node peer)
       (nlog node "connected to ~a" (subseq (%hex node-id) 0 16))
+      (readvertise node peer)
       (if keep-alive
           (unwind-protect (p:run-read-loop peer)
             (unregister-peer node peer))

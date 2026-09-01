@@ -31,7 +31,9 @@
                     (#:m #:cl-payments.commitment) (#:ch #:cl-payments.channel)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:secp #:secp256k1-fast) (#:bt #:bordeaux-threads)
-                    (#:benc #:cl-consensus.encoding))
+                    (#:benc #:cl-consensus.encoding)
+                    (#:n #:cl-payments.node) (#:gs #:cl-payments.gossip)
+                    (#:bb #:cl-consensus.block))
   (:export #:run))
 
 (in-package #:open-channel)
@@ -55,6 +57,14 @@
     (let ((start (+ at (length key))))
       (subseq json start (position #\" json :start start)))))
 
+(defun json-number (json field)
+  "Pull a numeric FIELD out of bitcoin-cli's JSON.  Same reasoning as
+   JSON-STRING: two fields is not worth a parser dependency."
+  (let* ((key (format nil "\"~a\": " field))
+         (at (search key json)))
+    (unless at (error "no ~a in ~a" field json))
+    (parse-integer json :start (+ at (length key)) :junk-allowed t)))
+
 (defvar *step* 0)
 (defun step! (fmt &rest args)
   (format t "~&~%~d. ~?~%" (incf *step*) fmt args)
@@ -63,15 +73,49 @@
 
 ;;; ----------------------------------------------------------------------------
 
-(defstruct our-keys funding revocation payment delayed htlc seed)
+;;; Channel keys are DERIVED from the node key and an index, not generated
+;;; randomly.  Random keys would make this script the only thing in the world
+;;; that knows half of a 2-of-2 holding real funds: the moment it exits, the
+;;; channel is unannounceable by the daemon and — worse — unspendable.  The
+;;; struct is kept so the flow below reads unchanged.
+(defstruct our-keys funding revocation payment delayed htlc seed index)
 
-(defun fresh-keys ()
-  (flet ((k () (c:generate-key)))
-    (make-our-keys :funding (k) :revocation (k) :payment (k)
-                   :delayed (k) :htlc (k)
-                   :seed (c:octets (ironclad:random-data 32)))))
+(defun derived-keys (node-privkey index)
+  (let ((ck (n:derive-channel-keys node-privkey index)))
+    (make-our-keys :funding (n:ck-funding ck) :revocation (n:ck-revocation ck)
+                   :payment (n:ck-payment ck) :delayed (n:ck-delayed ck)
+                   :htlc (n:ck-htlc ck) :seed (n:ck-seed ck) :index index)))
 
-(defun pub (secret) (c:compressed-pubkey (c:pubkey-of secret)))
+(defun next-key-index (dir)
+  "One past the highest index any recorded channel uses.  Reusing an index would
+   reuse a funding key across two channels, and a revocation secret leaked on one
+   would then apply to the other."
+  (let ((path (merge-pathnames "channels.sexp" (uiop:ensure-directory-pathname dir))))
+    (if (probe-file path)
+        (with-open-file (s path)
+          (loop for form = (read s nil) while form
+                maximize (1+ (or (getf form :key-index) 0))))
+        0)))
+
+(defun scid-of (txid-hex vout)
+  "Where the funding output landed, as a short channel id.  A channel is NAMED by
+   its funding outpoint's position in the chain, so this has to come from the
+   chain rather than from anything either peer said.
+
+   The block is fetched as raw hex and parsed with cl-consensus rather than
+   scraped out of bitcoin-cli's JSON.  A first attempt did scrape it, and found
+   the funding transaction at index 0 — the coinbase's slot, which no real
+   transaction can occupy.  An scid that is wrong by one is not a near miss: it
+   names a different output, so the announcement fails to check against the chain
+   and every peer drops it silently."
+  (let* ((blockhash (json-string (bcli "getrawtransaction" txid-hex "true") "blockhash"))
+         (hex (bcli "getblock" blockhash "0"))
+         (blk (bb:parse-block (bw:hex->bytes hex)))
+         (txids (map 'list (lambda (tx) (bw:hash->hex (btx:tx-txid tx))) (bb:block-txs blk)))
+         (idx (position txid-hex txids :test #'string=))
+         (height (json-number (bcli "getblockheader" blockhash) "height")))
+    (unless idx (error "funding tx ~a is not in block ~a" txid-hex blockhash))
+    (gs:make-scid height idx vout)))
 
 (defun run (&optional (uri (or (uiop:getenv "CL_PAYMENTS_PEER")
                                (error "set CL_PAYMENTS_PEER=<node_id>@host:port"))))
@@ -80,7 +124,6 @@
          (node-id (c:hex->bytes (subseq uri 0 at)))
          (host (subseq uri (1+ at) colon))
          (port (parse-integer (subseq uri (1+ colon))))
-         (keys (fresh-keys))
          (funding-sat 200000)
          (temp-id (c:octets (ironclad:random-data 32)))
          (inbox (make-hash-table))
@@ -89,7 +132,7 @@
     ;; per run leaves an un-reclaimable channel behind every time: the channel is
     ;; a 2-of-2 with a specific counterparty, so a node that forgets its key can
     ;; never reconnect to a channel it opened.
-    (let ((our-node-key
+    (let* ((our-node-key
             (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
               (if dir
                   (secp:bytes-to-int
@@ -98,7 +141,11 @@
                                  (uiop:read-file-string
                                   (merge-pathnames "node.key"
                                                    (uiop:ensure-directory-pathname dir))))))
-                  (c:generate-key)))))
+                  (c:generate-key))))
+           (key-index (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
+                        (if dir (next-key-index dir) 0)))
+           (keys (derived-keys our-node-key key-index)))
+      (note "channel key index ~d (derived from the node key)" key-index)
       (let ((peer (p:connect host port node-id our-node-key
                              :chain-hashes (list (w:chain-hash))
                              :log nil :read-loop nil)))
@@ -279,6 +326,43 @@
                            (let ((cr (await ch:+msg-channel-ready+ 60 "their channel_ready")))
                              (declare (ignore cr))
                              (step! "their channel_ready received"))
+                           ;; ---- record it, so the daemon can announce it -----
+                           ;;
+                           ;; This script's job ends here, but the channel's does
+                           ;; not.  announcement_signatures arrive minutes later,
+                           ;; to whatever process is connected then — so what is
+                           ;; written now is exactly what the daemon will need and
+                           ;; cannot re-derive: the key index, where the funding
+                           ;; landed, and the peer's half of the 2-of-2.
+                           (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
+                             (when dir
+                               (step! "recording the channel for the daemon")
+                               (let* ((node (n:make-node :dir dir :port 0 :log nil))
+                                      (txid-hex (bw:hash->hex (btx:tx-txid ftx)))
+                                      (scid (handler-case (scid-of txid-hex fidx)
+                                              (error (e)
+                                                (note "could not resolve scid: ~a" e)
+                                                nil))))
+                                 (n:load-channels node)
+                                 (setf (gethash (c:bytes->hex
+                                                 (ch:channel-id (btx:tx-txid ftx) fidx))
+                                                (n:node-channels node))
+                                       (n:make-stored-channel
+                                        :channel-id (ch:channel-id (btx:tx-txid ftx) fidx)
+                                        :peer-id node-id
+                                        :funding-txid (btx:tx-txid ftx)
+                                        :funding-index fidx
+                                        :capacity-sat funding-sat
+                                        :local-msat (* 1000 funding-sat)
+                                        :remote-msat 0
+                                        :key-index key-index
+                                        :scid scid
+                                        :remote-funding-pubkey (ch:ac-funding-pubkey acc)))
+                                 (n:save-channels node)
+                                 (note "wrote ~a (scid ~a)"
+                                       (merge-pathnames "channels.sexp"
+                                                        (uiop:ensure-directory-pathname dir))
+                                       (if scid (gs:scid-string scid) "unknown")))))
                            (format t "~&~%✓ a real Lightning node opened a channel with us.~%")
                            t)))))))
           (ignore-errors (p:disconnect peer)))))))

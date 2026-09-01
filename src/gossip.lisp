@@ -45,7 +45,12 @@
    #:node-ann-features #:node-ann-addresses
    ;; verification
    #:verify-channel-announcement #:verify-channel-update #:verify-node-announcement
-   #:signed-portion #:gossip-error
+   #:signed-portion #:gossip-error #:verify-gossip-sig
+   ;; emitting
+   #:sign-gossip #:node-order
+   #:channel-announcement-body #:encode-channel-announcement
+   #:channel-update-body #:encode-channel-update
+   #:node-announcement-body #:encode-node-announcement
    ;; the graph
    #:router #:make-router #:router-channels #:router-nodes
    #:ingest #:router-channel-count #:router-node-count
@@ -257,6 +262,127 @@
 (defun verify-node-announcement (ann)
   (%verify-sig (node-ann-signature ann) (gossip-hash (node-ann-raw ann) 1)
                (node-ann-node-id ann)))
+
+;;; ----------------------------------------------------------------------------
+;;; Emitting gossip
+;;;
+;;; Everything above this point parses and verifies what other nodes say.  To be
+;;; ROUTABLE rather than merely well-informed we have to say it ourselves, and
+;;; the asymmetry matters: a parser that is too lenient accepts junk, but an
+;;; encoder that is too lenient gets us ignored by the entire network with no
+;;; error message.  Nobody replies "your announcement was malformed"; the channel
+;;; simply never appears in anyone's graph.
+;;;
+;;; Each message is built in two pieces — a BODY, which is what the signature
+;;; covers, and the full payload, which is the signatures followed by that exact
+;;; body.  Serialising twice and hoping the two agree is how you produce a
+;;; signature over bytes you did not send.
+;;; ----------------------------------------------------------------------------
+
+(defun verify-gossip-sig (sig64 body pubkey-bytes)
+  "Check a gossip signature against the BODY it covers, rather than against a
+   pre-computed hash.  Callers that hold a body they built themselves should use
+   this: hashing it here is one fewer place to get the double-SHA256 wrong."
+  (%verify-sig sig64 (c:sha256 (c:sha256 body)) pubkey-bytes))
+
+(defun sign-gossip (privkey body)
+  "A 64-byte compact (r ‖ s) signature over the double-SHA256 of BODY."
+  (let ((hash (c:sha256 (c:sha256 body))))
+    (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey (c:octets hash))
+      (c:bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s)))))
+
+(defun node-order (point-a point-b)
+  "BOLT #7 orders the two ends of a channel by comparing their compressed node
+   ids as byte strings; the lesser is node_1.  Returns (values node-1 node-2
+   a-is-node-1-p).
+
+   This is not cosmetic.  The direction bit in channel_update is defined against
+   this ordering, so getting it backwards advertises our fee policy as if it were
+   the other end's — and every route computed over it is wrong."
+  (let ((a (c:octets point-a)) (b (c:octets point-b)))
+    (let ((a<b (loop for x across a for y across b
+                     when (/= x y) return (< x y)
+                     finally (return t))))
+      (if a<b (values a b t) (values b a nil)))))
+
+(defun channel-announcement-body (&key features chain-hash scid
+                                       node-1 node-2 bitcoin-1 bitcoin-2)
+  "The signed portion of channel_announcement.  NODE-1/NODE-2 must already be in
+   BOLT #7 order, with BITCOIN-1 being node_1's funding pubkey."
+  (let ((wr (w:make-writer)))
+    (w:w-varbytes wr (f:features->bytes (or features 0)))
+    (w:w-hash wr chain-hash)
+    (w:w-u64 wr (scid->u64 scid))
+    (w:w-point wr node-1) (w:w-point wr node-2)
+    (w:w-point wr bitcoin-1) (w:w-point wr bitcoin-2)
+    (w:writer-bytes wr)))
+
+(defun encode-channel-announcement (body &key node-sig-1 node-sig-2
+                                              bitcoin-sig-1 bitcoin-sig-2)
+  "The four signatures, then BODY verbatim."
+  (let ((wr (w:make-writer)))
+    (w:w-sig wr node-sig-1) (w:w-sig wr node-sig-2)
+    (w:w-sig wr bitcoin-sig-1) (w:w-sig wr bitcoin-sig-2)
+    (w:w-bytes wr body)
+    (w:writer-bytes wr)))
+
+(defun channel-update-body (&key chain-hash scid timestamp
+                                 (message-flags 1) (channel-flags 0)
+                                 (cltv-expiry-delta 40) (htlc-minimum-msat 1000)
+                                 (fee-base-msat 1000)
+                                 (fee-proportional-millionths 1)
+                                 htlc-maximum-msat)
+  "The signed portion of channel_update — our fee and timelock policy for ONE
+   direction of the channel.
+
+   MESSAGE-FLAGS bit 0 declares that htlc_maximum_msat follows.  Modern peers
+   require it: Core Lightning rejects an update without it outright, so it
+   defaults on and HTLC-MAXIMUM-MSAT must be supplied."
+  (when (and (logtest message-flags 1) (null htlc-maximum-msat))
+    (error 'gossip-error :detail "message_flags bit 0 set but no htlc_maximum_msat"))
+  (let ((wr (w:make-writer)))
+    (w:w-hash wr chain-hash)
+    (w:w-u64 wr (scid->u64 scid))
+    (w:w-u32 wr timestamp)
+    (w:w-u8 wr message-flags)
+    (w:w-u8 wr channel-flags)
+    (w:w-u16 wr cltv-expiry-delta)
+    (w:w-u64 wr htlc-minimum-msat)
+    (w:w-u32 wr fee-base-msat)
+    (w:w-u32 wr fee-proportional-millionths)
+    (when (logtest message-flags 1) (w:w-u64 wr htlc-maximum-msat))
+    (w:writer-bytes wr)))
+
+(defun encode-channel-update (privkey body)
+  (let ((wr (w:make-writer)))
+    (w:w-sig wr (sign-gossip privkey body))
+    (w:w-bytes wr body)
+    (w:writer-bytes wr)))
+
+(defun node-announcement-body (&key features timestamp node-id
+                                    (rgb (c:zeros 3)) (alias "") (addresses #()))
+  "The signed portion of node_announcement.  ALIAS is padded to exactly 32 bytes
+   and TRUNCATED there — the field is fixed width, and an over-long alias would
+   otherwise shift every following field and produce a message that parses as
+   garbage rather than one that is rejected."
+  (let ((wr (w:make-writer))
+        (alias-bytes (let ((buf (c:zeros 32))
+                           (src (c:ascii->bytes alias)))
+                       (replace buf src :end2 (min 32 (length src)))
+                       buf)))
+    (w:w-varbytes wr (f:features->bytes (or features 0)))
+    (w:w-u32 wr timestamp)
+    (w:w-point wr node-id)
+    (w:w-bytes wr (c:octets rgb))
+    (w:w-bytes wr alias-bytes)
+    (w:w-varbytes wr (c:octets addresses))
+    (w:writer-bytes wr)))
+
+(defun encode-node-announcement (privkey body)
+  (let ((wr (w:make-writer)))
+    (w:w-sig wr (sign-gossip privkey body))
+    (w:w-bytes wr body)
+    (w:writer-bytes wr)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; The routing graph
