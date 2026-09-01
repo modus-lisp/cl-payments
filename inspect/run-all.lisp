@@ -19,6 +19,7 @@
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)
+  (run-updates-tests)
   (let ((ok (report)))
     (unless ok (uiop:quit 1))
     ok))

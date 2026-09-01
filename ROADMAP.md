@@ -225,6 +225,36 @@ Two things the live run taught:
 `./mine.sh 6`, and have CLN report it as `CHANNELD_NORMAL`. Then the same
 against lnd1.
 
+### 4d — the HTLC lifecycle  **[PARTIAL]**
+
+`src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
+`commitment_signed`, `revoke_and_ack`, `update_fee`, and the state machine that
+tracks what has been proposed, what is irrevocably committed, and whether a
+revocation is outstanding.
+
+The ordering discipline is the point, not the encodings:
+
+- An HTLC's amount leaves the sender's balance when **proposed**, not when
+  committed — it is in flight, belonging to neither side, and returns only if
+  the HTLC fails.
+- A fulfill is honoured only if the preimage really hashes to the payment hash,
+  in **both** directions. Accepting an unproven claim gives money away; sending
+  one pays out against nothing redeemable on chain.
+- `commitment_signed` may not be sent while a `revoke_and_ack` is outstanding —
+  the peer would hold two commitments with no way to say which it revoked.
+- A commitment is never revoked before its replacement is signed. Revoking first
+  leaves you holding nothing enforceable: the old state is punishable if you
+  publish it and the new one is unsigned, so the balance is entirely at the
+  counterparty's discretion.
+
+**Not done, and this is the larger part.** The state machine is tested in
+isolation; it has never driven a real channel. Making an actual payment needs:
+re-signing the commitment on every update (both directions, with HTLC outputs
+and their signatures), the `channel_reestablish` resync after a reconnect, and
+BOLT #4's onion — `update_add_htlc` carries a 1366-byte onion packet that this
+code can carry but not yet construct or peel. Until that exists, no payment can
+move.
+
 ## Phase 5 — commitment transactions
 
 BOLT #3: the per-commitment secret chain, key derivation
