@@ -1,0 +1,81 @@
+;;;; inspect/harness.lisp
+;;;;
+;;;; A minimal check/report harness shared by every gate.  Deliberately tiny and
+;;;; dependency-free: the point of this suite is to be runnable with one command
+;;;; and no test framework to install, matching cl-consensus's inspect/ suite.
+
+(defpackage #:cl-payments.test
+  (:use #:cl)
+  (:local-nicknames (#:c #:cl-payments.crypto) (#:w #:cl-payments.wire)
+                    (#:tp #:cl-payments.transport))
+  (:export #:check #:check-equal #:check-bytes #:check-signals
+           #:with-gate #:run-all #:*failures* #:*checks*
+           #:hx #:report))
+
+(in-package #:cl-payments.test)
+
+(defvar *checks* 0)
+(defvar *failures* '())
+(defvar *gate* "")
+
+(defun hx (s)
+  "Hex string (with optional 0x prefix and internal whitespace) to bytes."
+  (let ((clean (remove-if (lambda (ch) (member ch '(#\Space #\Newline #\Tab))) s)))
+    (when (and (> (length clean) 1) (string= "0x" (subseq clean 0 2)))
+      (setf clean (subseq clean 2)))
+    (c:hex->bytes clean)))
+
+(defun %fail (label detail)
+  (push (format nil "~a / ~a: ~a" *gate* label detail) *failures*)
+  (format t "~&    FAIL  ~a — ~a~%" label detail))
+
+(defun check (label ok &optional detail)
+  (incf *checks*)
+  (if ok
+      (format t "~&    ok    ~a~%" label)
+      (%fail label (or detail "assertion failed")))
+  ok)
+
+(defun check-equal (label actual expected)
+  (incf *checks*)
+  (if (equalp actual expected)
+      (progn (format t "~&    ok    ~a~%" label) t)
+      (progn (%fail label (format nil "~<~%          expected ~s~:@>~<~%          actual   ~s~:@>"
+                                  (list expected) (list actual)))
+             nil)))
+
+(defun check-bytes (label actual expected)
+  "Compare byte vectors, reporting as hex — the form every spec vector is quoted in."
+  (incf *checks*)
+  (let ((a (c:octets actual)) (e (c:octets expected)))
+    (if (equalp a e)
+        (progn (format t "~&    ok    ~a~%" label) t)
+        (progn (%fail label (format nil "~%          expected ~a~%          actual   ~a"
+                                    (c:bytes->hex e) (c:bytes->hex a)))
+               nil))))
+
+(defmacro check-signals (label condition-type &body body)
+  "Assert BODY signals CONDITION-TYPE.  Half of wire-level correctness is
+   *rejecting* malformed input, so the negative cases are first-class checks."
+  `(progn
+     (incf *checks*)
+     (handler-case (progn ,@body
+                          (%fail ,label (format nil "expected ~a, nothing signalled"
+                                                ',condition-type)))
+       (,condition-type () (format t "~&    ok    ~a~%" ,label) t)
+       (error (e) (%fail ,label (format nil "expected ~a, got ~a: ~a"
+                                        ',condition-type (type-of e) e))))))
+
+(defmacro with-gate ((name) &body body)
+  `(let ((*gate* ,name))
+     (format t "~&~%  ~a~%" ,name)
+     ,@body))
+
+(defun report ()
+  (format t "~&~%~a~%" (make-string 62 :initial-element #\=))
+  (if *failures*
+      (progn
+        (format t "FAILED — ~d of ~d check~:p failed~%~%" (length *failures*) *checks*)
+        (dolist (f (reverse *failures*)) (format t "  · ~a~%" f))
+        nil)
+      (progn (format t "PASS — ~d checks~%" *checks*) t)))
