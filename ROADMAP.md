@@ -126,7 +126,7 @@ fields, where a misread offset still yields a plausible number.
 Not yet done: pathfinding. The graph is built and verified; choosing a route
 across it belongs with Phase 6, where there is something to route.
 
-## Phase 4 — channels
+## Phase 4 — channels  **[DONE]**
 
 BOLT #2: `open_channel`/`accept_channel`, `funding_created`/`funding_signed`,
 `channel_ready`, then the HTLC lifecycle (`update_add_htlc`,
@@ -145,14 +145,16 @@ Sub-phases, in the order they were actually built:
 | 4b | commitment and HTLC transactions | done |
 | 4c | BOLT #2 open messages; a live open against CLN | done |
 | 4c-bis | LND interop, `channel_reestablish` | done |
-| 4d | HTLC lifecycle state machine | **partial** — never driven a live channel |
+| 4d | HTLC lifecycle, on a live channel | done |
 | 4e | the daemon | done |
 | 4f | announcing our channels | done |
 | 4g | accepting opens | done |
-| 4h | `shutdown` / `closing_signed` | **not started** |
+| 4h | `shutdown` / `closing_signed` | done |
 
-**What closes Phase 4:** an HTLC actually moving over a live channel with a real
-implementation, and a cooperative close. Everything else in it is done.
+**Closed by:** a payment from Core Lightning received over `306x1x0` —
+`waitsendpay` reports `complete` with our preimage — a second payment we failed
+and whose money returned, and a cooperative close whose transaction confirmed
+with our output at an address derived from the node key.
 
 
 ### 4a — key derivation  **[DONE]**
@@ -262,7 +264,7 @@ flaps; with it off, LND never relays gossip and routes die at the LND hop. As a
 leaf with sync off the links are stable, which is what BOLT #8/#1/#2 interop
 needs.
 
-### 4d — the HTLC lifecycle  **[PARTIAL]**
+### 4d — the HTLC lifecycle  **[DONE]**
 
 `src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
 `commitment_signed`, `revoke_and_ack`, `update_fee`, and the state machine that
@@ -284,13 +286,28 @@ The ordering discipline is the point, not the encodings:
   publish it and the new one is unsigned, so the balance is entirely at the
   counterparty's discretion.
 
-**Not done, and this is the larger part.** The state machine is tested in
-isolation; it has never driven a real channel. Remaining: wiring it into the
-daemon so `commitment_signed`/`revoke_and_ack` interleave over a live connection,
-re-signing the commitment on every update (both directions, with per-HTLC
-signatures), and BOLT #4's onion so `update_add_htlc` carries something a peer
-can act on. `channel_reestablish` itself is done (4c-bis). Until this closes, no
-payment can move.
+**Done, in `src/live.lisp`.** The state machine above had one view of the
+channel; a live channel has two. Each end holds its OWN commitment, signed by
+the other, and for the interval between `commitment_signed` and the matching
+`revoke_and_ack` the two legitimately disagree. The bookkeeping is the standard
+change-stage model — ours go proposed → signed → acked, theirs proposed → acked
+→ signed — and each commitment is built by reducing a base with exactly the
+changes that belong in it. Get that wrong and the two sides sign different
+transactions while each believes the other's signature is over its own.
+
+Every transition is pure and returns the message to send, so two channels are
+run against each other in `inspect/live-test.lisp` (50 checks), and every
+commitment either accepts is then spent under cl-consensus's script interpreter
+with the real 2-of-2 witness.
+
+Against Core Lightning on the devnet: CLN opened `306x1x0` to clp3, sent
+`update_fee`, then paid 50,000,000 msat via `sendpay`. We verified the
+`commitment_signed` carrying the HTLC output and its `htlc_signature`,
+exchanged `revoke_and_ack` both ways, revealed the preimage, and re-signed;
+`waitsendpay` reported `complete`. A second payment to an unknown hash was
+failed and CLN's balance was unchanged. Both ends agreed on every balance
+throughout. The onion is still unpeeled — we fulfil because we hold the
+preimage, not because we read the packet — which is Phase 6.
 
 ### 4e — the daemon  **[DONE]**
 
@@ -350,11 +367,18 @@ Channel keys are derived from the node key and an index rather than generated
 randomly — `open-channel.lisp` had been generating them fresh, which made the
 script the only thing holding half of a 2-of-2 over real funds.
 
-### 4h — closing  **[NOT STARTED]**
+### 4h — closing  **[DONE]**
 
-`shutdown` and `closing_signed`: the cooperative close, negotiating a fee and
-producing a mutual closing transaction that spends the funding output directly.
-Named in Phase 4's scope from the start; nothing built yet.
+`shutdown` and `closing_signed`, both sides, in `src/live.lisp`. The closing
+transaction is built from the fee alone, so if the two ends disagree about the
+channel's contents the signature fails and says so — there is no separate
+"do we agree" step. Our funds go to P2WPKH of a key derived from the node key,
+recoverable without any channel state.
+
+Verified: `lightning-cli close` on `306x1x0` from CLN. Our `shutdown` answered
+theirs, their `closing_signed` verified at their fee, ours accepted it, and the
+transaction confirmed with 150,000 sat at exactly the address we derive.
+CLN: `CLOSINGD_COMPLETE`.
 
 ## Phase 5 — forwarding
 
@@ -445,9 +469,9 @@ routed end to end.
 
 ## Status
 
-Phases 0–3 are done. Phase 4 is done except for two things: an HTLC has never
-moved over a live channel (4d), and there is no cooperative close (4h). Phase 5a
-is done.
+**Phases 0–4 are done.** cl-payments opens channels, accepts them, announces
+them, receives payments over them, and closes them cooperatively — each step
+verified against Core Lightning on the private signet. Phase 5a is done.
 
 Verified against real implementations on the private signet:
 
@@ -459,9 +483,20 @@ Verified against real implementations on the private signet:
   bitcoin signatures over the announcement and relayed it.
 - `getroute` finds paths **to** clp3 (3 hops) and **through** it
   (cln3 → clp3 → cln4), paying exactly the fee our formula computes.
+- CLN **paid us** 50,000,000 msat over `306x1x0` via `sendpay`; `waitsendpay`
+  reports `complete` with our preimage. A payment to an unknown hash was
+  failed and returned. Both ends agreed on every balance.
+- CLN **closed** `306x1x0` cooperatively; the closing transaction confirmed with
+  our 150,000 sat at an address derived from the node key.
 
-Offline suite: 524 checks across two gates, every new check mutation-verified.
+Offline suite: 576 checks across two gates, every new check mutation-verified.
 
-**Next, in order:** 4d over a live channel, then Phase 6 (onion), then 5b — at
-which point clp3 forwards a real payment and its middle-hop position stops being
-a graph fact and becomes a behaviour. 4h and Phases 7–8 follow.
+**Next, in order:** Phase 6 (onion), then 5b — at which point clp3 forwards a
+real payment and its middle-hop position stops being a graph fact and becomes a
+behaviour. 5c and Phases 7–8 follow.
+
+Two things carried forward from the daemon work, neither blocking: channels
+opened by `inspect/open-channel.lisp` predate the live state and cannot carry
+HTLCs (CLN's channeld gives up on them — reopen from the daemon side instead),
+and `update_fail_htlc` carries an opaque reason until 5c, which CLN reports as
+"Malformed error reply" while still returning the funds.

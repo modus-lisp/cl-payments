@@ -31,8 +31,9 @@
                     (#:p #:cl-payments.peer) (#:k #:cl-payments.keys)
                     (#:ch #:cl-payments.channel) (#:u #:cl-payments.updates)
                     (#:gs #:cl-payments.gossip) (#:m #:cl-payments.commitment)
-                    (#:f #:cl-payments.features)
+                    (#:f #:cl-payments.features) (#:lv #:cl-payments.live)
                     (#:tr #:cl-transport) (#:bt #:bordeaux-threads)
+                    (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:secp #:secp256k1-fast))
   (:nicknames #:ln-node)
   (:export
@@ -76,7 +77,11 @@
   ;; funding pubkey (the other half of the 2-of-2), and the two signatures the
   ;; peer contributed.
   (key-index 0)
-  scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig)
+  scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig
+  ;; The commitment-cycle state, for channels the daemon accepted.  Channels
+  ;; opened by inspect/open-channel.lisp predate this and have none: they are
+  ;; announced and routable in the graph, but no HTLC can cross them.
+  (live nil))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Channel keys
@@ -163,7 +168,8 @@
                                 :remote-node-sig
                                 (let ((k (sc-remote-node-sig sc))) (and k (%hex k)))
                                 :remote-bitcoin-sig
-                                (let ((k (sc-remote-bitcoin-sig sc))) (and k (%hex k))))
+                                (let ((k (sc-remote-bitcoin-sig sc))) (and k (%hex k)))
+                                :live (let ((l (sc-live sc))) (and l (lv:live->plist l))))
                           s)
                    (terpri s))
                  (node-channels node))))
@@ -197,7 +203,8 @@
                             (let ((v (getf form :remote-node-sig))) (and v (%unhex v)))
                             :remote-bitcoin-sig
                             (let ((v (getf form :remote-bitcoin-sig)))
-                              (and v (%unhex v))))))
+                              (and v (%unhex v)))
+                            :live (let ((v (getf form :live))) (and v (lv:plist->live v))))))
                    (setf (gethash (%hex (sc-channel-id sc)) (node-channels node)) sc)))))
     (hash-table-count (node-channels node))))
 
@@ -276,7 +283,10 @@
         ;; a wrong answer, because the peer waits forever.  The numbers below are
         ;; the "nothing has happened yet" state, which is true of a channel we
         ;; have no record of.
-        (let ((ours (u:make-channel-reestablish
+        (let ((ours (if (and sc (sc-live sc))
+                        (lv:reestablish-message (sc-live sc))
+                        (u:encode-channel-reestablish
+                         (u:make-channel-reestablish
                      :channel-id cid
                      :next-commitment-number
                      (if sc (1+ (sc-local-commitment-number sc)) 1)
@@ -287,9 +297,8 @@
                      (k:per-commitment-point
                       (c:sha256 (c:bytes (secp:int-to-bytes32 (node-privkey node)) cid))
                       (- k:+max-commitment-index+
-                         (if sc (sc-local-commitment-number sc) 0))))))
-          (ignore-errors
-           (p:send-message peer (u:encode-channel-reestablish ours) nil)))))))
+                         (if sc (sc-local-commitment-number sc) 0))))))))
+          (ignore-errors (p:send-message peer ours nil)))))))
 
 (defconstant +msg-announcement-signatures+ 259)
 
@@ -635,7 +644,25 @@
                    :local-msat push-msat
                    :remote-msat (- (* funding-sat 1000) push-msat)
                    :key-index (ck-index keys)
-                   :remote-funding-pubkey their-funding-pub))
+                   :remote-funding-pubkey their-funding-pub
+                   :live (lv:make-live
+                          :channel-id cid :funding-txid (ch:fc-funding-txid fc)
+                          :funding-index (ch:fc-funding-output-index fc)
+                          :capacity-sat funding-sat :opener :remote
+                          :funding-priv (ck-funding keys) :revocation-priv (ck-revocation keys)
+                          :payment-priv (ck-payment keys) :delayed-priv (ck-delayed keys)
+                          :htlc-priv (ck-htlc keys) :seed (ck-seed keys)
+                          :remote-funding-pubkey their-funding-pub
+                          :remote-revocation-basepoint (ch:oc-revocation-basepoint oc)
+                          :remote-payment-basepoint (ch:oc-payment-basepoint oc)
+                          :remote-delayed-basepoint (ch:oc-delayed-payment-basepoint oc)
+                          :remote-htlc-basepoint (ch:oc-htlc-basepoint oc)
+                          :local-dust-limit 546 :remote-dust-limit (ch:oc-dust-limit-satoshis oc)
+                          ;; They chose the delay on OUR to_local; we chose theirs.
+                          :local-to-self-delay (ch:oc-to-self-delay oc) :remote-to-self-delay 144
+                          :feerate-per-kw (ch:oc-feerate-per-kw oc)
+                          :local-msat push-msat :remote-msat (- (* funding-sat 1000) push-msat)
+                          :remote-first-point their-pcp)))
             (save-channels node)
             (nlog node "  funding_signed sent — channel ~a accepted, ~d msat ours"
                   (subseq (%hex cid) 0 16) push-msat))))
@@ -659,6 +686,12 @@
         (if (null sc)
             (nlog node "  no record of that channel — not replying")
             (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+              ;; Their second per-commitment point is what we sign their FIRST
+              ;; update into.  Only taken while nothing has happened yet: a peer
+              ;; re-sending channel_ready after a reconnect must not rewind us.
+              (when (and (sc-live sc) (zerop (lv:live-remote-commit-index (sc-live sc))))
+                (lv:set-remote-next-point (sc-live sc) (ch:cr-second-per-commitment-point cr))
+                (save-channels node))
               (p:send-message
                peer
                (ch:encode-channel-ready
@@ -669,6 +702,164 @@
                nil)
               (nlog node "  our channel_ready sent"))))
     (error (e) (nlog node "bad channel_ready: ~a" e))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; The HTLC cycle on a live channel
+;;;
+;;; The daemon's part is deliberately thin: hand each message to the live
+;;; channel, send back whatever it returns, and persist.  Two decisions live
+;;; here rather than in live.lisp because they are POLICY, not protocol:
+;;;
+;;;   * when to send commitment_signed — as soon as there is something to sign
+;;;     and nothing outstanding.  A node that waits for "enough" updates is a
+;;;     node whose peer times out.
+;;;   * when to settle a received HTLC — once it is in BOTH commitments, and
+;;;     only if we hold the preimage.  Settling earlier lets the peer dispute a
+;;;     payment we already treated as received.
+;;; ----------------------------------------------------------------------------
+
+(defun known-preimages (node)
+  "Preimages we are willing to reveal, from <dir>/preimages.sexp: one hex string
+   per line.  Re-read on every HTLC so a preimage can be added while the daemon
+   runs.  This stands in for invoices (Phase 7); the payment_hash is what a
+   sender puts in the onion, and knowing its preimage is what makes the payment
+   ours to claim."
+  (let ((path (merge-pathnames "preimages.sexp" (node-dir node))))
+    (when (probe-file path)
+      (with-open-file (s path)
+        (loop for form = (read s nil) while form
+              collect (%unhex (string form)))))))
+
+(defun preimage-for (node payment-hash)
+  (find-if (lambda (pre) (equalp (c:octets (c:sha256 pre)) (c:octets payment-hash)))
+           (known-preimages node)))
+
+(defun live-channel-for (node payload)
+  "The stored channel a channel-scoped message is about, by its leading
+   channel_id, or NIL (logged) if we do not have a live one."
+  (let* ((cid (subseq payload 0 32))
+         (sc (gethash (%hex cid) (node-channels node))))
+    (cond ((null sc) (nlog node "  message for unknown channel ~a" (subseq (%hex cid) 0 16)) nil)
+          ((null (sc-live sc)) (nlog node "  channel ~a has no live state" (subseq (%hex cid) 0 16)) nil)
+          (t sc))))
+
+(defun maybe-commit (node peer sc)
+  "Sign their next commitment if there is anything to sign and we may."
+  (let ((lc (sc-live sc)))
+    (when (lv:can-send-commit-p lc)
+      (p:send-message peer (lv:send-commit lc) nil)
+      (nlog node "  commitment_signed sent (their commitment ~d)"
+            (1+ (lv:live-remote-commit-index lc))))))
+
+(defun settle-received (node peer sc)
+  "Fulfil or fail every received HTLC that is now committed on both sides."
+  (let ((lc (sc-live sc)))
+    (dolist (h (lv:fully-committed-received-htlcs lc))
+      (let ((pre (preimage-for node (lv:hr-payment-hash h))))
+        (cond
+          (pre
+           (p:send-message peer (lv:send-fulfill lc (lv:hr-id h) pre) nil)
+           (nlog node "  HTLC ~d: preimage known — update_fulfill_htlc sent, ~d msat is ours"
+                 (lv:hr-id h) (lv:hr-amount-msat h)))
+          (t
+           ;; The reason should be a BOLT #4 failure onion (Phase 5c).  Until
+           ;; then an opaque reason still returns the money; the sender just
+           ;; cannot read why.
+           (p:send-message peer (lv:send-fail lc (lv:hr-id h) (c:zeros 32)) nil)
+           (nlog node "  HTLC ~d: no preimage for ~a — update_fail_htlc sent"
+                 (lv:hr-id h) (subseq (%hex (lv:hr-payment-hash h)) 0 16))))))))
+
+(defmacro with-live-channel ((sc lc node payload what) &body body)
+  `(handler-case
+       (let ((,sc (live-channel-for ,node ,payload)))
+         (when ,sc
+           (let ((,lc (sc-live ,sc)))
+             (declare (ignorable ,lc))
+             ,@body
+             (save-channels ,node))))
+     (error (e) (nlog ,node "~a: ~a" ,what e))))
+
+(defun handle-update-add (node peer payload)
+  (declare (ignore peer))
+  (with-live-channel (sc lc node payload "update_add_htlc")
+    (let ((h (lv:receive-add lc payload)))
+      (nlog node "update_add_htlc ~d: ~d msat, hash ~a, expiry ~d"
+            (lv:hr-id h) (lv:hr-amount-msat h) (subseq (%hex (lv:hr-payment-hash h)) 0 16)
+            (lv:hr-cltv-expiry h)))))
+
+(defun handle-commitment-signed (node peer payload)
+  (with-live-channel (sc lc node payload "commitment_signed")
+    (let ((raa (lv:receive-commit lc payload)))
+      (nlog node "commitment_signed verified — our commitment ~d has ~d HTLC~:p, ~d msat ours"
+            (lv:live-local-commit-index lc) (length (lv:live-htlcs lc))
+            (lv:live-local-balance-msat lc))
+      (p:send-message peer raa nil)
+      (nlog node "  revoke_and_ack sent")
+      ;; Their updates are acked now; sign them into their commitment.
+      (maybe-commit node peer sc))))
+
+(defun handle-revoke-and-ack (node peer payload)
+  (with-live-channel (sc lc node payload "revoke_and_ack")
+    (lv:receive-revocation lc payload)
+    (nlog node "revoke_and_ack accepted — their commitment ~d is current"
+          (lv:live-remote-commit-index lc))
+    (settle-received node peer sc)
+    (maybe-commit node peer sc)))
+
+(defun handle-update-fulfill (node peer payload)
+  (declare (ignore peer))
+  (with-live-channel (sc lc node payload "update_fulfill_htlc")
+    (let ((h (lv:receive-fulfill lc payload)))
+      (nlog node "update_fulfill_htlc ~d: preimage verified" (lv:hr-id h)))))
+
+(defun handle-update-fail (node peer payload)
+  (declare (ignore peer))
+  (with-live-channel (sc lc node payload "update_fail_htlc")
+    (let ((id (w:r-u64 (w:make-reader payload :start 32))))
+      (lv:receive-fail lc id)
+      (nlog node "update_fail_htlc ~d" id))))
+
+(defun handle-update-fail-malformed (node peer payload)
+  (declare (ignore peer))
+  (with-live-channel (sc lc node payload "update_fail_malformed_htlc")
+    (let* ((r (w:make-reader payload :start 32))
+           (id (w:r-u64 r)))
+      (w:r-bytes r 32)
+      (let ((code (w:r-u16 r)))
+        (lv:receive-fail lc id)
+        (nlog node "update_fail_malformed_htlc ~d: failure code #x~x" id code)))))
+
+(defun handle-update-fee (node peer payload)
+  (declare (ignore peer))
+  (with-live-channel (sc lc node payload "update_fee")
+    (let ((fee (w:r-u32 (w:make-reader payload :start 32))))
+      (lv:receive-fee lc fee)
+      (nlog node "update_fee: ~d sat/kw" fee))))
+
+;;; ----------------------------------------------------------------------------
+;;; Closing
+;;; ----------------------------------------------------------------------------
+
+(defun our-shutdown-script (node sc)
+  "Where our side of a close goes: P2WPKH of a key derived for this channel.
+   Recoverable from the node key alone, like every other channel key."
+  (m:p2wpkh (ck-pub (%derive-scalar (node-privkey node) (sc-key-index sc) "close"))))
+
+(defun handle-shutdown (node peer payload)
+  (with-live-channel (sc lc node payload "shutdown")
+    (lv:receive-shutdown lc payload)
+    (nlog node "shutdown received for ~a" (gs:scid-string (or (sc-scid sc) (gs:make-scid 0 0 0))))
+    (unless (lv:live-local-shutdown-script lc)
+      (p:send-message peer (lv:send-shutdown lc (our-shutdown-script node sc)) nil)
+      (nlog node "  our shutdown sent"))))
+
+(defun handle-closing-signed (node peer payload)
+  (with-live-channel (sc lc node payload "closing_signed")
+    (multiple-value-bind (reply tx) (lv:receive-closing-signed lc payload)
+      (p:send-message peer reply nil)
+      (nlog node "closing_signed: their signature verifies — agreed, closing tx ~a"
+            (bw:hash->hex (btx:tx-txid tx))))))
 
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+
@@ -681,6 +872,16 @@
         (lambda (pr payload) (handle-announcement-signatures node pr payload)))
   (p:on peer ch:+msg-channel-ready+
         (lambda (pr payload) (handle-channel-ready node pr payload)))
+  (p:on peer u:+msg-update-add-htlc+ (lambda (pr pl) (handle-update-add node pr pl)))
+  (p:on peer u:+msg-commitment-signed+ (lambda (pr pl) (handle-commitment-signed node pr pl)))
+  (p:on peer u:+msg-revoke-and-ack+ (lambda (pr pl) (handle-revoke-and-ack node pr pl)))
+  (p:on peer u:+msg-update-fulfill-htlc+ (lambda (pr pl) (handle-update-fulfill node pr pl)))
+  (p:on peer u:+msg-update-fail-htlc+ (lambda (pr pl) (handle-update-fail node pr pl)))
+  (p:on peer u:+msg-update-fail-malformed-htlc+
+        (lambda (pr pl) (handle-update-fail-malformed node pr pl)))
+  (p:on peer u:+msg-update-fee+ (lambda (pr pl) (handle-update-fee node pr pl)))
+  (p:on peer lv::+msg-shutdown+ (lambda (pr pl) (handle-shutdown node pr pl)))
+  (p:on peer lv::+msg-closing-signed+ (lambda (pr pl) (handle-closing-signed node pr pl)))
   ;; Gossip is accepted and ignored for now; the point of logging it is that a
   ;; silent daemon is indistinguishable from a wedged one.
   (p:on peer gs:+msg-channel-announcement+ (lambda (pr pl) (declare (ignore pr pl)) nil))
