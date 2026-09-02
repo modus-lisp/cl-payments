@@ -832,6 +832,8 @@
         :remote-shutdown-script (hx (live-remote-shutdown-script lc))
         :closed-p (live-closed-p lc) :closing-txid (hx (live-closing-txid lc))
         :local-commit-sig (hx (live-local-commit-sig lc))
+        :prev-commit-sig (hx (live-prev-commit-sig lc)) :prev-index (live-prev-index lc)
+        :prev-spec (and (live-prev-spec lc) (spec->plist (live-prev-spec lc)))
         :local-commit-htlc-sigs (mapcar #'hx (live-local-commit-htlc-sigs lc))
         :revocations (k:shachain->plist (live-revocations lc))))
 
@@ -861,5 +863,7 @@
                 :remote-shutdown-script (uh (g :remote-shutdown-script))
                 :closed-p (g :closed-p) :closing-txid (uh (g :closing-txid))
                 :local-commit-sig (uh (g :local-commit-sig))
+                :prev-commit-sig (uh (g :prev-commit-sig)) :prev-index (g :prev-index)
+                :prev-spec (and (g :prev-spec) (plist->spec (g :prev-spec)))
                 :local-commit-htlc-sigs (mapcar #'uh (g :local-commit-htlc-sigs))
                 :revocations (if (g :revocations) (k:plist->shachain (g :revocations)) (k:make-shachain)))))

@@ -505,14 +505,41 @@ daemon's receive path still takes preimages from a file rather than minting
 invoices. That is the last piece of "cl-payments as a wallet" and belongs with
 the RPC that Phase 8's chain view will also need.
 
-## Phase 8 — on-chain handling
+## Phase 8 — on-chain handling  **[DONE, except HTLC outputs]**
 
-BOLT #5: watch for commitment transactions on chain, sweep to-local after the
-CSV delay, penalise a revoked commitment, resolve HTLCs by timeout or preimage.
+BOLT #5. `src/chain.lisp` is the chain view — one small protocol, bitcoind over
+bitcoin-cli behind it for the daemon and an in-memory chain for gates.
+`src/onchain.lisp` answers a spend of the funding output: mutual close (nothing
+to do), their current commitment (sweep our to_remote at once), their REVOKED
+commitment (penalty: their to_local via the revocation key and our to_remote,
+one transaction), our own (sweep to_local after the CSV delay). The daemon's
+watcher thread confirms fundings from where they actually landed, scans each
+new block for spends of our funding outputs, and answers them.
 
-**Milestone.** Force-close from cl-payments and sweep correctly; and separately,
-publish a revoked commitment on the devnet and confirm the counterparty
-penalises us — the one test that is genuinely dangerous anywhere but here.
+Every transaction is spent under cl-consensus's interpreter with CSV on, and
+the daemon gate ends with B publishing a revoked commitment: A's watcher builds
+and broadcasts the penalty, and B's own delayed sweep finds the output gone.
+
+Not yet: HTLC outputs on a published commitment (timeout and success paths),
+and a real fee estimate for sweeps (a fixed 500 sat). Both are needed before
+this is safe with HTLCs in flight at close time.
+
+**Milestone met, both halves, against Core Lightning on the devnet:**
+
+- clp3 force-closed a channel: the commitment confirmed, the watcher classified
+  it as our own, and after the 144-block delay the to_local sweep confirmed at
+  our address.
+- clp3 deliberately published a REVOKED commitment (the `:publish-revoked`
+  command, which exists for this test and nothing else). cln4 moved to
+  `ONCHAIN` and its penalty transactions spent both our to_local (173,000 sat)
+  and an HTLC output (7,000 sat); its wallet holds 171,940 and 5,824 sat from
+  them. The one test that is genuinely dangerous anywhere but here, and the
+  reason a revoked state is never safe to publish.
+
+The daemon's own reaction to the same event — classifying, building the
+penalty, and broadcasting it — is exercised end to end in the daemon gate with
+a mock chain; against CLN it was the victim this time, which is the half a
+counterparty can verify.
 
 ---
 
@@ -555,12 +582,16 @@ routed end to end.
 
 ## Status
 
-**Phases 0–7 are done.** cl-payments opens channels, accepts them, announces
+**Phases 0–8 are done, with the HTLC-output caveat under Phase 8.** cl-payments
+opens channels, accepts them, announces
 them, receives payments with the onion read, forwards payments between two other
 implementations' nodes with readable failures in every rejection path, PAYS
 invoices from both Core Lightning and LND over routes learned from gossip with
-retry around channels that turn out empty, and closes cooperatively — each step
-verified against real implementations on the private signet.
+retry around channels that turn out empty, closes cooperatively, force-closes
+and sweeps after the delay, and — the reason any of it is safe — punishes a
+revoked commitment, as Core Lightning punished ours. Each step verified against
+real implementations on the private signet, and the whole story runs as
+`integration.sh`: 19 steps.
 
 Verified against real implementations on the private signet:
 
@@ -586,13 +617,12 @@ Verified against real implementations on the private signet:
 
 Offline suite: 762 checks across two gates, every new check mutation-verified.
 
-**Next: Phase 8**, on-chain handling — the chain view the daemon has been
-missing (which also unblocks the two skipped forwarding checks and removes the
-height parameter from `clp-pay.sh`), watching for commitment transactions,
-sweeping after the CSV delay, penalising a revoked commitment, and resolving
-HTLCs on chain. It is what makes everything above safe against a peer that
-stops cooperating; until then every channel here is safe only because both
-ends behave.
+**Next:** HTLC outputs on a published commitment — the timeout and success
+second-stage transactions, and their revocation paths — so a close with HTLCs
+in flight resolves rather than strands them; a real fee estimate for sweeps and
+closes instead of fixed satoshis; minting invoices in the daemon (the encoder is
+proven, the receive path still reads preimages from a file); and an RPC so
+`commands/` can retire. After that the non-goals list is where the roadmap goes.
 
 Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
 state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the

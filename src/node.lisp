@@ -827,6 +827,7 @@
   (let ((found nil))
     (maphash (lambda (k sc) (declare (ignore k))
                (when (and (sc-scid sc) (sc-live sc) (not (lv:live-closed-p (sc-live sc)))
+                          (null (sc-close-kind sc))
                           (= (gs:scid->u64 (sc-scid sc)) (gs:scid->u64 scid)))
                  (setf found sc)))
              (node-channels node))
@@ -1104,7 +1105,11 @@
   (let ((out '()))
     (maphash (lambda (k sc) (declare (ignore k))
                (let ((lc (sc-live sc)))
-                 (when (and lc (sc-scid sc) (not (lv:live-closed-p lc))
+                 ;; A channel whose funding output has been spent is not a channel
+                 ;; any more, whatever the peer still says.  Routing over one hangs
+                 ;; the HTLC: the LND payment that did this sat for a minute with
+                 ;; nobody able to fail it.
+                 (when (and lc (sc-scid sc) (not (lv:live-closed-p lc)) (null (sc-close-kind sc))
                             (gethash (%hex (sc-peer-id sc)) (node-peers node)))
                    (push (rt:make-edge :from (node-id node) :to (sc-peer-id sc) :scid (sc-scid sc)
                                        :policy (fw:make-policy)
