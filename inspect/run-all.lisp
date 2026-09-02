@@ -21,6 +21,7 @@
   (run-forward-tests)
   (run-live-tests)
   (run-onion-tests)
+  (run-invoice-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)

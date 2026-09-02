@@ -16,7 +16,7 @@
                     (#:u #:cl-payments.updates)
                     (#:n #:cl-payments.node)
                     (#:fw #:cl-payments.forward)
-                    (#:lv #:cl-payments.live) (#:on #:cl-payments.onion)
+                    (#:lv #:cl-payments.live) (#:on #:cl-payments.onion) (#:inv #:cl-payments.invoice)
                     (#:btx #:cl-consensus.tx) (#:bs #:cl-consensus.script)
                     (#:secp #:secp256k1-fast))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
@@ -83,12 +83,17 @@
    Needed because a parser under test signals on malformed input, and a raw call
    in a gate would abort the WHOLE SUITE rather than failing one check — turning
    a one-line regression into a run with no results at all."
-  `(progn
-     (incf *checks*)
-     (handler-case (let ((v (progn ,@body)))
-                     (format t "~&    ok    ~a~%" ,label)
-                     v)
-       (error (e) (%fail ,label (format nil "signalled ~a: ~a" (type-of e) e)) nil))))
+  (let ((v (gensym "VALUE")))
+    ;; A gensym, not a literal V: the LABEL form is evaluated inside this
+    ;; binding, and a caller whose own variable is named V would otherwise see
+    ;; the checked value instead of its variable — a capture that surfaced as a
+    ;; TYPE-ERROR pointing at a struct that had nothing to do with it.
+    `(progn
+       (incf *checks*)
+       (handler-case (let ((,v (progn ,@body)))
+                       (format t "~&    ok    ~a~%" ,label)
+                       ,v)
+         (error (e) (%fail ,label (format nil "signalled ~a: ~a" (type-of e) e)) nil)))))
 
 (defmacro with-gate ((name) &body body)
   "Run a group of checks, CONTAINING any error to this gate.
