@@ -20,6 +20,7 @@
   (run-accept-tests)
   (run-forward-tests)
   (run-live-tests)
+  (run-onion-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)

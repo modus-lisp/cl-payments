@@ -16,7 +16,7 @@
                     (#:u #:cl-payments.updates)
                     (#:n #:cl-payments.node)
                     (#:fw #:cl-payments.forward)
-                    (#:lv #:cl-payments.live)
+                    (#:lv #:cl-payments.live) (#:on #:cl-payments.onion)
                     (#:btx #:cl-consensus.tx) (#:bs #:cl-consensus.script)
                     (#:secp #:secp256k1-fast))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal

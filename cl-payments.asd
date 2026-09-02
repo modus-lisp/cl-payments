@@ -33,6 +33,7 @@
      (:file "updates")     ; BOLT #2: the HTLC lifecycle and its state machine
      (:file "forward")    ; BOLT #4: the forwarding decision
      (:file "live")       ; BOLT #2: the commitment cycle on a live channel
+     (:file "onion")      ; BOLT #4: the Sphinx onion
      (:file "node"))))     ; the daemon: listener, peer registry, channel state
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
@@ -57,5 +58,6 @@
                              (:file "updates-test")
                              (:file "forward-test")
                              (:file "live-test")
+                             (:file "onion-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))
