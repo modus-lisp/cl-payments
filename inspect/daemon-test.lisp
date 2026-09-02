@@ -213,6 +213,12 @@
              ;; next one.  Broadcasting it is theft; A must take everything.
              (let* ((cheat (lv:previous-commitment-tx (live-of b))))
                (ok "B holds a signed previous (revoked) commitment" (and cheat t))
+               ;; A reports each revocation from its handler thread; the blob for
+               ;; THIS commitment is the newest, so wait for it specifically
+               ;; rather than mining ahead of it.
+               (wait-for "the tower holds the blob for the commitment B is about to publish" 5
+                         (lambda () (gethash (c:bytes->hex (subseq (c:octets (btx:tx-txid cheat)) 0 16))
+                                             (n:node-tower-store tower))))
                (chn:chain-broadcast chain cheat)
                (chn:mock-mine chain 1)
                ;; The tower sees the block before A does — A might be offline.
