@@ -132,11 +132,28 @@ BOLT #2: `open_channel`/`accept_channel`, `funding_created`/`funding_signed`,
 `channel_ready`, then the HTLC lifecycle (`update_add_htlc`,
 `commitment_signed`, `revoke_and_ack`) and `shutdown`/`closing_signed`.
 
-**The phase ordering below was wrong and has been corrected in practice.** BOLT
-#2 sits *on top of* BOLT #3, not beside it: `funding_created` carries a signature
-over the peer's first commitment transaction, so the commitment keys and the
-transaction itself must exist before the message can be sent at all. BOLT #3 is
-therefore being built first, starting with key derivation.
+BOLT #3 (commitment transactions) is folded in here rather than being its own
+phase, because BOLT #2 sits *on top of* it: `funding_created` carries a
+signature over the peer's first commitment transaction, so the keys and the
+transaction had to exist before the message could be sent at all.
+
+Sub-phases, in the order they were actually built:
+
+| | | |
+|---|---|---|
+| 4a | key derivation, shachain | done |
+| 4b | commitment and HTLC transactions | done |
+| 4c | BOLT #2 open messages; a live open against CLN | done |
+| 4c-bis | LND interop, `channel_reestablish` | done |
+| 4d | HTLC lifecycle state machine | **partial** — never driven a live channel |
+| 4e | the daemon | done |
+| 4f | announcing our channels | done |
+| 4g | accepting opens | done |
+| 4h | `shutdown` / `closing_signed` | **not started** |
+
+**What closes Phase 4:** an HTLC actually moving over a live channel with a real
+implementation, and a cooperative close. Everything else in it is done.
+
 
 ### 4a — key derivation  **[DONE]**
 
@@ -245,6 +262,36 @@ flaps; with it off, LND never relays gossip and routes die at the LND hop. As a
 leaf with sync off the links are stable, which is what BOLT #8/#1/#2 interop
 needs.
 
+### 4d — the HTLC lifecycle  **[PARTIAL]**
+
+`src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
+`commitment_signed`, `revoke_and_ack`, `update_fee`, and the state machine that
+tracks what has been proposed, what is irrevocably committed, and whether a
+revocation is outstanding.
+
+The ordering discipline is the point, not the encodings:
+
+- An HTLC's amount leaves the sender's balance when **proposed**, not when
+  committed — it is in flight, belonging to neither side, and returns only if
+  the HTLC fails.
+- A fulfill is honoured only if the preimage really hashes to the payment hash,
+  in **both** directions. Accepting an unproven claim gives money away; sending
+  one pays out against nothing redeemable on chain.
+- `commitment_signed` may not be sent while a `revoke_and_ack` is outstanding —
+  the peer would hold two commitments with no way to say which it revoked.
+- A commitment is never revoked before its replacement is signed. Revoking first
+  leaves you holding nothing enforceable: the old state is punishable if you
+  publish it and the new one is unsigned, so the balance is entirely at the
+  counterparty's discretion.
+
+**Not done, and this is the larger part.** The state machine is tested in
+isolation; it has never driven a real channel. Remaining: wiring it into the
+daemon so `commitment_signed`/`revoke_and_ack` interleave over a live connection,
+re-signing the commitment on every update (both directions, with per-HTLC
+signatures), and BOLT #4's onion so `update_add_htlc` carries something a peer
+can act on. `channel_reestablish` itself is done (4c-bis). Until this closes, no
+payment can move.
+
 ### 4e — the daemon  **[DONE]**
 
 `src/node.lisp` and `bin/cl-payments.lisp`: a process that listens, accepts
@@ -303,6 +350,19 @@ Channel keys are derived from the node key and an index rather than generated
 randomly — `open-channel.lisp` had been generating them fresh, which made the
 script the only thing holding half of a 2-of-2 over real funds.
 
+### 4h — closing  **[NOT STARTED]**
+
+`shutdown` and `closing_signed`: the cooperative close, negotiating a fee and
+producing a mutual closing transaction that spends the funding output directly.
+Named in Phase 4's scope from the start; nothing built yet.
+
+## Phase 5 — forwarding
+
+What a node in the MIDDLE of a route owes everyone else. Split out from onion
+routing because the money is in the *decision*, not the packet: peeling a layer
+says what the sender asked for, and whether that request is acceptable is a
+policy question about our own channel.
+
 ### 5a — the forwarding decision  **[DONE]**
 
 `src/forward.lisp`: BOLT #4 failure codes, our fee/CLTV policy, and the check
@@ -337,57 +397,26 @@ the baseline every test in `forward-test.lisp` perturbs.
 66 checks, 13 mutations, 13 killed — including "forward everything", which fails
 24 of them.
 
-### 4d — the HTLC lifecycle  **[PARTIAL]**
+### 5b — forwarding over a live channel  **[NOT STARTED]**
 
-`src/updates.lisp`: `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
-`commitment_signed`, `revoke_and_ack`, `update_fee`, and the state machine that
-tracks what has been proposed, what is irrevocably committed, and whether a
-revocation is outstanding.
+Wire 5a's decision into the daemon: receive `update_add_htlc` upstream, decide,
+offer downstream, relay the fulfil or the failure back. Depends on 4d closing and
+on Phase 6 for the onion. The devnet is already shaped for it — CLN computes
+cln3 → clp3 → cln4 today; this is what makes that route actually carry a payment.
 
-The ordering discipline is the point, not the encodings:
+### 5c — failure messages  **[NOT STARTED]**
 
-- An HTLC's amount leaves the sender's balance when **proposed**, not when
-  committed — it is in flight, belonging to neither side, and returns only if
-  the HTLC fails.
-- A fulfill is honoured only if the preimage really hashes to the payment hash,
-  in **both** directions. Accepting an unproven claim gives money away; sending
-  one pays out against nothing redeemable on chain.
-- `commitment_signed` may not be sent while a `revoke_and_ack` is outstanding —
-  the peer would hold two commitments with no way to say which it revoked.
-- A commitment is never revoked before its replacement is signed. Revoking first
-  leaves you holding nothing enforceable: the old state is punishable if you
-  publish it and the new one is unsigned, so the balance is entirely at the
-  counterparty's discretion.
-
-**Not done, and this is the larger part.** The state machine is tested in
-isolation; it has never driven a real channel. Making an actual payment needs:
-re-signing the commitment on every update (both directions, with HTLC outputs
-and their signatures), the `channel_reestablish` resync after a reconnect, and
-BOLT #4's onion — `update_add_htlc` carries a 1366-byte onion packet that this
-code can carry but not yet construct or peel. Until that exists, no payment can
-move.
-
-## Phase 5 — commitment transactions
-
-BOLT #3: the per-commitment secret chain, key derivation
-(`localpubkey`/`revocationpubkey`/…), to-local and to-remote outputs, HTLC
-outputs and their timeout/success transactions, anchor outputs.
-
-This is where cl-consensus does the heavy lifting: every commitment transaction
-is a Bitcoin transaction our own script interpreter can validate, and every
-signature is checked by our own secp256k1.
-
-**Milestone.** BOLT #3's test vectors reproduce byte-for-byte, and a commitment
-transaction we build validates under cl-consensus's script interpreter.
+BOLT #4's encrypted failure onion: wrap our failure code (with the
+`channel_update` for UPDATE failures) so only the sender can read it, and
+obfuscate failures we relay from downstream.
 
 ## Phase 6 — onion routing
 
 BOLT #4 Sphinx: construct a 1300-byte onion, peel a layer, handle the error
 onion. Constant-size routing packets with per-hop keys.
 
-**Milestone.** BOLT #4's vectors reproduce, and a payment we onion-route reaches
-lnd1 through cln2 — the same path `smoke.sh` proves works between the
-implementations.
+**Milestone.** BOLT #4's vectors reproduce, and a payment we onion-route crosses
+the spine — and, separately, one routed *by CLN* is forwarded *through* clp3.
 
 ## Phase 7 — invoices
 
@@ -416,9 +445,23 @@ routed end to end.
 
 ## Status
 
-Phases 0–3 are done and verified against both the spec vectors and two live
-implementations: 185 offline checks, a connection both Core Lightning and LND
-accept and keep, and a routing graph that matches theirs exactly.
+Phases 0–3 are done. Phase 4 is done except for two things: an HTLC has never
+moved over a live channel (4d), and there is no cooperative close (4h). Phase 5a
+is done.
 
-Phase 4 (channels) is next — the first phase where we put money at risk, and the
-first that needs cl-consensus for more than a chain hash.
+Verified against real implementations on the private signet:
+
+- Core Lightning and LND both accept our BOLT #8 handshake, init, and gossip.
+- CLN dials **us**; we answer `channel_reestablish` and it resyncs.
+- Channels we open (`273x1x1`) and channels CLN opens **to us** (`291x1x0`,
+  `300x1x0`) both reach `CHANNELD_NORMAL` and are announced network-wide with
+  both directions active. A second implementation verified our node *and*
+  bitcoin signatures over the announcement and relayed it.
+- `getroute` finds paths **to** clp3 (3 hops) and **through** it
+  (cln3 → clp3 → cln4), paying exactly the fee our formula computes.
+
+Offline suite: 524 checks across two gates, every new check mutation-verified.
+
+**Next, in order:** 4d over a live channel, then Phase 6 (onion), then 5b — at
+which point clp3 forwards a real payment and its middle-hop position stops being
+a graph fact and becomes a behaviour. 4h and Phases 7–8 follow.
