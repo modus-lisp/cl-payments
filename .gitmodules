@@ -7,3 +7,6 @@
 [submodule "deps/cl-consensus"]
 	path = deps/cl-consensus
 	url = https://github.com/modus-lisp/cl-consensus.git
+[submodule "deps/pagetree"]
+	path = deps/pagetree
+	url = https://github.com/modus-lisp/pagetree.git

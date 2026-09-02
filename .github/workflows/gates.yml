@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # cl-consensus, secp256k1-fast and cl-transport are not on Quicklisp;
+          # cl-consensus, pagetree, secp256k1-fast and cl-transport are not on Quicklisp;
           # they are vendored under deps/ and pinned by commit.
           submodules: recursive
       - name: Install SBCL
@@ -23,7 +23,7 @@ jobs:
           sbcl --non-interactive --load /tmp/ql.lisp \
             --eval '(quicklisp-quickstart:install)' \
             --eval '(ql-util:without-prompting (ql:add-to-init-file))' \
-            --eval '(ql:quickload (list :ironclad :usocket :bordeaux-threads))'
+            --eval '(ql:quickload (list :ironclad :usocket :bordeaux-threads :com.inuoe.jzon :hunchentoot))'
       - name: Offline gate suite
         run: inspect/run-all.sh
       - name: Gate logs on failure
