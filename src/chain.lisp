@@ -60,11 +60,16 @@
   (make-instance 'bitcoind :command (uiop:split-string command-string :separator " ")))
 
 (defun %cli (chain &rest args)
-  (handler-case
-      (string-trim '(#\Newline #\Space)
-                   (uiop:run-program (append (bitcoind-command chain) (remove "" args :test #'string=))
-                                     :output :string :error-output nil))
-    (error (e) (error 'chain-error :detail (format nil "bitcoin-cli ~a: ~a" (first args) e)))))
+  "Run bitcoin-cli.  On failure the error carries bitcoind's own message —
+   \"non-BIP68-final\", \"bad-txns-inputs-missingorspent\" — which is the only
+   thing that distinguishes a sweep sent too early from one sent too late."
+  (multiple-value-bind (out err code)
+      (uiop:run-program (append (bitcoind-command chain) (remove "" args :test #'string=))
+                        :output :string :error-output :string :ignore-error-status t)
+    (if (zerop code)
+        (string-trim '(#\Newline #\Space) out)
+        (error 'chain-error :detail (format nil "bitcoin-cli ~a: ~a" (first args)
+                                            (string-trim '(#\Newline #\Space) err))))))
 
 (defun %json-field (json key)
   "One string or number field out of flat JSON, without a JSON dependency."

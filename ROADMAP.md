@@ -532,7 +532,9 @@ restart mid-resolution resumes. Which HTLCs were in each commitment we signed fo
 the peer is kept, because a revoked commitment's scripts cannot be rebuilt
 without their hashes and expiries.
 
-Not yet: a real fee estimate for sweeps and closes (fixed satoshis).
+Fees come from the chain's feerate — bitcoind's estimate, then the mempool
+minimum, never below 1 sat/vB — times a vsize estimate by input kind, chosen
+before signing because the fee changes what the signature covers.
 
 **Milestone met, both halves, against Core Lightning on the devnet:**
 
@@ -626,10 +628,18 @@ Verified against real implementations on the private signet:
 
 Offline suite: 762 checks across two gates, every new check mutation-verified.
 
-**Next:** a real fee estimate for sweeps and closes instead of fixed satoshis;
-minting invoices in the daemon (the encoder is proven, the receive path still
-reads preimages from a file); and an RPC so `commands/` can retire. After that
-the non-goals list is where the roadmap goes.
+**The roadmap is complete.** The daemon mints invoices, pays over a control
+socket or a dropped file, and `integration.sh` runs the whole story against
+Core Lightning and LND in 24 steps: control socket, three opens, lock-in,
+announcement and relay, a minted invoice paid by CLN, a forward with fee kept,
+a relayed failure, payments to CLN and LND (the latter routed around an empty
+channel), a cooperative close, a force-close with the to_local swept after the
+delay, and a deliberately published revoked commitment that Core Lightning
+punished. 24 of 24.
+
+What a production node would still want, in order: more than one confirmation
+before a funding is locked in; watchtower-style outsourcing of the penalty;
+anchor outputs, so fees can be bumped after the fact; and the non-goals below.
 
 Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
 state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the
