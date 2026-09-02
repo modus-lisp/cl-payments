@@ -38,7 +38,7 @@
    #:derive-revocation-pubkey #:derive-revocation-privkey
    #:per-commitment-point #:per-commitment-secret
    #:generate-from-seed #:+max-commitment-index+
-   #:shachain #:make-shachain #:shachain-insert #:shachain-lookup
+   #:shachain #:make-shachain #:shachain-insert #:shachain-lookup #:shachain->plist #:plist->shachain
    #:commitment-keys #:derive-commitment-keys
    #:ck-local #:ck-remote #:ck-delayed #:ck-revocation #:ck-local-htlc #:ck-remote-htlc
    #:key-error))
@@ -190,6 +190,22 @@
                                           index (aref (shachain-indices chain) b))))))
     (setf (aref (shachain-known chain) bucket) (c:octets secret)
           (aref (shachain-indices chain) bucket) index)
+    chain))
+
+(defun shachain->plist (chain)
+  "The retained secrets, for persistence.  Losing these is losing the ability
+   to punish: an old commitment we can no longer prove revoked is one the peer
+   can publish for free."
+  (loop for i from 0 below 49
+        for secret = (aref (shachain-known chain) i)
+        when secret collect (list :index (aref (shachain-indices chain) i)
+                                  :secret (c:bytes->hex (c:octets secret)))))
+
+(defun plist->shachain (plist)
+  (let ((chain (make-shachain)))
+    (loop for entry in plist for i from 0
+          do (setf (aref (shachain-known chain) i) (c:hex->bytes (getf entry :secret))
+                   (aref (shachain-indices chain) i) (getf entry :index)))
     chain))
 
 (defun shachain-lookup (chain index)

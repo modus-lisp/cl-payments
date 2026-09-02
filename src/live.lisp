@@ -59,6 +59,8 @@
    #:send-fulfill #:receive-fulfill #:send-fail #:send-fail-malformed #:receive-fail #:receive-fee
    #:send-commit #:receive-commit #:receive-revocation
    #:initial-commitment-signature #:verify-initial-commitment
+   #:local-commitment-tx #:commitment-number-of #:remote-point-for #:revoked-secret-for
+   #:live-local-commit-sig #:local-point #:pub
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
    ;; closing
@@ -126,6 +128,10 @@
   (next-htlc-id 0)
   (revocations (k:make-shachain))
   last-remote-secret                  ; for channel_reestablish
+  ;; Their signature (and htlc signatures) over OUR current commitment.  A
+  ;; force-close is broadcasting that commitment, which needs both halves of
+  ;; the 2-of-2; verifying theirs and forgetting it would leave us unable to.
+  local-commit-sig local-commit-htlc-sigs
   ;; --- closing --------------------------------------------------------------
   local-shutdown-script remote-shutdown-script
   (closed-p nil) closing-txid)
@@ -510,6 +516,8 @@
     ;; Everything checks.  Adopt the new commitment and revoke the old one.
     (setf (live-local-spec lc) spec
           (live-local-commit-index lc) n
+          (live-local-commit-sig lc) (u:cs-signature cs)
+          (live-local-commit-htlc-sigs lc) (u:cs-htlc-signatures cs)
           (live-remote-acked lc) (append (live-remote-acked lc) (live-remote-proposed lc))
           (live-remote-proposed lc) '()
           (live-local-acked lc) '())
@@ -517,6 +525,60 @@
      (u:make-revoke-and-ack :channel-id (live-channel-id lc)
                             :per-commitment-secret (secp:int-to-bytes32 (local-secret lc (1- n)))
                             :next-per-commitment-point (local-point lc (1+ n))))))
+
+(defun local-commitment-tx (lc)
+  "OUR current commitment, fully signed: what a force-close broadcasts.
+   Returns (values tx built) or NIL if they have never signed one."
+  (let ((their-sig (or (live-local-commit-sig lc) (return-from local-commitment-tx nil)))
+        ;; :INDEX matters — without it %BUILD numbers the NEXT commitment, and
+        ;; their signature is over this one.
+        (built (%build lc (live-local-spec lc) :ours t :point (local-point lc (live-local-commit-index lc))
+                       :index (live-local-commit-index lc))))
+    (let* ((tx (b-tx built))
+           (our-pub (pub (live-funding-priv lc)))
+           (our-sig (m:sign-commitment tx (live-funding-priv lc) our-pub
+                                       (live-remote-funding-pubkey lc) (live-capacity-sat lc)))
+           (script (m:funding-script our-pub (live-remote-funding-pubkey lc))))
+      ;; Re-parsed rather than returned as built: TX-TXID is a slot the PARSER
+      ;; fills, and a transaction assembled by MAKE-TX has none.  A NIL txid
+      ;; compares equal to another NIL txid, which made every unknown spend
+      ;; look like our own commitment.
+      (values (btx:parse-tx (bw:make-reader
+                             (btx:serialize-tx
+                              (btx:make-tx :version (btx:tx-version tx) :inputs (btx:tx-inputs tx)
+                                           :outputs (btx:tx-outputs tx) :locktime (btx:tx-locktime tx)
+                                           :witnesses (list (m:funding-witness our-sig our-pub their-sig
+                                                                               (live-remote-funding-pubkey lc) script))
+                                           :segwit-p t))))
+              built))))
+
+(defun commitment-number-of (lc tx)
+  "Which commitment a broadcast transaction is, read back out of its obscured
+   locktime and sequence.  The obscuring factor is the same for both ends, so
+   this works on their commitments as well as ours."
+  (let* ((obscuring (m:obscuring-factor
+                     (if (eq (live-opener lc) :local) (pub (live-payment-priv lc)) (live-remote-payment-basepoint lc))
+                     (if (eq (live-opener lc) :local) (live-remote-payment-basepoint lc) (pub (live-payment-priv lc)))))
+         (lo (logand (btx:tx-locktime tx) #xffffff))
+         (hi (logand (btx:txin-sequence (first (btx:tx-inputs tx))) #xffffff)))
+    (logxor (logior (ash hi 24) lo) obscuring)))
+
+(defun remote-point-for (lc n)
+  "Their per-commitment point for THEIR commitment N, if we can know it: the
+   current or next point we were told, or reconstructed from a revoked secret."
+  (cond ((= n (live-remote-commit-index lc)) (live-remote-current-point lc))
+        ((= n (1+ (live-remote-commit-index lc))) (live-remote-next-point lc))
+        ((< n (live-remote-commit-index lc))
+         (let ((secret (revoked-secret-for lc n)))
+           (and secret (c:compressed-pubkey (c:pubkey-of (secp:bytes-to-int secret))))))
+        (t nil)))
+
+(defun revoked-secret-for (lc n)
+  "The per-commitment secret they revealed when they revoked commitment N, or
+   NIL if N is not revoked.  This is the whole punishment mechanism: with it,
+   the revocation key of that commitment is ours to sign with."
+  (and (< n (live-remote-commit-index lc))
+       (k:shachain-lookup (live-revocations lc) (- k:+max-commitment-index+ n))))
 
 (defun receive-revocation (lc msg)
   "They revoked their previous commitment.  The secret is checked against the
@@ -743,7 +805,10 @@
         :last-remote-secret (hx (live-last-remote-secret lc))
         :local-shutdown-script (hx (live-local-shutdown-script lc))
         :remote-shutdown-script (hx (live-remote-shutdown-script lc))
-        :closed-p (live-closed-p lc) :closing-txid (hx (live-closing-txid lc))))
+        :closed-p (live-closed-p lc) :closing-txid (hx (live-closing-txid lc))
+        :local-commit-sig (hx (live-local-commit-sig lc))
+        :local-commit-htlc-sigs (mapcar #'hx (live-local-commit-htlc-sigs lc))
+        :revocations (k:shachain->plist (live-revocations lc))))
 
 (defun plist->live (p)
   (flet ((g (k) (getf p k)))
@@ -769,4 +834,7 @@
                 :last-remote-secret (uh (g :last-remote-secret))
                 :local-shutdown-script (uh (g :local-shutdown-script))
                 :remote-shutdown-script (uh (g :remote-shutdown-script))
-                :closed-p (g :closed-p) :closing-txid (uh (g :closing-txid)))))
+                :closed-p (g :closed-p) :closing-txid (uh (g :closing-txid))
+                :local-commit-sig (uh (g :local-commit-sig))
+                :local-commit-htlc-sigs (mapcar #'uh (g :local-commit-htlc-sigs))
+                :revocations (if (g :revocations) (k:plist->shachain (g :revocations)) (k:make-shachain)))))
