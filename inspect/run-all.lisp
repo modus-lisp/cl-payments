@@ -26,6 +26,7 @@
   (run-onchain-tests)
   (run-keys-tests)
   (run-commitment-tests)
+  (run-commitment-anchors-tests)
   (run-channel-tests)
   (run-updates-tests)
   (let ((ok (report)))

@@ -51,6 +51,8 @@
    #:htlc-payment-hash #:offered-htlc-script #:received-htlc-script
    ;; the transaction
    #:build-commitment #:sign-commitment #:verify-commitment #:commitment-sighash
+   #:anchor-script #:to-remote-anchors-script #:+anchor-sat+ #:+commit-weight-base-anchors+
+   #:+sighash-single-anyonecanpay+
    #:sig->der #:funding-witness
    ;; second-stage HTLC transactions
    #:htlc-tx-script #:build-htlc-tx #:htlc-tx-fee #:sign-htlc-tx #:htlc-tx-sighash
@@ -134,6 +136,21 @@
          (script-push (c:octets delayed-pubkey))
          (vector #x68 #xac)))                       ; OP_ENDIF OP_CHECKSIG
 
+(defconstant +anchor-sat+ 330 "An anchor's value: the default P2WSH dust limit.")
+
+(defun anchor-script (funding-pubkey)
+  "`<funding_pubkey> OP_CHECKSIG OP_IFDUP OP_NOTIF OP_16 OP_CSV OP_ENDIF`: the
+   owner can spend at once to bump the commitment's fee (child-pays-for-parent);
+   after 16 blocks anyone can, so unspent anchors do not pollute the UTXO set."
+  (bytes (script-push (c:octets funding-pubkey))
+         (vector #xac #x73 #x64 #x60 #xb2 #x68)))
+
+(defun to-remote-anchors-script (remote-pubkey)
+  "With option_anchors, to_remote is not a bare P2WPKH but
+   `<remotepubkey> OP_CHECKSIGVERIFY 1 OP_CSV`: one block of CSV, so the
+   commitment cannot be pinned by a child spending it in the same block."
+  (bytes (script-push (c:octets remote-pubkey)) (vector #xad #x51 #xb2)))
+
 (defun to-remote-scriptpubkey (remote-pubkey)
   "The counterparty's side of a commitment I hold.  Plain P2WPKH: they are not
    the one who published it, so they need no delay and there is nothing to
@@ -174,6 +191,8 @@
 ;;; Fees
 ;;; ----------------------------------------------------------------------------
 
+(defconstant +commit-weight-base-anchors+ 1124
+  "With option_anchors: two more P2WSH outputs and a larger to_remote.")
 (defconstant +commit-weight-base+ 724
   "Weight of a commitment transaction with no HTLC outputs (BOLT #3 Appendix A).")
 (defconstant +htlc-output-weight+ 172
@@ -183,29 +202,20 @@
 (defconstant +htlc-success-weight+ 703
   "Weight of the second-stage HTLC-success transaction (no option_anchors).")
 
-(defun commitment-fee (feerate-per-kw num-htlcs)
+(defun commitment-fee (feerate-per-kw num-htlcs &key anchors)
   "Fee in satoshis.  Note `per_kw` is per 1000 WEIGHT units, not per 1000 bytes,
    and the result is truncated."
-  (floor (* feerate-per-kw (+ +commit-weight-base+ (* num-htlcs +htlc-output-weight+)))
+  (floor (* feerate-per-kw (+ (if anchors +commit-weight-base-anchors+ +commit-weight-base+)
+                              (* num-htlcs +htlc-output-weight+)))
          1000))
 
-(defun htlc-trimmed-p (amount-msat direction feerate-per-kw dust-limit)
-  "Whether an HTLC output is dropped from the commitment.
-
-   The test is NOT the HTLC amount against the dust limit.  It is the amount
-   MINUS THE FEE OF THE SECOND-STAGE TRANSACTION that would claim it — an HTLC
-   worth slightly more than dust is still worthless if redeeming it costs more
-   than it is worth.  Offered and received HTLCs use different weights (663 vs
-   703), so the same amount can be trimmed in one direction and not the other,
-   and the two sides can hold different dust limits.
-
-   Both parties must trim EXACTLY the same set: a disagreement means different
-   transactions, and neither side's signature validates against the other's."
-  (let* ((weight (ecase direction
-                   (:offered +htlc-timeout-weight+)
-                   (:received +htlc-success-weight+)))
-         (second-stage-fee (floor (* feerate-per-kw weight) 1000)))
-    (< (- (floor amount-msat 1000) second-stage-fee) dust-limit)))
+(defun htlc-trimmed-p (amount-msat direction feerate-per-kw dust-limit &key anchors)
+  "An HTLC is trimmed when its second-stage transaction's output would be
+   dust: the HTLC amount minus that transaction's fee, against the owner's
+   dust limit.  With anchors the second stage pays no fee, so the amount alone
+   decides — a higher dust limit is the only trimming lever left."
+  (< (- (floor amount-msat 1000) (if anchors 0 (htlc-tx-fee feerate-per-kw direction)))
+     dust-limit))
 
 (defun dust-p (amount-sat dust-limit)
   "An output below the dust limit is not created at all — its value goes to fees
@@ -236,7 +246,7 @@
 (defun %ripemd160 (bytes) (ironclad:digest-sequence :ripemd-160 (c:octets bytes)))
 
 (defun offered-htlc-script (revocation-pubkey remote-htlc-pubkey local-htlc-pubkey
-                            payment-hash)
+                            payment-hash &key anchors)
   "An HTLC WE offered: the remote takes it with the preimage, we reclaim it
    through a timelocked HTLC-timeout transaction."
   (bytes (vector #x76 #xa9)                                   ; OP_DUP OP_HASH160
@@ -254,10 +264,13 @@
          (vector #xa9)                                        ;   OP_HASH160
          (script-push (%ripemd160 payment-hash))
          (vector #x88 #xac)                                   ;   OP_EQUALVERIFY OP_CHECKSIG
-         (vector #x68 #x68)))                                 ; OP_ENDIF OP_ENDIF
+         (vector #x68)                                        ; OP_ENDIF
+         ;; option_anchors: every non-anchor output is one block CSV-locked.
+         (if anchors (vector #x51 #xb2 #x75) (vector))        ;   1 OP_CSV OP_DROP
+         (vector #x68)))                                      ; OP_ENDIF
 
 (defun received-htlc-script (revocation-pubkey remote-htlc-pubkey local-htlc-pubkey
-                             payment-hash cltv-expiry)
+                             payment-hash cltv-expiry &key anchors)
   "An HTLC we RECEIVED: we take it with the preimage via an HTLC-success
    transaction, the remote reclaims it after `cltv_expiry`."
   (bytes (vector #x76 #xa9)                                   ; OP_DUP OP_HASH160
@@ -279,7 +292,9 @@
          (script-number cltv-expiry)
          (vector #xb1 #x75)                                   ;   OP_CLTV OP_DROP
          (vector #xac)                                        ;   OP_CHECKSIG
-         (vector #x68 #x68)))                                 ; OP_ENDIF OP_ENDIF
+         (vector #x68)                                        ; OP_ENDIF
+         (if anchors (vector #x51 #xb2 #x75) (vector))        ;   1 OP_CSV OP_DROP
+         (vector #x68)))                                      ; OP_ENDIF
 
 ;;; ----------------------------------------------------------------------------
 ;;; The transaction
@@ -326,7 +341,8 @@
                               local-feerate-per-kw dust-limit-sat
                               revocation-pubkey to-self-delay delayed-pubkey
                               remote-pubkey (opener :local)
-                              htlcs local-htlc-pubkey remote-htlc-pubkey)
+                              htlcs local-htlc-pubkey remote-htlc-pubkey
+                              anchors local-funding-pubkey remote-funding-pubkey)
   "Build one commitment transaction.  Returns (values tx description htlc-order).
 
    HTLC-ORDER is the surviving HTLCs in OUTPUT order, which the caller needs and
@@ -343,43 +359,66 @@
          (live-htlcs (remove-if (lambda (h)
                                   (htlc-trimmed-p (htlc-amount-msat h)
                                                   (htlc-direction h)
-                                                  local-feerate-per-kw dust-limit-sat))
+                                                  local-feerate-per-kw dust-limit-sat
+                                                  :anchors anchors))
                                 htlcs))
-         (fee (commitment-fee local-feerate-per-kw (length live-htlcs)))
+         (fee (commitment-fee local-feerate-per-kw (length live-htlcs) :anchors anchors))
          (to-local-sat (floor to-local-msat 1000))
          (to-remote-sat (floor to-remote-msat 1000)))
     ;; Deduct the fee from whoever opened, before dust is considered — an output
     ;; can be dusted BY the fee.
-    (ecase opener
-      (:local (setf to-local-sat (- to-local-sat fee)))
-      (:remote (setf to-remote-sat (- to-remote-sat fee))))
-    (when (or (minusp to-local-sat) (minusp to-remote-sat))
-      (error 'commitment-error
-             :detail (format nil "fee ~d exceeds the ~(~a~) balance" fee opener)))
+    ;; With anchors, the funder also pays for the anchors themselves — both of
+    ;; them, whenever both exist.  Whether both exist depends on the dust
+    ;; decision below, so the anchor cost is taken first assuming both and
+    ;; refunded if one turns out not to be needed.
+    (let ((anchor-cost (if anchors (* 2 +anchor-sat+) 0)))
+      (ecase opener
+        (:local (setf to-local-sat (- to-local-sat fee anchor-cost)))
+        (:remote (setf to-remote-sat (- to-remote-sat fee anchor-cost))))
+      (when (or (minusp to-local-sat) (minusp to-remote-sat))
+        (error 'commitment-error
+               :detail (format nil "fee ~d exceeds the ~(~a~) balance" fee opener)))
+      ;; The single-anchor rule: with no HTLCs, a side whose balance output is
+      ;; dust gets no anchor either — there is nothing of theirs to bump.
+      (let* ((local-dust (dust-p to-local-sat dust-limit-sat))
+             (remote-dust (dust-p to-remote-sat dust-limit-sat))
+             (local-anchor (and anchors (or live-htlcs (not local-dust))))
+             (remote-anchor (and anchors (or live-htlcs (not remote-dust)))))
+        ;; When only one anchor exists the funder STILL pays for two: the
+        ;; absent anchor's 330 sat goes to fees, as a trimmed output would.
+        ;; (Appendix F's single-anchor vector is the proof.)
     (let* ((local-script (to-local-script revocation-pubkey to-self-delay delayed-pubkey))
            (outputs '())
            (described '()))
-      (unless (dust-p to-remote-sat dust-limit-sat)
+      (unless remote-dust
         (push (cons (btx:make-txout :value to-remote-sat
-                                    :script (to-remote-scriptpubkey remote-pubkey))
+                                    :script (if anchors
+                                                (p2wsh (to-remote-anchors-script remote-pubkey))
+                                                (to-remote-scriptpubkey remote-pubkey)))
                     nil)
               outputs)
         (push (list :to-remote to-remote-sat) described))
-      (unless (dust-p to-local-sat dust-limit-sat)
+      (unless local-dust
         (push (cons (btx:make-txout :value to-local-sat :script (p2wsh local-script)) nil)
               outputs)
         (push (list :to-local to-local-sat local-script) described))
+      (when local-anchor
+        (push (cons (btx:make-txout :value +anchor-sat+ :script (p2wsh (anchor-script local-funding-pubkey))) nil) outputs)
+        (push (list :to-local-anchor +anchor-sat+) described))
+      (when remote-anchor
+        (push (cons (btx:make-txout :value +anchor-sat+ :script (p2wsh (anchor-script remote-funding-pubkey))) nil) outputs)
+        (push (list :to-remote-anchor +anchor-sat+) described))
       (dolist (h live-htlcs)
         (let* ((script (ecase (htlc-direction h)
                          (:offered (offered-htlc-script revocation-pubkey
                                                         remote-htlc-pubkey
                                                         local-htlc-pubkey
-                                                        (htlc-payment-hash h)))
+                                                        (htlc-payment-hash h) :anchors anchors))
                          (:received (received-htlc-script revocation-pubkey
                                                           remote-htlc-pubkey
                                                           local-htlc-pubkey
                                                           (htlc-payment-hash h)
-                                                          (htlc-expiry h)))))
+                                                          (htlc-expiry h) :anchors anchors))))
                ;; The millisatoshi remainder is dropped, not rounded — and it is
                ;; dropped for the ORDERING comparison too.
                (sat (floor (htlc-amount-msat h) 1000)))
@@ -403,7 +442,7 @@
         (declare (ignorable funding-amount-sat))
         (values (btx:parse-tx (bw:make-reader (btx:serialize-tx tx)))
                 (nreverse described)
-                htlc-order)))))
+                htlc-order)))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Signing
@@ -518,14 +557,17 @@
 
 (defun build-htlc-tx (&key commitment-txid output-index htlc-amount-msat direction
                            cltv-expiry feerate-per-kw
-                           revocation-pubkey to-self-delay delayed-pubkey)
+                           revocation-pubkey to-self-delay delayed-pubkey anchors)
   "The HTLC-success (:received) or HTLC-timeout (:offered) transaction spending
    one HTLC output of a commitment.
 
    The locktime is the difference: 0 for success — the preimage is proof enough,
    there is nothing to wait for — and `cltv_expiry` for timeout, which is what
    stops the offerer reclaiming the HTLC before it has actually expired."
-  (let* ((fee (htlc-tx-fee feerate-per-kw direction))
+  ;; With anchors the second stage pays NO fee: its input and output are equal,
+  ;; the peer signs it SINGLE|ANYONECANPAY, and whoever broadcasts it attaches
+  ;; inputs of their own for the fee.
+  (let* ((fee (if anchors 0 (htlc-tx-fee feerate-per-kw direction)))
          (amount (- (floor htlc-amount-msat 1000) fee)))
     (when (minusp amount)
       (error 'commitment-error
@@ -538,7 +580,7 @@
                               :prev-index output-index
                               :script #()
                               ;; 0 without option_anchors; 1 with it.
-                              :sequence 0))
+                              :sequence (if anchors 1 0)))
                :outputs (list (btx:make-txout
                                :value amount
                                :script (p2wsh (htlc-tx-script revocation-pubkey
@@ -551,14 +593,17 @@
                :segwit-p nil)))
       (btx:parse-tx (bw:make-reader (btx:serialize-tx tx))))))
 
-(defun htlc-tx-sighash (tx htlc-witness-script htlc-amount-sat)
+(defconstant +sighash-single-anyonecanpay+ (logior bs:+sighash-single+ bs:+sighash-anyonecanpay+))
+
+(defun htlc-tx-sighash (tx htlc-witness-script htlc-amount-sat &key (sighash bs:+sighash-all+))
   "BIP143 digest for an HTLC transaction.  The scriptCode is the HTLC output's
    own witness script — the offered/received script from the commitment, not the
-   HTLC transaction's output script."
-  (bs:bip143-sighash tx 0 htlc-witness-script htlc-amount-sat bs:+sighash-all+))
+   HTLC transaction's output script.  With anchors the PEER's signature is
+   SINGLE|ANYONECANPAY, so the broadcaster can add fee inputs; ours stays ALL."
+  (bs:bip143-sighash tx 0 htlc-witness-script htlc-amount-sat sighash))
 
-(defun sign-htlc-tx (tx privkey htlc-witness-script htlc-amount-sat)
+(defun sign-htlc-tx (tx privkey htlc-witness-script htlc-amount-sat &key (sighash bs:+sighash-all+))
   "Sign an HTLC transaction, returning the 64-byte compact form."
-  (let ((hash (htlc-tx-sighash tx htlc-witness-script htlc-amount-sat)))
+  (let ((hash (htlc-tx-sighash tx htlc-witness-script htlc-amount-sat :sighash sighash)))
     (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey hash)
       (bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s)))))

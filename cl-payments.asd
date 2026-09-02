@@ -58,6 +58,7 @@
                              (:file "gossip-encode-test")
                              (:file "keys-test")
                              (:file "commitment-test")
+                             (:file "commitment-anchors-test")
                              (:file "channel-test")
                              (:file "updates-test")
                              (:file "forward-test")
