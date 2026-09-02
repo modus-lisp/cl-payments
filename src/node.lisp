@@ -548,7 +548,8 @@
   temporary-channel-id keys open-msg
   ;; the opener's side of the handshake
   (role :accepter) funding-sat push-msat fund-fn broadcast-fn channel-id
-  funding-txid funding-index accept-msg live)   ; accept-msg carries their minimum_depth
+  funding-txid funding-index accept-msg live    ; accept-msg carries their minimum_depth
+  anchors-p)
 
 (defun next-key-index (node)
   "One past the highest index in use.  Reusing an index reuses a funding key
@@ -564,6 +565,14 @@
   "The channel_type the peer actually put on the wire (TLV 1), or NIL."
   (let ((raw (and (ch:oc-tlvs oc) (w:tlv-get (ch:oc-tlvs oc) 1))))
     (and raw (f:bytes->features raw))))
+
+(defun anchors-in-type-p (channel-type)
+  (and channel-type (f:feature-supported-p channel-type :anchors-zero-fee-htlc-tx)))
+
+(defun peer-anchors-p (peer)
+  "Does the peer advertise anchors?  Then that is the channel type to propose."
+  (let ((feats (p:peer-features peer)))
+    (and feats (f:feature-supported-p feats :anchors-zero-fee-htlc-tx))))
 
 (defun handle-open-channel (node peer payload)
   "Answer `open_channel` with `accept_channel`.
@@ -632,7 +641,10 @@
    Order matters and is not a style choice.  Their signature is what lets us
    spend the funding output unilaterally; if we sent `funding_signed` first and
    theirs turned out to be invalid, they could broadcast a funding transaction
-   we can never claim from.  So: check theirs, and only then produce ours."
+   we can never claim from.  So: check theirs, and only then produce ours.
+
+   Both commitments are built by the live channel itself, so whatever format
+   was negotiated — anchors or not — is the one both signatures are over."
   (handler-case
       (let* ((fc (ch:parse-funding-created payload))
              (po (gethash (%hex (ch:fc-temporary-channel-id fc)) (node-pending node))))
@@ -643,102 +655,52 @@
                (keys (po-keys po))
                (funding-sat (ch:oc-funding-satoshis oc))
                (push-msat (ch:oc-push-msat oc))
-               (their-pcp (ch:oc-first-per-commitment-point oc))
-               (our-pcp-seed (ck-seed keys))
-               (obscuring (m:obscuring-factor (ch:oc-payment-basepoint oc)
-                                              (ck-pub (ck-payment keys))))
-               (our-funding-pub (ck-pub (ck-funding keys)))
-               (their-funding-pub (ch:oc-funding-pubkey oc))
-               ;; OUR commitment: to_local is what we hold (the push), behind our
-               ;; delayed key and THEIR revocation key.  They opened, so the fee
-               ;; comes off their side.
-               (our-pcp (k:per-commitment-point our-pcp-seed k:+max-commitment-index+))
-               (our-commitment
-                 (m:build-commitment
-                  :funding-txid (ch:fc-funding-txid fc)
-                  :funding-output-index (ch:fc-funding-output-index fc)
-                  :funding-amount-sat funding-sat
-                  :commitment-number 0 :obscuring obscuring
-                  :to-local-msat push-msat
-                  :to-remote-msat (- (* funding-sat 1000) push-msat)
-                  :local-feerate-per-kw (ch:oc-feerate-per-kw oc)
-                  :dust-limit-sat (ch:oc-dust-limit-satoshis oc)
-                  ;; The revocation key in OUR commitment comes from THEIR
-                  ;; revocation basepoint: it exists so THEY can punish US.
-                  :revocation-pubkey
-                  (k:derive-revocation-pubkey (ch:oc-revocation-basepoint oc) our-pcp)
-                  :to-self-delay (ch:oc-to-self-delay oc)
-                  :delayed-pubkey (k:derive-pubkey (ck-pub (ck-delayed keys)) our-pcp)
-                  :remote-pubkey (ch:oc-payment-basepoint oc)
-                  :opener :remote)))
-          (unless (m:verify-commitment our-commitment (ch:fc-signature fc)
-                                       our-funding-pub their-funding-pub
-                                       funding-sat their-funding-pub)
+               (cid (ch:channel-id (ch:fc-funding-txid fc) (ch:fc-funding-output-index fc)))
+               (lc (lv:make-live
+                    :channel-id cid :funding-txid (ch:fc-funding-txid fc)
+                    :funding-index (ch:fc-funding-output-index fc)
+                    :capacity-sat funding-sat :opener :remote
+                    :anchors-p (anchors-in-type-p (their-channel-type oc))
+                    :funding-priv (ck-funding keys) :revocation-priv (ck-revocation keys)
+                    :payment-priv (ck-payment keys) :delayed-priv (ck-delayed keys)
+                    :htlc-priv (ck-htlc keys) :seed (ck-seed keys)
+                    :remote-funding-pubkey (ch:oc-funding-pubkey oc)
+                    :remote-revocation-basepoint (ch:oc-revocation-basepoint oc)
+                    :remote-payment-basepoint (ch:oc-payment-basepoint oc)
+                    :remote-delayed-basepoint (ch:oc-delayed-payment-basepoint oc)
+                    :remote-htlc-basepoint (ch:oc-htlc-basepoint oc)
+                    :local-dust-limit 546 :remote-dust-limit (ch:oc-dust-limit-satoshis oc)
+                    ;; They chose the delay on OUR to_local; we chose theirs.
+                    :local-to-self-delay (ch:oc-to-self-delay oc) :remote-to-self-delay 144
+                    :feerate-per-kw (ch:oc-feerate-per-kw oc)
+                    :local-msat push-msat :remote-msat (- (* funding-sat 1000) push-msat)
+                    :remote-first-point (ch:oc-first-per-commitment-point oc))))
+          (unless (lv:verify-initial-commitment lc (ch:fc-signature fc))
             (nlog node "  their signature over OUR commitment does not verify — refusing")
             (return-from handle-funding-created nil))
           (nlog node "  their signature over our commitment verifies")
-
-          ;; Now THEIR commitment, which we sign.  The mirror: to_local is their
-          ;; balance behind their delayed key and OUR revocation key.
-          (let* ((their-commitment
-                   (m:build-commitment
-                    :funding-txid (ch:fc-funding-txid fc)
-                    :funding-output-index (ch:fc-funding-output-index fc)
-                    :funding-amount-sat funding-sat
-                    :commitment-number 0 :obscuring obscuring
-                    :to-local-msat (- (* funding-sat 1000) push-msat)
-                    :to-remote-msat push-msat
-                    :local-feerate-per-kw (ch:oc-feerate-per-kw oc)
-                    :dust-limit-sat (ch:oc-dust-limit-satoshis oc)
-                    :revocation-pubkey
-                    (k:derive-revocation-pubkey (ck-pub (ck-revocation keys)) their-pcp)
-                    :to-self-delay 144
-                    :delayed-pubkey
-                    (k:derive-pubkey (ch:oc-delayed-payment-basepoint oc) their-pcp)
-                    :remote-pubkey (ck-pub (ck-payment keys))
-                    :opener :local))
-                 (sig (m:sign-commitment their-commitment (ck-funding keys)
-                                         our-funding-pub their-funding-pub funding-sat))
-                 (cid (ch:channel-id (ch:fc-funding-txid fc)
-                                     (ch:fc-funding-output-index fc))))
-            (p:send-message peer
-                            (ch:encode-funding-signed
-                             (ch:make-funding-signed :channel-id cid :signature sig))
-                            nil)
-            (remhash (%hex (ch:fc-temporary-channel-id fc)) (node-pending node))
-            (setf (gethash (%hex cid) (node-channels node))
-                  (make-stored-channel
-                   :channel-id cid
-                   :peer-id (p:peer-node-id peer)
-                   :funding-txid (ch:fc-funding-txid fc)
-                   :funding-index (ch:fc-funding-output-index fc)
-                   :capacity-sat funding-sat
-                   :local-msat push-msat
-                   :remote-msat (- (* funding-sat 1000) push-msat)
-                   :key-index (ck-index keys)
-                   :remote-funding-pubkey their-funding-pub
-                   :min-depth (node-funding-depth node)
-                   :live (lv:make-live
-                          :channel-id cid :funding-txid (ch:fc-funding-txid fc)
-                          :funding-index (ch:fc-funding-output-index fc)
-                          :capacity-sat funding-sat :opener :remote
-                          :funding-priv (ck-funding keys) :revocation-priv (ck-revocation keys)
-                          :payment-priv (ck-payment keys) :delayed-priv (ck-delayed keys)
-                          :htlc-priv (ck-htlc keys) :seed (ck-seed keys)
-                          :remote-funding-pubkey their-funding-pub
-                          :remote-revocation-basepoint (ch:oc-revocation-basepoint oc)
-                          :remote-payment-basepoint (ch:oc-payment-basepoint oc)
-                          :remote-delayed-basepoint (ch:oc-delayed-payment-basepoint oc)
-                          :remote-htlc-basepoint (ch:oc-htlc-basepoint oc)
-                          :local-dust-limit 546 :remote-dust-limit (ch:oc-dust-limit-satoshis oc)
-                          ;; They chose the delay on OUR to_local; we chose theirs.
-                          :local-to-self-delay (ch:oc-to-self-delay oc) :remote-to-self-delay 144
-                          :feerate-per-kw (ch:oc-feerate-per-kw oc)
-                          :local-msat push-msat :remote-msat (- (* funding-sat 1000) push-msat)
-                          :remote-first-point their-pcp)))
-            (save-channels node)
-            (nlog node "  funding_signed sent — channel ~a accepted, ~d msat ours"
-                  (subseq (%hex cid) 0 16) push-msat))))
+          (p:send-message peer
+                          (ch:encode-funding-signed
+                           (ch:make-funding-signed :channel-id cid
+                                                   :signature (lv:initial-commitment-signature lc)))
+                          nil)
+          (remhash (%hex (ch:fc-temporary-channel-id fc)) (node-pending node))
+          (setf (gethash (%hex cid) (node-channels node))
+                (make-stored-channel
+                 :channel-id cid
+                 :peer-id (p:peer-node-id peer)
+                 :funding-txid (ch:fc-funding-txid fc)
+                 :funding-index (ch:fc-funding-output-index fc)
+                 :capacity-sat funding-sat
+                 :local-msat push-msat
+                 :remote-msat (- (* funding-sat 1000) push-msat)
+                 :key-index (ck-index keys)
+                 :remote-funding-pubkey (ch:oc-funding-pubkey oc)
+                 :min-depth (node-funding-depth node)
+                 :live lc))
+          (save-channels node)
+          (nlog node "  funding_signed sent — channel ~a accepted (~:[static remotekey~;anchors~]), ~d msat ours"
+                (subseq (%hex cid) 0 16) (lv:live-anchors-p lc) push-msat)))
     (error (e) (nlog node "bad funding_created: ~a" e))))
 
 (defun handle-channel-ready (node peer payload)
@@ -1456,7 +1418,8 @@
     (bt:with-recursive-lock-held ((node-htlc-lock node))
       (setf (gethash (%hex temp-id) (node-pending node))
             (make-pending-open :temporary-channel-id temp-id :keys keys :role :opener
-                               :funding-sat funding-sat :push-msat push-msat :fund-fn fund-fn))
+                               :funding-sat funding-sat :push-msat push-msat :fund-fn fund-fn
+                               :anchors-p (peer-anchors-p peer)))
       (p:send-message
        peer
        (ch:encode-open-channel
@@ -1472,7 +1435,12 @@
          :delayed-payment-basepoint (ck-pub (ck-delayed keys))
          :htlc-basepoint (ck-pub (ck-htlc keys))
          :first-per-commitment-point (k:per-commitment-point (ck-seed keys) k:+max-commitment-index+)
-         :channel-flags (if announce 1 0)))
+         :channel-flags (if announce 1 0)
+         ;; Anchors when the peer speaks them — the format CLN and LND prefer.
+         :channel-type (if (peer-anchors-p peer)
+                           (f:features-from '((:static-remotekey . :required)
+                                              (:anchors-zero-fee-htlc-tx . :required)))
+                           (f:features-from '((:static-remotekey . :required))))))
        nil)
       (nlog node "open_channel sent to ~a: ~d sat, ~d msat pushed (key index ~d)"
             (subseq (%hex peer-id) 0 16) funding-sat push-msat index)
@@ -1494,7 +1462,7 @@
             (let* ((cid (ch:channel-id txid index))
                    (lc (lv:make-live
                         :channel-id cid :funding-txid txid :funding-index index
-                        :capacity-sat funding-sat :opener :local
+                        :capacity-sat funding-sat :opener :local :anchors-p (po-anchors-p po)
                         :funding-priv (ck-funding keys) :revocation-priv (ck-revocation keys)
                         :payment-priv (ck-payment keys) :delayed-priv (ck-delayed keys)
                         :htlc-priv (ck-htlc keys) :seed (ck-seed keys)

@@ -189,6 +189,10 @@
      (:static-remotekey  . :optional)
      (:payment-secret    . :optional)
      (:channel-type      . :optional)
+     ;; Anchor outputs: the commitment format both CLN and LND negotiate by
+     ;; default once offered.  Implemented in commitment.lisp against BOLT #3
+     ;; Appendix F; advertising it is what makes a peer propose it.
+     (:anchors-zero-fee-htlc-tx . :optional)
      ;; Needed before we can ask for the routing graph in Phase 3.
      (:gossip-queries    . :optional)
      ;; We can parse a large-channel announcement; nothing here opens one yet.

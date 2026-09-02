@@ -125,6 +125,8 @@
              (ok "both ends name the same channel"
                  (and (only-channel a) (only-channel b)
                       (equalp (n::sc-channel-id (only-channel a)) (n::sc-channel-id (only-channel b)))))
+             (ok "both daemons advertise anchors, so the channel negotiated them"
+                 (and (lv:live-anchors-p (live-of a)) (lv:live-anchors-p (live-of b))))
              (ok "A is the opener, B the accepter"
                  (and (eq :local (lv:live-opener (live-of a))) (eq :remote (lv:live-opener (live-of b)))))
              (ok "balances: A 800k sat, B 200k sat"
@@ -244,8 +246,9 @@
                  (chn:mock-mine chain 1)
                  (chn:mock-mine chain 200)
                  (n:watch-once b)
-                 (ok "B's delayed sweep finds the output already gone"
-                     (not (chn:chain-txout-unspent-p chain (btx:tx-txid cheat) 0)))))
+                 (ok "B's delayed sweep finds its to_local already gone"
+                     (let ((lidx (oc:to-local-output (live-of a) cheat :theirs t :n (lv::live-prev-index (live-of b)))))
+                       (not (chn:chain-txout-unspent-p chain (btx:tx-txid cheat) lidx))))))
 
              ;; ---- and it all survived being written to disk ------------------------
              (let ((reloaded (n:make-node :dir (n:node-dir a) :port 0 :log nil)))

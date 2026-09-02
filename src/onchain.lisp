@@ -111,7 +111,10 @@
   "Our money in THEIR commitment: P2WPKH under our payment basepoint (static
    remotekey — no per-commitment tweak, which is the point of the option: we
    can find and spend it without knowing which commitment this was)."
-  (%find-output their-tx (m:to-remote-scriptpubkey (lv:pub (lv::live-payment-priv lc)))))
+  (let ((pub (lv:pub (lv::live-payment-priv lc))))
+    (%find-output their-tx (if (lv:live-anchors-p lc)
+                               (m:p2wsh (m:to-remote-anchors-script pub))
+                               (m:to-remote-scriptpubkey pub)))))
 
 (defun %own-to-local-at (lc tx n)
   "Index of OUR to_local in TX if TX is our commitment number N."
@@ -183,8 +186,10 @@
             (let* ((script (ecase (lv:hr-direction rec)
                              ;; We pay: in THEIR commitment that is one they RECEIVE.
                              (:offered (m:received-htlc-script rev our-htlc their-htlc
-                                                               (lv:hr-payment-hash rec) (lv:hr-cltv-expiry rec)))
-                             (:received (m:offered-htlc-script rev our-htlc their-htlc (lv:hr-payment-hash rec)))))
+                                                               (lv:hr-payment-hash rec) (lv:hr-cltv-expiry rec)
+                                                               :anchors (lv:live-anchors-p lc)))
+                             (:received (m:offered-htlc-script rev our-htlc their-htlc (lv:hr-payment-hash rec)
+                                                               :anchors (lv:live-anchors-p lc)))))
                    (idx (position (m:p2wsh script) (btx:tx-outputs tx) :start start
                                   :key #'btx:txout-script :test #'equalp)))
               (when idx
@@ -210,14 +215,16 @@
                  (when pre
                    ;; <sig> <preimage>: size 32 takes the hash branch, CHECKSIG
                    ;; against remote_htlcpubkey — which, in their commitment, is us.
-                   (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx #xffffffff)) dest-script value fee-sat))
+                   (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 #xffffffff)))
+                                          dest-script value fee-sat))
                           (sig (%sign tx2 0 script value our-priv)))
                      (push (%with-witnesses tx2 (list (list sig (c:octets pre) script))) out)))))
               (:offered
                (when (and height (>= height (lv:hr-cltv-expiry rec)))
                  ;; <sig> <>: an empty element is not 32 bytes, so the OP_ELSE
                  ;; branch: CLTV against the expiry, then CHECKSIG against us.
-                 (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx #xfffffffe)) dest-script value fee-sat))
+                 (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 #xfffffffe)))
+                                        dest-script value fee-sat))
                         (tx2 (btx:parse-tx (bw:make-reader (btx:serialize-tx
                                             (btx:make-tx :version 2 :inputs (btx:tx-inputs tx2) :outputs (btx:tx-outputs tx2)
                                                          :witnesses (list nil) :locktime (lv:hr-cltv-expiry rec) :segwit-p t)))))
@@ -244,7 +251,9 @@
             do (let* ((amount (floor (lv:hr-amount-msat rec) 1000))
                       (htx (lv::%htlc-tx built t idx rec))
                       (our-sig (m:sign-htlc-tx htx our-priv script amount))
-                      (der-theirs (m:sig->der their-sig)) (der-ours (m:sig->der our-sig)))
+                      ;; Theirs is SINGLE|ANYONECANPAY on anchor channels; ours is ALL.
+                      (der-theirs (m:sig->der their-sig (lv:peer-htlc-sighash lc)))
+                      (der-ours (m:sig->der our-sig)))
                  (ecase (lv:hr-direction rec)
                    (:received
                     (let ((pre (find (lv:hr-payment-hash rec) preimages :key (lambda (p) (c:sha256 p)) :test #'equalp)))
@@ -318,10 +327,16 @@
    binds it, because it is their commitment, and the delay is on THEIR side."
   (multiple-value-bind (idx value) (to-remote-output lc their-tx)
     (unless idx (fail "their commitment has no to_remote for us (below dust?)"))
-    (let* ((tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx #xffffffff)) dest-script value fee-sat))
-           (pub (lv:pub (lv::live-payment-priv lc)))
-           (sig (%sign tx 0 (%p2wpkh-script-code pub) value (lv::live-payment-priv lc))))
-      (%with-witnesses tx (list (list sig (c:octets pub)))))))
+    (let ((pub (lv:pub (lv::live-payment-priv lc))))
+      (if (lv:live-anchors-p lc)
+          ;; Anchors: a P2WSH behind one block of CSV.  Sequence 1, witness <sig>.
+          (let* ((script (m:to-remote-anchors-script pub))
+                 (tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx 1)) dest-script value fee-sat))
+                 (sig (%sign tx 0 script value (lv::live-payment-priv lc))))
+            (%with-witnesses tx (list (list sig script))))
+          (let* ((tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx #xffffffff)) dest-script value fee-sat))
+                 (sig (%sign tx 0 (%p2wpkh-script-code pub) value (lv::live-payment-priv lc))))
+            (%with-witnesses tx (list (list sig (c:octets pub)))))))))
 
 (defun sweep-to-local (lc our-tx dest-script &key feerate (fee-sat (if feerate (fee-for feerate :script-inputs 1) 500)))
   "Claim our to_local from OUR commitment, after the CSV delay.  The input's
@@ -350,7 +365,7 @@
         (let* ((htlcs (their-htlc-outputs lc their-revoked-tx n))
                (rev-pub (k:derive-revocation-pubkey (lv:pub (lv::live-revocation-priv lc)) (lv:remote-point-for lc n)))
                (inputs (append (and lidx (list (list (btx:tx-txid their-revoked-tx) lidx #xffffffff)))
-                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx #xffffffff)))
+                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx (if (lv:live-anchors-p lc) 1 #xffffffff))))
                                (loop for (idx) in htlcs collect (list (btx:tx-txid their-revoked-tx) idx #xffffffff))))
                (total (+ (or lvalue 0) (or rvalue 0) (reduce #'+ htlcs :key #'second)))
                (rev-priv (k:derive-revocation-privkey (lv::live-revocation-priv lc) (secp:bytes-to-int secret)))
@@ -368,9 +383,12 @@
               (push (list (%sign tx i lscript lvalue rev-priv) (vector 1) lscript) witnesses)
               (incf i))
             (when ridx
-              (push (list (%sign tx i (%p2wpkh-script-code pay-pub) rvalue (lv::live-payment-priv lc))
-                          (c:octets pay-pub))
-                    witnesses)
+              (if (lv:live-anchors-p lc)
+                  (let ((script (m:to-remote-anchors-script pay-pub)))
+                    (push (list (%sign tx i script rvalue (lv::live-payment-priv lc)) script) witnesses))
+                  (push (list (%sign tx i (%p2wpkh-script-code pay-pub) rvalue (lv::live-payment-priv lc))
+                              (c:octets pay-pub))
+                        witnesses))
               (incf i))
             ;; Every HTLC output, whichever way it pointed: <sig> <revocationpubkey>
             ;; takes the OP_DUP OP_HASH160 branch at the top of both scripts.

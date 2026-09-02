@@ -61,6 +61,7 @@
    #:initial-commitment-signature #:verify-initial-commitment
    #:local-commitment-tx #:commitment-number-of #:remote-point-for #:revoked-secret-for
    #:live-local-commit-sig #:live-local-commit-htlc-sigs #:local-point #:pub #:previous-commitment-tx
+   #:live-anchors-p #:peer-htlc-sighash
    #:remote-htlcs-at #:their-commitment-tx #:built-local #:b-tx #:b-htlc-outputs #:b-revocation-pubkey #:b-delayed-pubkey
    #:b-to-self-delay #:b-feerate
    #:fully-committed-received-htlcs #:can-send-commit-p
@@ -106,6 +107,7 @@
   ;; --- fixed parameters -----------------------------------------------------
   channel-id funding-txid funding-index capacity-sat
   opener                              ; :local or :remote — who pays the fee
+  (anchors-p nil)                     ; option_anchors: the Appendix F format
   ;; our secrets: funding scalar, the four basepoint scalars, and the shachain seed
   funding-priv revocation-priv payment-priv delayed-priv htlc-priv seed
   ;; their public parameters
@@ -153,7 +155,7 @@
   local-shutdown-script remote-shutdown-script
   (closed-p nil) closing-txid)
 
-(defun make-live (&key channel-id funding-txid funding-index capacity-sat opener
+(defun make-live (&key channel-id funding-txid funding-index capacity-sat opener anchors-p
                        funding-priv revocation-priv payment-priv delayed-priv htlc-priv seed
                        remote-funding-pubkey remote-revocation-basepoint
                        remote-payment-basepoint remote-delayed-basepoint
@@ -164,7 +166,7 @@
                        remote-first-point)
   "A channel at commitment 0, as it stands the moment the funding is signed."
   (%make-live :channel-id channel-id :funding-txid funding-txid
-              :funding-index funding-index :capacity-sat capacity-sat :opener opener
+              :funding-index funding-index :capacity-sat capacity-sat :opener opener :anchors-p anchors-p
               :funding-priv funding-priv :revocation-priv revocation-priv
               :payment-priv payment-priv :delayed-priv delayed-priv
               :htlc-priv htlc-priv :seed seed
@@ -254,7 +256,7 @@
 
 (defstruct (built (:conc-name b-))
   tx htlc-outputs   ; htlc-outputs: list of (index htlc-rec witness-script), output order
-  revocation-pubkey delayed-pubkey to-self-delay feerate)
+  revocation-pubkey delayed-pubkey to-self-delay feerate anchors)
 
 (defun %build (lc spec &key ours point index)
   "Build the commitment described by SPEC.  OURS says whose commitment it is;
@@ -295,7 +297,11 @@
          :revocation-pubkey revocation-pubkey :to-self-delay to-self-delay
          :delayed-pubkey delayed-pubkey :remote-pubkey remote-pay
          :opener opener
-         :htlcs htlcs :local-htlc-pubkey local-htlc-pubkey :remote-htlc-pubkey remote-htlc-pubkey)
+         :htlcs htlcs :local-htlc-pubkey local-htlc-pubkey :remote-htlc-pubkey remote-htlc-pubkey
+         :anchors (live-anchors-p lc)
+         ;; Anchors lock to funding keys — the OWNER's is "local".
+         :local-funding-pubkey (if ours (pub (live-funding-priv lc)) (live-remote-funding-pubkey lc))
+         :remote-funding-pubkey (if ours (live-remote-funding-pubkey lc) (pub (live-funding-priv lc))))
       (declare (ignore desc))
       ;; Locate each surviving HTLC's output, in output order.  ORDER holds the
       ;; m:htlc structs in that order; recompute the witness script and find the
@@ -304,10 +310,11 @@
         (dolist (mh order)
           (let* ((script (ecase (m:htlc-direction mh)
                            (:offered (m:offered-htlc-script revocation-pubkey remote-htlc-pubkey
-                                                            local-htlc-pubkey (m:htlc-payment-hash mh)))
+                                                            local-htlc-pubkey (m:htlc-payment-hash mh)
+                                                            :anchors (live-anchors-p lc)))
                            (:received (m:received-htlc-script revocation-pubkey remote-htlc-pubkey
                                                               local-htlc-pubkey (m:htlc-payment-hash mh)
-                                                              (m:htlc-expiry mh)))))
+                                                              (m:htlc-expiry mh) :anchors (live-anchors-p lc)))))
                  (spk (m:p2wsh script))
                  (idx (position spk outputs :start start :key #'btx:txout-script :test #'equalp))
                  (rec (find-if (lambda (h) (and (equalp (hr-payment-hash h) (m:htlc-payment-hash mh))
@@ -320,7 +327,8 @@
             (push (list idx rec script) found)))
         (make-built :tx tx :htlc-outputs (nreverse found)
                     :revocation-pubkey revocation-pubkey :delayed-pubkey delayed-pubkey
-                    :to-self-delay to-self-delay :feerate (spec-feerate-per-kw spec))))))
+                    :to-self-delay to-self-delay :feerate (spec-feerate-per-kw spec)
+                    :anchors (live-anchors-p lc))))))
 
 (defun %htlc-tx (built ours idx rec)
   "The second-stage transaction for the HTLC at output IDX.  Direction is from
@@ -332,7 +340,13 @@
                    :cltv-expiry (hr-cltv-expiry rec) :feerate-per-kw (b-feerate built)
                    :revocation-pubkey (b-revocation-pubkey built)
                    :to-self-delay (b-to-self-delay built)
-                   :delayed-pubkey (b-delayed-pubkey built)))
+                   :delayed-pubkey (b-delayed-pubkey built)
+                   :anchors (b-anchors built)))
+
+(defun peer-htlc-sighash (lc)
+  "What the PEER signs second-stage HTLC transactions with: SINGLE|ANYONECANPAY
+   on anchor channels, so the broadcaster can add fee inputs; ALL otherwise."
+  (if (live-anchors-p lc) m:+sighash-single-anyonecanpay+ 1))
 
 (defun %verify64 (sig hash pubkey)
   (handler-case
@@ -483,7 +497,8 @@
          (htlc-priv (k:derive-privkey (live-htlc-priv lc) (live-remote-next-point lc)))
          (htlc-sigs (loop for (idx rec script) in (b-htlc-outputs built)
                           collect (m:sign-htlc-tx (%htlc-tx built nil idx rec) htlc-priv
-                                                  script (floor (hr-amount-msat rec) 1000)))))
+                                                  script (floor (hr-amount-msat rec) 1000)
+                                                  :sighash (peer-htlc-sighash lc)))))
     (push (cons (1+ (live-remote-commit-index lc)) (copy-list (spec-htlcs spec))) (live-remote-history lc))
     (setf (live-remote-next-commit lc) (cons (1+ (live-remote-commit-index lc)) spec)
           (live-local-signed lc) (append (live-local-signed lc) (live-local-proposed lc))
@@ -535,7 +550,8 @@
       (loop for (idx rec script) in (b-htlc-outputs built)
             for sig in (u:cs-htlc-signatures cs)
             do (let* ((htx (%htlc-tx built t idx rec))
-                      (hash (m:htlc-tx-sighash htx script (floor (hr-amount-msat rec) 1000))))
+                      (hash (m:htlc-tx-sighash htx script (floor (hr-amount-msat rec) 1000)
+                                               :sighash (peer-htlc-sighash lc))))
                  (unless (%verify64 sig hash their-htlc-pub)
                    (fail "their htlc_signature for HTLC ~d does not verify" (hr-id rec))))))
     ;; Everything checks.  Adopt the new commitment and revoke the old one.
@@ -848,7 +864,7 @@
 (defun live->plist (lc)
   (list :channel-id (hx (live-channel-id lc)) :funding-txid (hx (live-funding-txid lc))
         :funding-index (live-funding-index lc) :capacity-sat (live-capacity-sat lc)
-        :opener (live-opener lc)
+        :opener (live-opener lc) :anchors-p (live-anchors-p lc)
         :funding-priv (live-funding-priv lc) :revocation-priv (live-revocation-priv lc)
         :payment-priv (live-payment-priv lc) :delayed-priv (live-delayed-priv lc)
         :htlc-priv (live-htlc-priv lc) :seed (hx (live-seed lc))
@@ -884,7 +900,7 @@
 (defun plist->live (p)
   (flet ((g (k) (getf p k)))
     (%make-live :channel-id (uh (g :channel-id)) :funding-txid (uh (g :funding-txid))
-                :funding-index (g :funding-index) :capacity-sat (g :capacity-sat) :opener (g :opener)
+                :funding-index (g :funding-index) :capacity-sat (g :capacity-sat) :opener (g :opener) :anchors-p (g :anchors-p)
                 :funding-priv (g :funding-priv) :revocation-priv (g :revocation-priv)
                 :payment-priv (g :payment-priv) :delayed-priv (g :delayed-priv)
                 :htlc-priv (g :htlc-priv) :seed (uh (g :seed))
