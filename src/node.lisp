@@ -1817,17 +1817,19 @@
             (lv:live-local-commit-index lc) (subseq (%hex channel-id) 0 16) (bw:hash->hex (btx:tx-txid tx)))
       ;; An anchor commitment carries whatever fee it was signed at; bring it
       ;; to today's rate through its anchor, if we have an input to do it with.
+      ;; The close has happened whatever the bump does; nothing below may turn
+      ;; a successful broadcast into a reported failure.
       (when (lv:live-anchors-p lc)
-        (let ((u (spendable-utxo node 5000)))
-          (if u
-              (handler-case
+        (handler-case
+            (let ((u (spendable-utxo node 5000)))
+              (if u
                   (let ((bump (oc:bump-with-anchor lc tx u (node-feerate node))))
                     (chn:chain-broadcast (node-chain node) bump)
                     (setf (node-utxos node) (remove u (node-utxos node))) (save-utxos node)
                     (nlog node "  anchor bump broadcast: ~a (parent+child at ~d sat/kvB)"
                           (bw:hash->hex (btx:tx-txid bump)) (node-feerate node)))
-                (error (e) (nlog node "  anchor bump failed: ~a" e)))
-              (nlog node "  no input to bump the anchor with; the commitment carries its own fee"))))
+                  (nlog node "  no input to bump the anchor with; the commitment carries its own fee")))
+          (error (e) (nlog node "  anchor bump failed: ~a" e))))
       (btx:tx-txid tx))))
 
 
@@ -2021,8 +2023,9 @@
 
 (defun spendable-utxo (node &optional (at-least 1000))
   "The largest UTXO we hold worth at least AT-LEAST sat, or NIL."
-  (let ((best (reduce (lambda (a b) (if (and b (> (oc:utxo-value b) (oc:utxo-value a))) b a))
-                      (node-utxos node) :initial-value nil)))
+  (let ((best nil))
+    (dolist (u (node-utxos node))
+      (when (or (null best) (> (oc:utxo-value u) (oc:utxo-value best))) (setf best u)))
     (and best (>= (oc:utxo-value best) at-least) best)))
 
 (defun install-handlers (node peer)
