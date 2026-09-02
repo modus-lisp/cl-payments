@@ -1374,14 +1374,17 @@
                (result (make-pathname :type "result" :defaults f)))
           (delete-file f)
           (let ((text (handle-command node form)))
-            ;; A payment's outcome arrives later; keep writing it where the
-            ;; command asked, as before.
-            (when (and (eq (first form) :pay) (search ":pending" text))
-              (let ((p (gethash (subseq text (+ 16 (search ":payment-hash \"" text)) (+ 80 (search ":payment-hash \"" text)))
-                               (node-payments node))))
-                (when p (setf (pay-result-path p) result) (write-result p))))
             (with-open-file (s result :direction :output :if-exists :supersede)
-              (write-string text s) (terpri s)))))
+              (write-string text s) (terpri s))
+            ;; A payment's outcome arrives later; from here on the payment
+            ;; itself writes to the result file.  Attached AFTER the pending
+            ;; line is written, so a fast completion cannot be overwritten by it.
+            (when (and (eq (first form) :pay) (search ":pending" text))
+              (let* ((at (search ":payment-hash \"" text))
+                     (p (and at (gethash (subseq text (+ at 16) (+ at 80)) (node-payments node)))))
+                (when p
+                  (setf (pay-result-path p) result)
+                  (unless (eq (pay-status p) :pending) (write-result p))))))))
       (sleep 0.5))))
 
 ;;; ----------------------------------------------------------------------------
@@ -1805,7 +1808,9 @@
          (bolt11 (inv:encode-invoice inv)))
     (bt:with-lock-held ((node-save-lock node))
       (setf (gethash (%hex hash) (node-invoices node))
-            (list :preimage preimage :bolt11 bolt11 :amount-msat amount-msat :status :unpaid))
+            ;; :received-msat is present from the start: SETF GETF on a key a
+            ;; plist lacks extends the local variable, not the stored record.
+            (list :preimage preimage :bolt11 bolt11 :amount-msat amount-msat :status :unpaid :received-msat nil))
       ;; The preimage file stays the durable record: it is what a restart reads.
       (with-open-file (s (merge-pathnames "preimages.sexp" (node-dir node))
                          :direction :output :if-exists :append :if-does-not-exist :create)
