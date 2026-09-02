@@ -8,6 +8,7 @@
 ;;;;   CLP_PORT     port to listen on                        (default 9935)
 ;;;;   CLP_NETWORK  mainnet | testnet | signet | regtest     (default signet)
 ;;;;   CLP_BITCOIN_CLI  "bitcoin-cli -signet -datadir=..." — the chain view (optional)
+;;;;   CLP_CONTROL_PORT localhost control socket, one form per line (optional)
 ;;;;   CLP_CONNECT  optional <node_id>@host:port to dial on startup
 ;;;;
 ;;;;   CLP_DIR=/mnt/lisp/signet/clp1 CLP_PORT=9931 \
@@ -41,6 +42,9 @@
       (format t "~&chain view: ~a~%" cli)))
   (cl-payments.node:start node)
   (when (cl-payments.node:node-chain node) (cl-payments.node:start-watcher node))
+  ;; The control socket: one s-expression per line on localhost.
+  (let ((cp (env "CLP_CONTROL_PORT")))
+    (when cp (cl-payments.node:start-control-server node (parse-integer cp))))
   ;; Commands arrive as files; see RUN-COMMAND-LOOP.  Its own thread, so the
   ;; main one stays free to keep the process alive.
   (bordeaux-threads:make-thread (lambda () (cl-payments.node:run-command-loop node))

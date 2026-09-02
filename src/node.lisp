@@ -55,7 +55,7 @@
    #:node-error #:pay-invoice #:node-router #:run-command-loop
    #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
    #:node-chain #:node-height #:start-watcher #:force-close #:watch-once
-   #:mint-invoice #:node-invoices
+   #:mint-invoice #:node-invoices #:handle-command #:start-control-server #:node-control-port
    #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
@@ -277,6 +277,7 @@
   ;; The preimage is what makes a payment ours to claim; the record is what
   ;; lets us say afterwards whether it was.
   (invoices (make-hash-table :test 'equal))
+  control-port control-closer
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -1291,7 +1292,80 @@
 ;;; without inventing a protocol before there is a need for one.
 ;;; ----------------------------------------------------------------------------
 
+(defun handle-command (node form)
+  "Dispatch one command form and return the result as a printed form.  The
+   file watcher and the control socket both come here; the protocol IS the
+   forms, and having two dispatchers would mean having two protocols."
+  (flet ((r (fmt &rest args) (apply #'format nil fmt args)))
+    (handler-case
+        (ecase (first form)
+          (:pay
+           (let ((p (pay-invoice node (getf (rest form) :bolt11)
+                                 :current-height (getf (rest form) :height)
+                                 :amount-msat (getf (rest form) :amount-msat))))
+             (r "(:status :pending :payment-hash ~s)" (%hex (pay-payment-hash p)))))
+          (:payment-status
+           (let ((p (gethash (getf (rest form) :payment-hash) (node-payments node))))
+             (if p
+                 (r "(:status ~s :amount-msat ~d :fee-msat ~a :hops ~d :preimage ~s :failure ~s)"
+                    (pay-status p) (pay-amount-msat p)
+                    (and (pay-hops p) (rt:total-fee-msat (pay-hops p) (pay-amount-msat p)))
+                    (length (pay-hops p)) (and (pay-preimage p) (%hex (pay-preimage p))) (pay-failure p))
+                 "(:status :unknown)")))
+          (:invoice
+           (multiple-value-bind (bolt11 hash)
+               (mint-invoice node :amount-msat (getf (rest form) :amount-msat)
+                                  :description (getf (rest form) :description))
+             (r "(:status :ok :bolt11 ~s :payment-hash ~s)" bolt11 (%hex hash))))
+          (:invoice-status
+           (let ((rec (gethash (getf (rest form) :payment-hash) (node-invoices node))))
+             (if rec
+                 (r "(:status ~s :amount-msat ~d :received-msat ~a)" (getf rec :status) (getf rec :amount-msat) (getf rec :received-msat))
+                 "(:status :unknown)")))
+          (:force-close
+           (r "(:status :broadcast :txid ~s)" (bw:hash->hex (force-close node (%unhex (getf (rest form) :channel))))))
+          (:close
+           (close-channel node (%unhex (getf (rest form) :channel)))
+           "(:status :shutdown-sent)")
+          (:publish-revoked
+           ;; Deliberately publish a state we revoked.  This LOSES the channel's
+           ;; funds to the peer; it exists to prove, on a devnet, that the peer's
+           ;; penalty is real.
+           (let* ((sc (gethash (getf (rest form) :channel) (node-channels node)))
+                  (tx (and sc (sc-live sc) (lv:previous-commitment-tx (sc-live sc)))))
+             (unless tx (error 'node-error :detail "no revoked commitment to publish"))
+             (chn:chain-broadcast (node-chain node) tx)
+             (nlog node "CHEATING on purpose: published revoked commitment ~d of ~a: ~a"
+                   (lv::live-prev-index (sc-live sc)) (subseq (getf (rest form) :channel) 0 16)
+                   (bw:hash->hex (btx:tx-txid tx)))
+             (r "(:status :broadcast :txid ~s)" (bw:hash->hex (btx:tx-txid tx)))))
+          (:graph
+           (bt:with-lock-held ((node-router-lock node))
+             (r "(:channels ~d :nodes ~d :edges ~d :own ~d)"
+                (gs:router-channel-count (node-router node)) (gs:router-node-count (node-router node))
+                (length (rt:router-edges (node-router node))) (length (own-edges node)))))
+          (:channels
+           (let ((out '()))
+             (maphash (lambda (k sc) (declare (ignore k))
+                        (let ((lc (sc-live sc)))
+                          (push (list :channel-id (%hex (sc-channel-id sc)) :peer (%hex (sc-peer-id sc))
+                                      :scid (and (sc-scid sc) (gs:scid-string (sc-scid sc)))
+                                      :ours-msat (and lc (lv:live-local-balance-msat lc))
+                                      :theirs-msat (and lc (lv:live-remote-balance-msat lc))
+                                      :state (cond ((sc-close-kind sc) (sc-close-kind sc))
+                                                   ((and lc (lv:live-closed-p lc)) :closed)
+                                                   (lc :open) (t :no-live-state)))
+                                out)))
+                      (node-channels node))
+             (let ((*print-pretty* nil)) (r "~s" (nreverse out)))))
+          (:info
+           (r "(:id ~s :height ~a :feerate ~d :peers ~d :channels ~d)" (%hex (node-id node)) (node-height node)
+              (node-feerate node) (node-peer-count node) (node-channel-count node))))
+      (error (e) (r "(:status :error :message ~s)" (princ-to-string e))))))
+
 (defun run-command-loop (node)
+  "The file-based command channel.  Kept alongside the socket: it needs no
+   client at all, which a shell script on the box appreciates."
   (let ((dir (merge-pathnames "commands/" (node-dir node))))
     (ensure-directories-exist dir)
     (loop
@@ -1299,72 +1373,52 @@
         (let* ((form (handler-case (with-open-file (s f) (read s)) (error () nil)))
                (result (make-pathname :type "result" :defaults f)))
           (delete-file f)
-          (handler-case
-              (ecase (first form)
-                (:pay (pay-invoice node (getf (rest form) :bolt11)
-                                   :current-height (getf (rest form) :height)
-                                   :amount-msat (getf (rest form) :amount-msat)
-                                   :result-path result))
-                (:force-close
-                 (let ((txid (force-close node (%unhex (getf (rest form) :channel)))))
-                   (with-open-file (s result :direction :output :if-exists :supersede)
-                     (format s "(:status :broadcast :txid ~s)~%" (bw:hash->hex txid)))))
-                (:publish-revoked
-                 ;; Deliberately publish a state we revoked.  This LOSES the
-                 ;; channel's funds to the peer; it exists to prove, on a devnet,
-                 ;; that the peer's penalty is real.
-                 (let* ((sc (gethash (getf (rest form) :channel) (node-channels node)))
-                        (tx (and sc (sc-live sc) (lv:previous-commitment-tx (sc-live sc)))))
-                   (unless tx (error 'node-error :detail "no revoked commitment to publish"))
-                   (chn:chain-broadcast (node-chain node) tx)
-                   (nlog node "CHEATING on purpose: published revoked commitment ~d of ~a: ~a"
-                         (lv::live-prev-index (sc-live sc)) (subseq (getf (rest form) :channel) 0 16)
-                         (bw:hash->hex (btx:tx-txid tx)))
-                   (with-open-file (s result :direction :output :if-exists :supersede)
-                     (format s "(:status :broadcast :txid ~s)~%" (bw:hash->hex (btx:tx-txid tx))))))
-                (:close
-                 (close-channel node (%unhex (getf (rest form) :channel)))
-                 (with-open-file (s result :direction :output :if-exists :supersede)
-                   (format s "(:status :shutdown-sent)~%")))
-                (:invoice
-                 (multiple-value-bind (bolt11 hash)
-                     (mint-invoice node :amount-msat (getf (rest form) :amount-msat)
-                                        :description (getf (rest form) :description))
-                   (with-open-file (s result :direction :output :if-exists :supersede)
-                     (format s "(:status :ok :bolt11 ~s :payment-hash ~s)~%" bolt11 (%hex hash)))))
-                (:invoice-status
-                 (let ((rec (gethash (getf (rest form) :payment-hash) (node-invoices node))))
-                   (with-open-file (s result :direction :output :if-exists :supersede)
-                     (if rec
-                         (format s "(:status ~s :amount-msat ~d :received-msat ~a)~%"
-                                 (getf rec :status) (getf rec :amount-msat) (getf rec :received-msat))
-                         (format s "(:status :unknown)~%")))))
-                (:graph
-                 (with-open-file (s result :direction :output :if-exists :supersede)
-                   (bt:with-lock-held ((node-router-lock node))
-                     (format s "(:channels ~d :nodes ~d :edges ~d :own ~d)~%"
-                             (gs:router-channel-count (node-router node))
-                             (gs:router-node-count (node-router node))
-                             (length (rt:router-edges (node-router node)))
-                             (length (own-edges node)))))))
-            (error (e)
-              (nlog node "command ~a failed: ~a" (first form) e)
-              (with-open-file (s result :direction :output :if-exists :supersede)
-                (format s "(:status :error :message ~s)~%" (princ-to-string e)))))))
+          (let ((text (handle-command node form)))
+            ;; A payment's outcome arrives later; keep writing it where the
+            ;; command asked, as before.
+            (when (and (eq (first form) :pay) (search ":pending" text))
+              (let ((p (gethash (subseq text (+ 16 (search ":payment-hash \"" text)) (+ 80 (search ":payment-hash \"" text)))
+                               (node-payments node))))
+                (when p (setf (pay-result-path p) result) (write-result p))))
+            (with-open-file (s result :direction :output :if-exists :supersede)
+              (write-string text s) (terpri s)))))
       (sleep 0.5))))
 
-
 ;;; ----------------------------------------------------------------------------
-;;; Opening a channel, from the daemon
+;;; The control socket
 ;;;
-;;; The script that opened channels until now ran the same handshake with
-;;; bitcoind on the other end of a shell pipe.  Here the funding transaction is
-;;; whatever FUND-FN returns: the daemon-to-daemon test fabricates one, and the
-;;; devnet builds one with bitcoin-cli.  What the daemon insists on is the
-;;; ORDER — the transaction is not broadcast until the peer has signed our
-;;; first commitment — because broadcasting first hands the peer a funding
-;;; output we can never spend alone.
+;;; One request form per line, one response form per line, on localhost.  It
+;;; is not authenticated, because it is not exposed: anyone who can reach
+;;; 127.0.0.1 on this box already owns the node's key file.
 ;;; ----------------------------------------------------------------------------
+
+(defun %read-byte-line (stream)
+  "One line from a binary stream as a string, or NIL at end of stream."
+  (let ((buf (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer t)))
+    (loop for b = (read-byte stream nil)
+          do (cond ((null b) (return (and (plusp (length buf)) (sb-ext:octets-to-string buf :external-format :utf-8))))
+                   ((= b 10) (return (sb-ext:octets-to-string buf :external-format :utf-8)))
+                   (t (vector-push-extend b buf))))))
+
+(defun start-control-server (node port)
+  (setf (node-control-port node) port
+        (node-control-closer node)
+        (tr:expose (lambda (stream peer-plist)
+                     (declare (ignore peer-plist))
+                     ;; The listener hands us a byte stream (it is the same one
+                     ;; the Noise transport uses), so lines are assembled by hand.
+                     (handler-case
+                         (loop for line = (%read-byte-line stream)
+                               while line
+                               do (let* ((form (handler-case (let ((*read-eval* nil)) (read-from-string line))
+                                                 (error () nil)))
+                                         (reply (if (consp form) (handle-command node form)
+                                                    "(:status :error :message \"unreadable\")")))
+                                    (write-sequence (sb-ext:string-to-octets (format nil "~a~%" reply) :external-format :utf-8) stream)
+                                    (finish-output stream)))
+                       (error () nil)))
+                   :backend :tcp :host "127.0.0.1" :port port))
+  (nlog node "control socket on 127.0.0.1:~d" port))
 
 (defun open-channel-to (node peer-id funding-sat &key (push-msat 0) fund-fn (announce t))
   "Start a channel with a connected peer.  FUND-FN receives the funding
