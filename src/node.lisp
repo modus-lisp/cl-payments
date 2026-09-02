@@ -186,7 +186,7 @@
                                 :close-kind (sc-close-kind sc)
                                 :close-txid (let ((k (sc-close-txid sc))) (and k (%hex k)))
                                 :close-height (sc-close-height sc)
-                                :sweep-txid (let ((k (sc-sweep-txid sc))) (and k (%hex k)))
+                                :sweep-txid (let ((k (sc-sweep-txid sc))) (if (keywordp k) k (and k (%hex k))))
                                 :close-tx (let ((tx (sc-close-tx sc))) (and tx (%hex (btx:serialize-tx tx))))
                                 :claimed (mapcar (lambda (c) (cons (car c) (%hex (cdr c)))) (sc-claimed sc))
                                 :second-stage (mapcar (lambda (c) (cons (%hex (car c)) (cdr c))) (sc-second-stage sc)))
@@ -228,7 +228,7 @@
                             :close-kind (getf form :close-kind)
                             :close-txid (let ((v (getf form :close-txid))) (and v (%unhex v)))
                             :close-height (getf form :close-height)
-                            :sweep-txid (let ((v (getf form :sweep-txid))) (and v (%unhex v)))
+                            :sweep-txid (let ((v (getf form :sweep-txid))) (if (keywordp v) v (and v (%unhex v))))
                             :close-tx (let ((v (getf form :close-tx)))
                                         (and v (btx:parse-tx (bw:make-reader (%unhex v)))))
                             :claimed (mapcar (lambda (c) (cons (car c) (%unhex (cdr c)))) (getf form :claimed))
@@ -1380,8 +1380,10 @@
             ;; itself writes to the result file.  Attached AFTER the pending
             ;; line is written, so a fast completion cannot be overwritten by it.
             (when (and (eq (first form) :pay) (search ":pending" text))
-              (let* ((at (search ":payment-hash \"" text))
-                     (p (and at (gethash (subseq text (+ at 16) (+ at 80)) (node-payments node)))))
+              (let* ((prefix ":payment-hash \"")
+                     (at (search prefix text))
+                     (p (and at (gethash (subseq text (+ at (length prefix)) (+ at (length prefix) 64))
+                                         (node-payments node)))))
                 (when p
                   (setf (pay-result-path p) result)
                   (unless (eq (pay-status p) :pending) (write-result p))))))))
@@ -1656,7 +1658,15 @@
                (setf (sc-sweep-txid sc) (btx:tx-txid pen))
                (nlog node "  REVOKED COMMITMENT ~d PUBLISHED — penalty broadcast: ~a" n (bw:hash->hex (btx:tx-txid pen)))))
             (:our-commitment
-             (nlog node "  our own commitment; to_local sweepable after ~d blocks" (lv::live-local-to-self-delay lc)))
+             (cond
+               ((< n (lv:live-local-commit-index lc))
+                ;; An OLD commitment of ours on chain.  The peer holds its
+                ;; revocation secret and will take everything; there is nothing
+                ;; here for us to sweep, and trying every block just fails.
+                (setf (sc-sweep-txid sc) :forfeit)
+                (nlog node "  a REVOKED commitment of ours (~d < ~d) — forfeit; expect the peer's penalty"
+                      n (lv:live-local-commit-index lc)))
+               (t (nlog node "  our own commitment; to_local sweepable after ~d blocks" (lv::live-local-to-self-delay lc)))))
             (:unknown (nlog node "  UNRECOGNISED spend of our funding output — cannot answer it")))
         (error (e) (nlog node "  answering the spend failed: ~a" e)))
       (save-channels node))))
@@ -1727,7 +1737,15 @@
                      (save-channels node)
                      (nlog node "delay elapsed on ~a — swept our to_local: ~a"
                            (subseq (%hex (sc-channel-id sc)) 0 16) (bw:hash->hex (btx:tx-txid sweep))))
-                 (error (e) (nlog node "to_local sweep failed: ~a" e)))))
+                 (error (e)
+                   ;; A sweep the network refuses is usually a sweep of an
+                   ;; output that is already gone.  Check, and if so stop.
+                   (if (chn:chain-txout-unspent-p (node-chain node) (sc-close-txid sc)
+                                                  (or (ignore-errors (oc:to-local-output (sc-live sc) (sc-close-tx sc))) 0))
+                       (nlog node "to_local sweep failed: ~a" e)
+                       (progn (setf (sc-sweep-txid sc) :taken) (save-channels node)
+                              (nlog node "to_local of ~a is already spent — nothing to sweep"
+                                    (subseq (%hex (sc-channel-id sc)) 0 16))))))))
            (node-channels node)))
 
 (defun scan-block (node height)
