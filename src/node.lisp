@@ -56,6 +56,7 @@
    #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
    #:node-chain #:node-height #:start-watcher #:force-close #:watch-once
    #:mint-invoice #:node-invoices #:handle-command #:start-control-server #:node-control-port
+   #:node-funding-depth #:node-towers #:node-tower-store #:offer-to-towers #:control-call
    #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
@@ -85,6 +86,7 @@
   ;; peer contributed.
   (key-index 0)
   scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig
+  min-depth                 ; confirmations both sides agreed to wait for
   ;; On-chain resolution: what spent the funding output, and what we did.
   close-kind close-txid close-height sweep-txid
   close-tx                  ; the spending transaction itself, for HTLC claims
@@ -187,6 +189,7 @@
                                 :close-txid (let ((k (sc-close-txid sc))) (and k (%hex k)))
                                 :close-height (sc-close-height sc)
                                 :sweep-txid (let ((k (sc-sweep-txid sc))) (if (keywordp k) k (and k (%hex k))))
+                                :min-depth (sc-min-depth sc)
                                 :close-tx (let ((tx (sc-close-tx sc))) (and tx (%hex (btx:serialize-tx tx))))
                                 :claimed (mapcar (lambda (c) (cons (car c) (%hex (cdr c)))) (sc-claimed sc))
                                 :second-stage (mapcar (lambda (c) (cons (%hex (car c)) (cdr c))) (sc-second-stage sc)))
@@ -229,6 +232,7 @@
                             :close-txid (let ((v (getf form :close-txid))) (and v (%unhex v)))
                             :close-height (getf form :close-height)
                             :sweep-txid (let ((v (getf form :sweep-txid))) (if (keywordp v) v (and v (%unhex v))))
+                            :min-depth (getf form :min-depth)
                             :close-tx (let ((v (getf form :close-tx)))
                                         (and v (btx:parse-tx (bw:make-reader (%unhex v)))))
                             :claimed (mapcar (lambda (c) (cons (car c) (%unhex (cdr c)))) (getf form :claimed))
@@ -278,6 +282,14 @@
   ;; lets us say afterwards whether it was.
   (invoices (make-hash-table :test 'equal))
   control-port control-closer
+  ;; How deep a funding must be before we call the channel open.  One block
+  ;; is fine on a devnet we mine ourselves; a reorg that drops the funding
+  ;; drops the channel with it, so a real deployment wants more.
+  (funding-depth 3)
+  ;; Watchtowers we report to, as "host:port" of their control sockets; and,
+  ;; when WE are a tower, the blobs we hold: hint hex -> encrypted penalty.
+  (towers '())
+  (tower-store (make-hash-table :test 'equal))
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -536,7 +548,7 @@
   temporary-channel-id keys open-msg
   ;; the opener's side of the handshake
   (role :accepter) funding-sat push-msat fund-fn broadcast-fn channel-id
-  funding-txid funding-index accept-msg live)
+  funding-txid funding-index accept-msg live)   ; accept-msg carries their minimum_depth
 
 (defun next-key-index (node)
   "One past the highest index in use.  Reusing an index reuses a funding key
@@ -593,8 +605,7 @@
                 ;; choice; zero would make revocation punishment worthless.
                 :channel-reserve-satoshis (max 546 (floor (ch:oc-funding-satoshis oc) 100))
                 :htlc-minimum-msat 1
-                ;; One confirmation is fine on a devnet we mine ourselves.
-                :minimum-depth 1
+                :minimum-depth (node-funding-depth node)
                 :to-self-delay 144
                 :max-accepted-htlcs 30
                 :funding-pubkey (ck-pub (ck-funding keys))
@@ -706,6 +717,7 @@
                    :remote-msat (- (* funding-sat 1000) push-msat)
                    :key-index (ck-index keys)
                    :remote-funding-pubkey their-funding-pub
+                   :min-depth (node-funding-depth node)
                    :live (lv:make-live
                           :channel-id cid :funding-txid (ch:fc-funding-txid fc)
                           :funding-index (ch:fc-funding-output-index fc)
@@ -1013,6 +1025,7 @@
     (lv:receive-revocation lc payload)
     (nlog node "revoke_and_ack accepted — their commitment ~d is current"
           (lv:live-remote-commit-index lc))
+    (offer-to-towers node sc (1- (lv:live-remote-commit-index lc)))
     (settle-received node peer sc)
     (maybe-commit node peer sc)))
 
@@ -1358,6 +1371,11 @@
                                 out)))
                       (node-channels node))
              (let ((*print-pretty* nil)) (r "~s" (nreverse out)))))
+          (:watch
+           (setf (gethash (getf (rest form) :hint) (node-tower-store node)) (getf (rest form) :blob))
+           (save-tower-store node)
+           (r "(:status :watching :held ~d)" (hash-table-count (node-tower-store node))))
+          (:tower-status (r "(:held ~d)" (hash-table-count (node-tower-store node))))
           (:info
            (r "(:id ~s :height ~a :feerate ~d :peers ~d :channels ~d)" (%hex (node-id node)) (node-height node)
               (node-feerate node) (node-peer-count node) (node-channel-count node))))
@@ -1534,6 +1552,9 @@
                  :local-msat (lv:live-local-balance-msat lc) :remote-msat (lv:live-remote-balance-msat lc)
                  :key-index (ck-index (po-keys po))
                  :remote-funding-pubkey (ch:ac-funding-pubkey (po-accept-msg po))
+                 ;; The peer's minimum_depth is what THEY wait for before their
+                 ;; channel_ready; waiting less would only have us ready alone.
+                 :min-depth (max (node-funding-depth node) (ch:ac-minimum-depth (po-accept-msg po)))
                  :live lc))
           (save-channels node)
           (nlog node "  funding_signed verified — channel ~a is ours to fund" (subseq (%hex cid) 0 16))
@@ -1601,11 +1622,6 @@
 ;;;     passed in.
 ;;; ----------------------------------------------------------------------------
 
-(defconstant +funding-depth+ 1
-  "Confirmations before we call a funding locked in.  One is right for a
-   devnet we mine ourselves; a real deployment wants more, because a reorg
-   that drops the funding transaction drops the channel with it.")
-
 (defun funding-outpoints (node)
   "(txid-bytes index sc) for every live channel that is not yet resolved."
   (let ((out '()))
@@ -1624,7 +1640,8 @@
              (when (and (sc-live sc) (null (sc-scid sc)) (null (sc-close-kind sc))
                         (gethash (%hex (sc-peer-id sc)) (node-peers node)))
                (multiple-value-bind (height idx) (chn:chain-tx-position (node-chain node) (sc-funding-txid sc))
-                 (when (and height (>= (1+ (- (node-height node) height)) +funding-depth+))
+                 (when (and height (>= (1+ (- (node-height node) height))
+                                       (or (sc-min-depth sc) (node-funding-depth node))))
                    (let ((scid (gs:make-scid height idx (sc-funding-index sc))))
                      (nlog node "funding of ~a confirmed at ~a" (subseq (%hex (sc-channel-id sc)) 0 16)
                            (gs:scid-string scid))
@@ -1769,7 +1786,9 @@
       (setf (node-feerate node) (handler-case (chn:chain-feerate (node-chain node)) (error () (node-feerate node))))
       (check-fundings node)
       (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
-            do (scan-block node height))
+            do (scan-block node height)
+               (handler-case (tower-check-block node height)
+                 (error (e) (nlog node "tower scan: ~a" e))))
       (setf (node-scanned-height node) h)
       (check-delayed-sweeps node)
       (maphash (lambda (k sc) (declare (ignore k))
@@ -1839,6 +1858,98 @@
 (defun invoice-paid (node payment-hash amount-msat)
   (let ((rec (gethash (%hex payment-hash) (node-invoices node))))
     (when rec (setf (getf rec :status) :paid (getf rec :received-msat) amount-msat))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; Watchtowers
+;;;
+;;; A penalty is only worth anything if someone broadcasts it in time, and a
+;;; node that is offline when its peer cheats cannot.  So at every revocation
+;;; we pre-sign the penalty for the commitment just revoked and hand it to a
+;;; tower — encrypted under the revoked transaction's OWN txid, with the first
+;;; sixteen bytes of that txid as a hint.  The tower learns nothing about the
+;;; channel from the blob; it can only open it when the revoked transaction
+;;; appears on chain, at which point broadcasting the contents is exactly
+;;; what we would have done ourselves.
+;;; ----------------------------------------------------------------------------
+
+(defun control-call (host port form)
+  "One form to another daemon's control socket; returns the reply string."
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address host) port)
+           (let ((stream (sb-bsd-sockets:socket-make-stream sock :input t :output t
+                                                                 :element-type '(unsigned-byte 8))))
+             (write-sequence (sb-ext:string-to-octets (format nil "~a~%" form) :external-format :utf-8) stream)
+             (finish-output stream)
+             (%read-byte-line stream)))
+      (sb-bsd-sockets:socket-close sock))))
+
+(defun tower-blob (txid penalty-tx)
+  "Encrypt PENALTY-TX under TXID.  Returns (values hint-hex blob-hex)."
+  (let* ((key (c:sha256 (c:octets txid)))
+         (sealed (c:aead-encrypt key (c:zeros 12) (c:bytes) (btx:serialize-tx penalty-tx))))
+    (values (%hex (subseq (c:octets txid) 0 16)) (%hex sealed))))
+
+(defun tower-open (txid blob-hex)
+  "Decrypt a blob with the transaction that has appeared, or NIL."
+  (handler-case
+      (btx:parse-tx (bw:make-reader (c:aead-decrypt (c:sha256 (c:octets txid)) (c:zeros 12) (c:bytes) (%unhex blob-hex))))
+    (error () nil)))
+
+(defun offer-to-towers (node sc n)
+  "Commitment N of the peer's was just revoked: pre-sign its penalty and send
+   it to every configured tower."
+  (when (node-towers node)
+    (handler-case
+        (let* ((lc (sc-live sc))
+               (revoked (lv:their-commitment-tx lc n)))
+          (when revoked
+            (let ((pen (oc:penalty lc revoked n (our-sweep-script node sc) :feerate (node-feerate node))))
+              (multiple-value-bind (hint blob) (tower-blob (btx:tx-txid revoked) pen)
+                (dolist (tower (node-towers node))
+                  (let* ((colon (position #\: tower))
+                         (host (subseq tower 0 colon)) (port (parse-integer tower :start (1+ colon)))
+                         (reply (handler-case (control-call host port (format nil "(:watch :hint ~s :blob ~s)" hint blob))
+                                  (error (e) (format nil "(:status :error :message ~s)" (princ-to-string e))))))
+                    (nlog node "  tower ~a: commitment ~d of ~a — ~a" tower n
+                          (subseq (%hex (sc-channel-id sc)) 0 16) (subseq reply 0 (min 40 (length reply))))))))))
+      (error (e) (nlog node "  could not prepare a tower blob: ~a" e)))))
+
+(defun tower-store-path (node) (merge-pathnames "tower.sexp" (node-dir node)))
+
+(defun save-tower-store (node)
+  (bt:with-lock-held ((node-save-lock node))
+    (with-open-file (s (tower-store-path node) :direction :output :if-exists :supersede)
+      (let ((*print-pretty* nil))
+        (maphash (lambda (hint blob) (prin1 (list hint blob) s) (terpri s)) (node-tower-store node))))))
+
+(defun load-tower-store (node)
+  (when (probe-file (tower-store-path node))
+    (with-open-file (s (tower-store-path node))
+      (loop for form = (read s nil) while form
+            do (setf (gethash (first form) (node-tower-store node)) (second form))))))
+
+(defun tower-check-block (node height)
+  "As a tower: does any transaction in this block match a hint we hold?"
+  (when (plusp (hash-table-count (node-tower-store node)))
+    (dolist (tx (chn:chain-block-txs (node-chain node) height))
+      (let* ((txid (btx:tx-txid tx))
+             (hint (%hex (subseq (c:octets txid) 0 16)))
+             (blob (gethash hint (node-tower-store node))))
+        (when blob
+          (let ((pen (tower-open txid blob)))
+            (cond
+              (pen
+               (handler-case
+                   (progn (chn:chain-broadcast (node-chain node) pen)
+                          (nlog node "TOWER: ~a appeared at height ~d — penalty broadcast: ~a"
+                                (subseq (bw:hash->hex txid) 0 16) height (bw:hash->hex (btx:tx-txid pen))))
+                 (error (e) (nlog node "TOWER: penalty for ~a rejected: ~a" (subseq (bw:hash->hex txid) 0 16) e))))
+              (t (nlog node "TOWER: hint matched ~a but the blob did not open" (subseq (bw:hash->hex txid) 0 16))))
+            (remhash hint (node-tower-store node))
+            (save-tower-store node)))))))
 
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+
@@ -1937,6 +2048,7 @@
   (ensure-directories-exist (node-dir node))
   (let ((n (load-channels node)))
     (nlog node "loaded ~d channel~:p from ~a" n (node-dir node)))
+  (load-tower-store node)
   (setf (node-listener-closer node)
         (tr:expose (lambda (stream peer-plist)
                      (declare (ignore peer-plist))

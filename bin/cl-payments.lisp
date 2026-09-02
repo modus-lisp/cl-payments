@@ -9,6 +9,8 @@
 ;;;;   CLP_NETWORK  mainnet | testnet | signet | regtest     (default signet)
 ;;;;   CLP_BITCOIN_CLI  "bitcoin-cli -signet -datadir=..." — the chain view (optional)
 ;;;;   CLP_CONTROL_PORT localhost control socket, one form per line (optional)
+;;;;   CLP_FUNDING_DEPTH confirmations before a funding counts (default 3)
+;;;;   CLP_TOWERS       comma-separated host:port control sockets of watchtowers
 ;;;;   CLP_CONNECT  optional <node_id>@host:port to dial on startup
 ;;;;
 ;;;;   CLP_DIR=/mnt/lisp/signet/clp1 CLP_PORT=9931 \
@@ -40,6 +42,11 @@
     (when cli
       (setf (cl-payments.node:node-chain node) (cl-payments.chain:make-bitcoind cli))
       (format t "~&chain view: ~a~%" cli)))
+  (let ((d (env "CLP_FUNDING_DEPTH"))) (when d (setf (cl-payments.node:node-funding-depth node) (parse-integer d))))
+  (let ((towers (env "CLP_TOWERS")))
+    (when towers
+      (setf (cl-payments.node:node-towers node) (uiop:split-string towers :separator ","))
+      (format t "~&towers: ~a~%" towers)))
   (cl-payments.node:start node)
   (when (cl-payments.node:node-chain node) (cl-payments.node:start-watcher node))
   ;; The control socket: one s-expression per line on localhost.

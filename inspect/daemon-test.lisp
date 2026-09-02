@@ -94,12 +94,16 @@
   (setf *checks* 0 *fails* 0)
   (w:select-network :signet)
   (format t "~&=== daemon: two nodes, one channel, both directions, and a close ===~%")
-  (let* ((pa (free-port 19700)) (pb (free-port (1+ pa)))
+  (let* ((pa (free-port 19700)) (pb (free-port (1+ pa))) (pt (free-port (1+ pb))) (pc (free-port (1+ pt)))
          (a (fresh-node "a" pa)) (b (fresh-node "b" pb))
-         ;; ONE mock chain, seen by both: what A broadcasts, B's watcher sees.
+         ;; A third node that is nobody's peer: the watchtower A reports to.
+         (tower (fresh-node "tower" pt))
+         ;; ONE mock chain, seen by all: what B broadcasts, everyone's watcher sees.
          (chain (chn:make-mock-chain :height 100)))
-    (setf (n:node-chain a) chain (n:node-chain b) chain)
-    (n:start a) (n:start b)
+    (setf (n:node-chain a) chain (n:node-chain b) chain (n:node-chain tower) chain)
+    (n:start a) (n:start b) (n:start tower)
+    (n:start-control-server tower pc)
+    (setf (n:node-towers a) (list (format nil "127.0.0.1:~d" pc)))
     (unwind-protect
          (progn
            ;; ---- connect --------------------------------------------------------
@@ -132,7 +136,11 @@
            (let ((cid (n::sc-channel-id (only-channel a))))
              (chn:mock-mine chain 1)
              (n:watch-once a) (n:watch-once b)
-             (wait-for "both watchers assigned the scid from the chain" 5
+             (ok "one confirmation is not enough: default depth is 3"
+                 (and (null (n::sc-scid (only-channel a))) (null (n::sc-scid (only-channel b)))))
+             (chn:mock-mine chain 2)
+             (n:watch-once a) (n:watch-once b)
+             (wait-for "at three confirmations both watchers assigned the scid from the chain" 5
                        (lambda () (and (n::sc-scid (only-channel a)) (n::sc-scid (only-channel b))
                                        (string= "101x0x0" (cl-payments.gossip:scid-string (n::sc-scid (only-channel a)))))))
              (wait-for "both ends hold the other's next per-commitment point" 5
@@ -194,13 +202,32 @@
                            (lambda () (and (null (lv:live-htlcs (live-of a))) (null (lv:live-htlcs (live-of b))))))
                  (ok "A's balance is restored" (= 770000000 (lv:live-local-balance-msat (live-of a))))))
 
-             ;; ---- B publishes a REVOKED commitment; A's watcher punishes it ------
+             ;; ---- the tower holds a blob for every commitment B revoked ---------
+             (wait-for "A reported B's revoked commitments to the tower" 5
+                       (lambda () (>= (hash-table-count (n:node-tower-store tower)) 3)))
+
+             ;; ---- B publishes a REVOKED commitment; the TOWER punishes it first --
              ;; B's previous commitment is a state B revoked when it accepted the
              ;; next one.  Broadcasting it is theft; A must take everything.
              (let* ((cheat (lv:previous-commitment-tx (live-of b))))
                (ok "B holds a signed previous (revoked) commitment" (and cheat t))
                (chn:chain-broadcast chain cheat)
                (chn:mock-mine chain 1)
+               ;; The tower sees the block before A does — A might be offline.
+               (let ((held-before (hash-table-count (n:node-tower-store tower))))
+               (n:watch-once tower)
+               (let ((from-tower (find-if (lambda (tx) (some (lambda (in) (equalp (btx:txin-prev-hash in) (btx:tx-txid cheat)))
+                                                           (btx:tx-inputs tx)))
+                                          (chn:mock-mempool chain))))
+                 (ok "the tower opened the blob and broadcast a penalty spending the cheat" (and from-tower t))
+                 (when from-tower
+                   (multiple-value-bind (lidx lvalue) (oc:to-local-output (live-of a) cheat :theirs t :n (lv::live-prev-index (live-of b)))
+                     (ok "the tower's penalty spends B's to_local under cl-consensus"
+                         (spends-p from-tower 0 (btx:txout-script (nth lidx (btx:tx-outputs cheat))) lvalue))
+                     (ok "and pays A, not the tower"
+                         (equalp (btx:txout-script (first (btx:tx-outputs from-tower))) (n::our-sweep-script a (only-channel a))))))
+                 (ok "the tower forgot that one blob once used, and kept the rest"
+                     (= (hash-table-count (n:node-tower-store tower)) (1- held-before)))))
                (n:watch-once a) (n:watch-once b)
                (ok "A classified the spend as :revoked" (eq :revoked (n::sc-close-kind (only-channel a))))
                (ok "B knows it published its own commitment" (eq :our-commitment (n::sc-close-kind (only-channel b))))
@@ -226,6 +253,6 @@
                (ok "A's state reloads with the close recorded"
                    (let ((sc (only-channel reloaded)))
                      (and sc (eq :revoked (n::sc-close-kind sc)) (n::sc-sweep-txid sc)))))))
-      (ignore-errors (n:stop a)) (ignore-errors (n:stop b))))
+      (ignore-errors (n:stop a)) (ignore-errors (n:stop b)) (ignore-errors (n:stop tower))))
   (format t "~&~%~d check~:p, ~d failure~:p~%" *checks* *fails*)
   (zerop *fails*))

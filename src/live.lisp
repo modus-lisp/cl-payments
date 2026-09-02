@@ -61,7 +61,7 @@
    #:initial-commitment-signature #:verify-initial-commitment
    #:local-commitment-tx #:commitment-number-of #:remote-point-for #:revoked-secret-for
    #:live-local-commit-sig #:live-local-commit-htlc-sigs #:local-point #:pub #:previous-commitment-tx
-   #:remote-htlcs-at #:built-local #:b-tx #:b-htlc-outputs #:b-revocation-pubkey #:b-delayed-pubkey
+   #:remote-htlcs-at #:their-commitment-tx #:built-local #:b-tx #:b-htlc-outputs #:b-revocation-pubkey #:b-delayed-pubkey
    #:b-to-self-delay #:b-feerate
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
@@ -144,6 +144,11 @@
   ;; their scripts, and that needs the payment hash and expiry of each — which
   ;; nothing else remembers once the HTLC is resolved.
   (remote-history '())
+  ;; The full spec of each commitment of theirs that they have REVOKED, by
+  ;; number.  With it and the revealed secret, the revoked transaction can be
+  ;; rebuilt exactly — which is what lets a penalty be pre-signed and handed to
+  ;; a watchtower before the cheat happens rather than after.
+  (remote-spec-history '())
   ;; --- closing --------------------------------------------------------------
   local-shutdown-script remote-shutdown-script
   (closed-p nil) closing-txid)
@@ -596,6 +601,14 @@
   "The HTLCs (our view) in THEIR commitment N, or NIL if none / unknown."
   (cdr (assoc n (live-remote-history lc))))
 
+(defun their-commitment-tx (lc n)
+  "THEIR commitment N, rebuilt from its recorded spec and their point for N.
+   Unsigned — only its outputs and txid matter to a penalty — and only possible
+   for commitments they revoked, since only then do we hold the point."
+  (let ((spec (cdr (assoc n (live-remote-spec-history lc))))
+        (point (remote-point-for lc n)))
+    (and spec point (b-tx (%build lc spec :ours nil :point point :index n)))))
+
 (defun built-local (lc)
   "The BUILT record for our current commitment: outputs, HTLC positions and
    scripts, keys.  What second-stage transactions are made from."
@@ -643,6 +656,8 @@
       (fail "revoked secret does not match their commitment ~d point" (live-remote-commit-index lc)))
     (k:shachain-insert (live-revocations lc)
                        (- k:+max-commitment-index+ (live-remote-commit-index lc)) secret)
+    ;; The commitment being revoked is the one that was current until now.
+    (push (cons (live-remote-commit-index lc) (copy-spec* (live-remote-spec lc))) (live-remote-spec-history lc))
     (destructuring-bind (idx . spec) (live-remote-next-commit lc)
       (setf (live-remote-spec lc) spec
             (live-remote-commit-index lc) idx
@@ -862,7 +877,9 @@
         :local-commit-htlc-sigs (mapcar #'hx (live-local-commit-htlc-sigs lc))
         :revocations (k:shachain->plist (live-revocations lc))
         :remote-history (loop for (n . htlcs) in (live-remote-history lc)
-                              collect (cons n (mapcar #'htlc->plist htlcs)))))
+                              collect (cons n (mapcar #'htlc->plist htlcs)))
+        :remote-spec-history (loop for (n . sp) in (live-remote-spec-history lc)
+                                   collect (cons n (spec->plist sp)))))
 
 (defun plist->live (p)
   (flet ((g (k) (getf p k)))
@@ -895,4 +912,6 @@
                 :local-commit-htlc-sigs (mapcar #'uh (g :local-commit-htlc-sigs))
                 :revocations (if (g :revocations) (k:plist->shachain (g :revocations)) (k:make-shachain))
                 :remote-history (loop for (n . htlcs) in (g :remote-history)
-                                      collect (cons n (mapcar #'plist->htlc htlcs))))))
+                                      collect (cons n (mapcar #'plist->htlc htlcs)))
+                :remote-spec-history (loop for (n . sp) in (g :remote-spec-history)
+                                           collect (cons n (plist->spec sp))))))
