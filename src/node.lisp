@@ -32,6 +32,7 @@
                     (#:ch #:cl-payments.channel) (#:u #:cl-payments.updates)
                     (#:gs #:cl-payments.gossip) (#:m #:cl-payments.commitment)
                     (#:f #:cl-payments.features) (#:lv #:cl-payments.live)
+                    (#:on #:cl-payments.onion) (#:fw #:cl-payments.forward)
                     (#:tr #:cl-transport) (#:bt #:bordeaux-threads)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:secp #:secp256k1-fast))
@@ -220,6 +221,16 @@
   (peers (make-hash-table :test 'equal))     ; hex node id -> peer
   (channels (make-hash-table :test 'equal))  ; hex channel id -> stored-channel
   (pending (make-hash-table :test 'equal))   ; hex temporary channel id -> pending-open
+  ;; Forwarding state.  FORWARDS: (out-cid-hex . out-id) -> forward record, so a
+  ;; resolution arriving on the outgoing channel finds its way upstream.
+  ;; IN-FLIGHT: (in-cid-hex . in-id) -> t while we wait on downstream, so the
+  ;; same incoming HTLC is not resolved twice.
+  (forwards (make-hash-table :test 'equal))
+  (in-flight (make-hash-table :test 'equal))
+  ;; One lock for everything that touches live channels.  A forward spans TWO
+  ;; channels, whose peers run on two threads; without this, the outgoing send
+  ;; races the incoming peer's next message over the same state.
+  (htlc-lock (bt:make-recursive-lock "htlc"))
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -752,32 +763,178 @@
       (nlog node "  commitment_signed sent (their commitment ~d)"
             (1+ (lv:live-remote-commit-index lc))))))
 
-(defun settle-received (node peer sc)
-  "Fulfil or fail every received HTLC that is now committed on both sides."
+(defstruct (forward (:conc-name fwd-))
+  in-sc in-id in-peer shared-secret out-sc out-id)
+
+(defun our-channel-update-message (node sc)
+  "Our current channel_update for SC as a full message (type included), for the
+   UPDATE-class failures that carry one."
+  (multiple-value-bind (body we-are-1) (announcement-body-for node sc)
+    (declare (ignore body))
+    (w:encode-message
+     gs:+msg-channel-update+
+     (gs:encode-channel-update
+      (node-privkey node)
+      (gs:channel-update-body
+       :chain-hash (w:chain-hash) :scid (sc-scid sc)
+       :timestamp (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0))
+       :channel-flags (if we-are-1 0 1)
+       :htlc-maximum-msat (* 1000 (sc-capacity-sat sc)))))))
+
+(defun fail-upstream (node peer sc h ss code &key channel-update extra)
+  "Fail a received HTLC with a proper BOLT #4 failure onion, encrypted to the
+   sender under the shared secret we peeled it with."
+  (let* ((msg (on:encode-failure-message code :channel-update channel-update :extra extra))
+         (reason (on:create-failure-packet ss msg)))
+    (p:send-message peer (lv:send-fail (sc-live sc) (lv:hr-id h) reason) nil)
+    (nlog node "  HTLC ~d: failed with ~(~a~)" (lv:hr-id h) (fw:failure-name code))))
+
+(defun find-outgoing (node scid)
+  "The live, open channel with SCID and its connected peer, or NIL."
+  (let ((found nil))
+    (maphash (lambda (k sc) (declare (ignore k))
+               (when (and (sc-scid sc) (sc-live sc) (not (lv:live-closed-p (sc-live sc)))
+                          (= (gs:scid->u64 (sc-scid sc)) (gs:scid->u64 scid)))
+                 (setf found sc)))
+             (node-channels node))
+    (values found (and found (gethash (%hex (sc-peer-id found)) (node-peers node))))))
+
+(defun resolve-received (node peer sc)
+  "Every received HTLC that is now committed on both sides gets exactly one of:
+   fulfilled (it is ours and we hold the preimage), forwarded (the onion names a
+   next channel), or failed — with a reason the sender can read."
   (let ((lc (sc-live sc)))
     (dolist (h (lv:fully-committed-received-htlcs lc))
-      (let ((pre (preimage-for node (lv:hr-payment-hash h))))
-        (cond
-          (pre
-           (p:send-message peer (lv:send-fulfill lc (lv:hr-id h) pre) nil)
-           (nlog node "  HTLC ~d: preimage known — update_fulfill_htlc sent, ~d msat is ours"
-                 (lv:hr-id h) (lv:hr-amount-msat h)))
-          (t
-           ;; The reason should be a BOLT #4 failure onion (Phase 5c).  Until
-           ;; then an opaque reason still returns the money; the sender just
-           ;; cannot read why.
-           (p:send-message peer (lv:send-fail lc (lv:hr-id h) (c:zeros 32)) nil)
-           (nlog node "  HTLC ~d: no preimage for ~a — update_fail_htlc sent"
-                 (lv:hr-id h) (subseq (%hex (lv:hr-payment-hash h)) 0 16))))))))
+      (let ((key (cons (%hex (sc-channel-id sc)) (lv:hr-id h))))
+        (unless (gethash key (node-in-flight node))
+          (setf (gethash key (node-in-flight node)) t)
+          (handler-case
+              (multiple-value-bind (payload next ss)
+                  (on:peel-onion (lv:hr-onion h) (node-privkey node) (lv:hr-payment-hash h))
+                ;; From here on we HAVE a shared secret, so every failure can be
+                ;; a proper encrypted reason — including a payload we cannot
+                ;; parse, which is invalid_onion_payload rather than BADONION:
+                ;; the onion was fine, its contents were not.
+                (let ((hp (handler-case (on:parse-hop-payload payload)
+                            (error (e)
+                              (nlog node "  HTLC ~d: unparseable payload (~a)" (lv:hr-id h) e)
+                              (fail-upstream node peer sc h ss fw:+invalid-onion-payload+)
+                              nil))))
+                  (cond
+                    ((null hp) nil)
+                    ;; A payload naming no next channel on a non-final hop, or a
+                    ;; next channel on the final hop, is the sender contradicting
+                    ;; itself.
+                    ((if next (null (on:hp-scid hp)) (on:hp-scid hp))
+                     (fail-upstream node peer sc h ss fw:+invalid-onion-payload+))
+                    ;; ---- final hop: it is for us ---------------------------------
+                    ((null next)
+                     (let ((pre (preimage-for node (lv:hr-payment-hash h))))
+                       (cond
+                         ((< (lv:hr-amount-msat h) (on:hp-amount-msat hp))
+                          (fail-upstream node peer sc h ss fw:+final-incorrect-htlc-amount+
+                                         :extra (let ((wr (w:make-writer))) (w:w-u64 wr (lv:hr-amount-msat h)) (w:writer-bytes wr))))
+                         ((< (lv:hr-cltv-expiry h) (on:hp-cltv-expiry hp))
+                          (fail-upstream node peer sc h ss fw:+final-incorrect-cltv-expiry+
+                                         :extra (let ((wr (w:make-writer))) (w:w-u32 wr (lv:hr-cltv-expiry h)) (w:writer-bytes wr))))
+                         (pre
+                          (p:send-message peer (lv:send-fulfill lc (lv:hr-id h) pre) nil)
+                          (nlog node "  HTLC ~d is for us: onion read, preimage known — fulfilled, ~d msat ours"
+                                (lv:hr-id h) (lv:hr-amount-msat h)))
+                         (t
+                          (fail-upstream node peer sc h ss fw:+incorrect-or-unknown-payment-details+
+                                         :extra (let ((wr (w:make-writer)))
+                                                  (w:w-u64 wr (lv:hr-amount-msat h)) (w:w-u32 wr 0)
+                                                  (w:writer-bytes wr)))))))
+                    ;; ---- intermediate hop: forward it ------------------------------
+                    (t
+                     (multiple-value-bind (out-sc out-peer) (find-outgoing node (on:hp-scid hp))
+                       (let* ((out-lc (and out-sc (sc-live out-sc)))
+                              (decision
+                                (fw:check-forward
+                                 :incoming-amount-msat (lv:hr-amount-msat h)
+                                 :incoming-cltv-expiry (lv:hr-cltv-expiry h)
+                                 :amount-to-forward-msat (on:hp-amount-msat hp)
+                                 :outgoing-cltv-expiry (on:hp-cltv-expiry hp)
+                                 :policy (fw:make-policy)
+                                 :outgoing (fw:make-outgoing
+                                            :known-p (and out-sc t)
+                                            :peer-connected-p (and out-peer (p:peer-alive-p out-peer) t)
+                                            :available-msat (if out-lc (lv:live-local-balance-msat out-lc) 0)
+                                            :pending-htlcs (if out-lc (length (lv:live-htlcs out-lc)) 0))
+                                 :current-height nil)))
+                         (cond
+                           ((not (fw:forward-decision-ok-p decision))
+                            (let ((code (fw:forward-decision-failure-code decision)))
+                              (nlog node "  HTLC ~d: not forwarding to ~a — ~a" (lv:hr-id h)
+                                    (gs:scid-string (on:hp-scid hp)) (fw:forward-decision-detail decision))
+                              (fail-upstream node peer sc h ss code
+                                             :channel-update (and (fw:failure-update-p code) out-sc
+                                                                  (our-channel-update-message node out-sc)))))
+                           (t
+                            (let* ((out-msg (lv:send-add out-lc (on:hp-amount-msat hp) (lv:hr-payment-hash h)
+                                                         (on:hp-cltv-expiry hp) next))
+                                   (out-id (1- (lv:live-next-htlc-id out-lc))))
+                              (setf (gethash (cons (%hex (sc-channel-id out-sc)) out-id) (node-forwards node))
+                                    (make-forward :in-sc sc :in-id (lv:hr-id h) :in-peer peer
+                                                  :shared-secret ss :out-sc out-sc :out-id out-id))
+                              (p:send-message out-peer out-msg nil)
+                              (nlog node "  HTLC ~d: forwarding ~d msat over ~a as HTLC ~d (fee ~d msat)"
+                                    (lv:hr-id h) (on:hp-amount-msat hp) (gs:scid-string (sc-scid out-sc)) out-id
+                                    (- (lv:hr-amount-msat h) (on:hp-amount-msat hp)))
+                              (maybe-commit node out-peer out-sc)
+                              (save-channels node))))))))))
+            (on:onion-error (e)
+              ;; We could not even open the onion: no shared secret, so no
+              ;; encrypted reason.  BADONION, in the clear, with the onion's hash.
+              (nlog node "  HTLC ~d: unreadable onion (~a) — update_fail_malformed_htlc" (lv:hr-id h) e)
+              (p:send-message peer (lv:send-fail-malformed lc (lv:hr-id h) (lv:hr-onion h)
+                                                           (logior fw:+badonion+ fw:+perm+ 5))
+                              nil))))))))
+
+(defun settle-received (node peer sc) (resolve-received node peer sc))
+
+(defun relay-resolution (node out-sc out-id kind &key preimage reason malformed-code)
+  "Something resolved an HTLC we FORWARDED.  Carry it upstream: a fulfil with the
+   preimage, or a failure with one more onion layer added under the incoming
+   hop's shared secret."
+  (let* ((key (cons (%hex (sc-channel-id out-sc)) out-id))
+         (f (gethash key (node-forwards node))))
+    (when f
+      (remhash key (node-forwards node))
+      (let ((in-lc (sc-live (fwd-in-sc f))) (in-peer (fwd-in-peer f)))
+        (ecase kind
+          (:fulfill
+           (p:send-message in-peer (lv:send-fulfill in-lc (fwd-in-id f) preimage) nil)
+           (nlog node "  forwarded HTLC ~d settled downstream — fulfilling upstream HTLC ~d"
+                 out-id (fwd-in-id f)))
+          (:fail
+           (p:send-message in-peer
+                           (lv:send-fail in-lc (fwd-in-id f)
+                                         (on:wrap-failure-packet (fwd-shared-secret f) reason))
+                           nil)
+           (nlog node "  forwarded HTLC ~d failed downstream — relaying the failure upstream" out-id))
+          (:malformed
+           ;; Downstream could not read the onion WE forwarded.  Convert into a
+           ;; proper failure onion from our position, as BOLT #4 requires.
+           (p:send-message in-peer
+                           (lv:send-fail in-lc (fwd-in-id f)
+                                         (on:create-failure-packet (fwd-shared-secret f)
+                                                                   (on:encode-failure-message malformed-code)))
+                           nil)
+           (nlog node "  forwarded HTLC ~d: downstream reports malformed onion — failing upstream" out-id)))
+        (remhash (cons (%hex (sc-channel-id (fwd-in-sc f))) (fwd-in-id f)) (node-in-flight node))
+        (maybe-commit node in-peer (fwd-in-sc f))))))
 
 (defmacro with-live-channel ((sc lc node payload what) &body body)
   `(handler-case
-       (let ((,sc (live-channel-for ,node ,payload)))
-         (when ,sc
-           (let ((,lc (sc-live ,sc)))
-             (declare (ignorable ,lc))
-             ,@body
-             (save-channels ,node))))
+       (bt:with-recursive-lock-held ((node-htlc-lock ,node))
+         (let ((,sc (live-channel-for ,node ,payload)))
+           (when ,sc
+             (let ((,lc (sc-live ,sc)))
+               (declare (ignorable ,lc))
+               ,@body
+               (save-channels ,node)))))
      (error (e) (nlog ,node "~a: ~a" ,what e))))
 
 (defun handle-update-add (node peer payload)
@@ -811,14 +968,18 @@
   (declare (ignore peer))
   (with-live-channel (sc lc node payload "update_fulfill_htlc")
     (let ((h (lv:receive-fulfill lc payload)))
-      (nlog node "update_fulfill_htlc ~d: preimage verified" (lv:hr-id h)))))
+      (nlog node "update_fulfill_htlc ~d: preimage verified" (lv:hr-id h))
+      (relay-resolution node sc (lv:hr-id h) :fulfill :preimage (lv:hr-preimage h)))))
 
 (defun handle-update-fail (node peer payload)
   (declare (ignore peer))
   (with-live-channel (sc lc node payload "update_fail_htlc")
-    (let ((id (w:r-u64 (w:make-reader payload :start 32))))
+    (let* ((r (w:make-reader payload :start 32))
+           (id (w:r-u64 r))
+           (reason (w:r-varbytes r)))
       (lv:receive-fail lc id)
-      (nlog node "update_fail_htlc ~d" id))))
+      (nlog node "update_fail_htlc ~d" id)
+      (relay-resolution node sc id :fail :reason reason))))
 
 (defun handle-update-fail-malformed (node peer payload)
   (declare (ignore peer))
@@ -828,7 +989,8 @@
       (w:r-bytes r 32)
       (let ((code (w:r-u16 r)))
         (lv:receive-fail lc id)
-        (nlog node "update_fail_malformed_htlc ~d: failure code #x~x" id code)))))
+        (nlog node "update_fail_malformed_htlc ~d: failure code #x~x" id code)
+        (relay-resolution node sc id :malformed :malformed-code code)))))
 
 (defun handle-update-fee (node peer payload)
   (declare (ignore peer))

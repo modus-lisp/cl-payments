@@ -49,14 +49,14 @@
    #:live-local-commit-index #:live-remote-commit-index #:live-htlcs
    #:live-awaiting-revocation-p #:live-feerate-per-kw #:live-capacity-sat
    #:live-remote-shutdown-script #:live-local-shutdown-script #:live-closed-p
-   #:live-closing-txid #:live-pending-changes-p
+   #:live-closing-txid #:live-pending-changes-p #:live-next-htlc-id
    #:htlc-rec #:hr-id #:hr-direction #:hr-amount-msat #:hr-payment-hash
    #:hr-cltv-expiry #:hr-resolution #:hr-preimage #:hr-onion
    #:local-spec #:remote-spec #:spec-to-local-msat #:spec-to-remote-msat #:spec-htlcs
    ;; transitions — each returns the message(s) to send, or NIL
    #:set-remote-next-point #:set-remote-current-point
    #:send-add #:receive-add
-   #:send-fulfill #:receive-fulfill #:send-fail #:receive-fail #:receive-fee
+   #:send-fulfill #:receive-fulfill #:send-fail #:send-fail-malformed #:receive-fail #:receive-fee
    #:send-commit #:receive-commit #:receive-revocation
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
@@ -382,6 +382,19 @@
   (setf (live-local-proposed lc) (append (live-local-proposed lc) (list (list :fail id))))
   (u:encode-update-fail-htlc
    (u:make-update-fail-htlc :channel-id (live-channel-id lc) :id id :reason reason)))
+
+(defun send-fail-malformed (lc id onion code)
+  "update_fail_malformed_htlc: for an onion we could not even open.  There is no
+   shared secret to encrypt an error with, so the failure travels in the clear
+   with the onion's hash, and the code must carry BADONION."
+  (%find-received lc id)
+  (setf (live-local-proposed lc) (append (live-local-proposed lc) (list (list :fail id))))
+  (let ((wr (w:make-writer)))
+    (w:w-bytes wr (live-channel-id lc))
+    (w:w-u64 wr id)
+    (w:w-bytes wr (c:sha256 (c:octets onion)))
+    (w:w-u16 wr code)
+    (w:encode-message u:+msg-update-fail-malformed-htlc+ (w:writer-bytes wr))))
 
 (defun receive-fulfill (lc msg)
   "They claimed an HTLC we offered.  Verified before it is believed: crediting

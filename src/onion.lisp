@@ -144,14 +144,17 @@
 
 (defun parse-hop-payload (bytes)
   "BYTES is the TLV stream WITHOUT the length prefix (the peeler strips it).
-   A payload with neither scid nor payment_data is neither forwardable nor
-   final, and is rejected."
+
+   Whether a hop is final is decided by the onion — an all-zero next HMAC — not
+   by the payload.  A final payload carries payment_data only when the sender
+   had a payment secret to put in it; Core Lightning's `sendpay` with a bare
+   payment hash sends just the amount and expiry, and that is legal.  So the
+   only hard requirement here is the pair every payload must have."
   (let* ((recs (w:r-tlv-stream (w:make-reader bytes)))
          (get (lambda (ty) (w:tlv-get recs ty)))
          (amt (funcall get 2)) (cltv (funcall get 4))
          (scid (funcall get 6)) (pd (funcall get 8)))
     (unless (and amt cltv) (fail "hop payload lacks amt_to_forward or outgoing_cltv_value"))
-    (unless (or scid pd) (fail "hop payload has neither short_channel_id nor payment_data"))
     (make-hop-payload
      :amount-msat (w:r-tu (w:make-reader amt) 8)
      :cltv-expiry (w:r-tu (w:make-reader cltv) 4)

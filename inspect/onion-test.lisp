@@ -48,6 +48,11 @@
         ;; A hop derives the same secret from the OTHER side: ECDH(node_priv, epk).
         ;; We cannot, without the node keys — but rho/mu/um derive from the
         ;; secret alone and must be distinct per type.
+        ;; The spec stresses that key types are not NUL-terminated.  A mutation
+        ;; that appends the NUL SURVIVES this suite — and correctly so: HMAC
+        ;; zero-pads its key to the block size, so "um" and "um\0" are the same
+        ;; key.  The remark protects implementations whose HMAC takes a C string
+        ;; length, not the derivation itself.
         (let ((ss (first secrets)))
           (check "rho, mu, um, pad, ammag are five different keys"
                  (= 5 (length (remove-duplicates
@@ -143,6 +148,19 @@
               (check "a reason with a layer missing attributes to nobody"
                      (null (on:decrypt-failure-packet (butlast secrets 1)
                                                       (on:wrap-failure-packet (nth 4 secrets) packet)))))))))
+
+    (with-gate ("onion: payload shapes")
+      (let ((final-bare (on:parse-hop-payload
+                         (subseq (on:encode-hop-payload (on:make-hop-payload :amount-msat 7000000 :cltv-expiry 330)) 1))))
+        ;; CLN's sendpay with a bare payment hash sends exactly this.  Rejecting
+        ;; it turned every plain payment to us into "malformed onion".
+        (check "a final payload with only amount and expiry parses"
+               (and (= 7000000 (on:hp-amount-msat final-bare)) (null (on:hp-scid final-bare))
+                    (null (on:hp-payment-secret final-bare)))))
+      (check-signals "a payload without an amount is rejected" on:onion-error
+                     (on:parse-hop-payload (let ((wr (w:make-writer)))
+                                             (w:w-tlv-stream wr (list (w:make-tlv-record :type 4 :value (vector 1))))
+                                             (w:writer-bytes wr)))))
 
     ;; The spec's error vector — the erring node's step, exactly.
     (with-gate ("onion: the spec's error packet vector")

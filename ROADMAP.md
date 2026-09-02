@@ -421,26 +421,55 @@ the baseline every test in `forward-test.lisp` perturbs.
 66 checks, 13 mutations, 13 killed — including "forward everything", which fails
 24 of them.
 
-### 5b — forwarding over a live channel  **[NOT STARTED]**
+### 5b — forwarding over a live channel  **[DONE]**
 
-Wire 5a's decision into the daemon: receive `update_add_htlc` upstream, decide,
-offer downstream, relay the fulfil or the failure back. Depends on 4d closing and
-on Phase 6 for the onion. The devnet is already shaped for it — CLN computes
-cln3 → clp3 → cln4 today; this is what makes that route actually carry a payment.
+Every received HTLC, once committed on both sides, gets exactly one of: fulfilled
+(final hop, preimage known), forwarded (the onion names a next channel and 5a
+says yes), or failed with a reason the sender can read. A forward is recorded
+against its outgoing HTLC so the downstream fulfil or failure finds its way
+back upstream. One recursive lock covers everything that touches live channels:
+a forward spans two channels whose peers run on two threads.
 
-### 5c — failure messages  **[NOT STARTED]**
+**Verified on the devnet:** cln3 paid cln4 THROUGH clp3 (`315x1x0` → `315x2x0`),
+30,000,000 msat, `waitsendpay: complete`, fee 1030 msat kept — our
+forwarding decision's own arithmetic. cl-payments has now forwarded a real
+payment between two Core Lightning nodes. Its middle-hop position is a
+behaviour, not a graph fact.
 
-BOLT #4's encrypted failure onion: wrap our failure code (with the
-`channel_update` for UPDATE failures) so only the sender can read it, and
-obfuscate failures we relay from downstream.
+### 5c — failure messages  **[DONE]**
 
-## Phase 6 — onion routing
+BOLT #4's encrypted failure onion, in `src/onion.lisp`: our failure code (with
+our `channel_update` attached for UPDATE failures) encrypted so only the sender
+can read it, one more layer added to failures we relay from downstream, and a
+BADONION `update_fail_malformed_htlc` in the clear when we could not open the
+onion at all — the one case with no shared secret to encrypt under.
 
-BOLT #4 Sphinx: construct a 1300-byte onion, peel a layer, handle the error
-onion. Constant-size routing packets with per-hop keys.
+**Verified:** Core Lightning decoded every reason we sent. A no-fee route got
+`WIRE_FEE_INSUFFICIENT`, a short CLTV got `WIRE_INCORRECT_CLTV_EXPIRY`, a bogus
+next channel got `WIRE_UNKNOWN_NEXT_PEER`, each attributed to clp3; and cln4's
+own `INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS`, relayed through us, was attributed
+to cln4. An unknown hash at our own final hop gets the same code, not
+"Malformed error reply".
 
-**Milestone.** BOLT #4's vectors reproduce, and a payment we onion-route crosses
-the spine — and, separately, one routed *by CLN* is forwarded *through* clp3.
+## Phase 6 — onion routing  **[DONE]**
+
+BOLT #4 Sphinx in `src/onion.lisp`: construct the 1366-byte packet, peel a
+layer, build and read the error onion. The spec's five-hop packet reproduces
+byte for byte, and its error vector's keys and stream match. The filler is the
+subtle part — the sender must reproduce the tail every hop will leave behind by
+XORing the END of each hop's stream, or no HMAC verifies anywhere — and getting
+it wrong looks identical to a corrupted packet.
+
+Final-hop payloads carry `payment_data` only when the sender had a secret; a
+bare amount and expiry is legal and is what CLN's `sendpay` with a hash sends.
+Rejecting it turned every plain payment to us into "malformed onion" until it
+didn't.
+
+**Milestone met** for the receiving and forwarding halves: BOLT #4's vectors
+reproduce, and payments routed by CLN are received at clp3 with the onion read,
+and forwarded through it. What remains is the SENDING half — building an onion
+for a route we chose and offering the HTLC ourselves — which needs a route
+(Phase 3's graph plus pathfinding) and an invoice to pay (Phase 7).
 
 ## Phase 7 — invoices
 
@@ -469,9 +498,11 @@ routed end to end.
 
 ## Status
 
-**Phases 0–4 are done.** cl-payments opens channels, accepts them, announces
-them, receives payments over them, and closes them cooperatively — each step
-verified against Core Lightning on the private signet. Phase 5a is done.
+**Phases 0–6 are done, except for sending.** cl-payments opens channels,
+accepts them, announces them, receives payments with the onion read, FORWARDS
+payments between two other implementations' nodes with readable failures in
+every rejection path, and closes cooperatively — each step verified against
+Core Lightning on the private signet.
 
 Verified against real implementations on the private signet:
 
@@ -488,15 +519,19 @@ Verified against real implementations on the private signet:
   failed and returned. Both ends agreed on every balance.
 - CLN **closed** `306x1x0` cooperatively; the closing transaction confirmed with
   our 150,000 sat at an address derived from the node key.
+- cln3 **paid cln4 through clp3**: onion peeled, HTLC forwarded over `315x2x0`,
+  preimage relayed upstream, 1030 msat fee kept. Every rejection path returns a
+  failure onion CLN decodes and attributes correctly.
 
-Offline suite: 576 checks across two gates, every new check mutation-verified.
+Offline suite: 632 checks across two gates, every new check mutation-verified.
 
-**Next, in order:** Phase 6 (onion), then 5b — at which point clp3 forwards a
-real payment and its middle-hop position stops being a graph fact and becomes a
-behaviour. 5c and Phases 7–8 follow.
+**Next:** Phase 7 (BOLT #11 invoices), then the sending half of Phase 6 —
+pathfinding over the graph we already hold, an onion for the route, and
+`update_add_htlc` offered by us — so a cl-payments node can PAY as well as
+receive and forward. Then Phase 8, on-chain handling, which is what makes any
+of the above safe against a peer that stops cooperating.
 
-Two things carried forward from the daemon work, neither blocking: channels
-opened by `inspect/open-channel.lisp` predate the live state and cannot carry
-HTLCs (CLN's channeld gives up on them — reopen from the daemon side instead),
-and `update_fail_htlc` carries an opaque reason until 5c, which CLN reports as
-"Malformed error reply" while still returning the funds.
+Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
+state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the
+daemon side instead). Forwarding checks skip the two expiry-vs-chain-tip rules
+because the daemon has no chain view yet; that arrives with Phase 8.
