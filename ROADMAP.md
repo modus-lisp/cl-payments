@@ -465,19 +465,45 @@ bare amount and expiry is legal and is what CLN's `sendpay` with a hash sends.
 Rejecting it turned every plain payment to us into "malformed onion" until it
 didn't.
 
-**Milestone met** for the receiving and forwarding halves: BOLT #4's vectors
-reproduce, and payments routed by CLN are received at clp3 with the onion read,
-and forwarded through it. What remains is the SENDING half — building an onion
-for a route we chose and offering the HTLC ourselves — which needs a route
-(Phase 3's graph plus pathfinding) and an invoice to pay (Phase 7).
+**Milestone met, all three halves.** BOLT #4's vectors reproduce; payments
+routed by CLN are received at clp3 with the onion read, and forwarded through
+it; and clp3 SENDS. `src/route.lisp` runs Dijkstra backwards from the
+destination over the gossip graph — backwards because what an intermediate must
+receive depends on the fee it charges to forward what the NEXT node must
+receive — and the daemon builds the onion for the route, offers the HTLC, and
+reads the fulfil or the failure as origin. A transient failure that names a
+channel triggers a retry around it: gossip says what a channel would charge,
+never whether it has the balance right now, and the only way to learn that is to
+try.
 
-## Phase 7 — invoices
+Verified: clp3 paid cln4 directly, paid cln1 three hops away over a route learned
+entirely from gossip (fee 102 msat), and paid an LND invoice on the second
+attempt after the cheapest route failed at cln3's empty channel — the failure
+onion decoded, cln3 blamed, its channel excluded, the longer route via cln2
+taken, LND `SETTLED`.
 
-BOLT #11 bech32 invoice encode/decode, including the signature and the tagged
-fields. cl-consensus's `encoding.lisp` already has bech32.
+The daemon has no RPC; `clp-pay.sh` drops a one-form file in `<dir>/commands/`
+and reads the outcome beside it. The block height is passed in because the
+daemon has no chain view yet — Phase 8.
 
-**Milestone.** Decode invoices produced by both CLN and LND; produce invoices
-both of them accept and pay.
+## Phase 7 — invoices  **[DONE]**
+
+BOLT #11 in `src/invoice.lisp`: decode, verify, encode, sign. Fourteen of the
+spec's fifteen valid examples, decoded and re-signed with the spec's published
+key, come back byte-identical — RFC 6979 makes that possible and makes it the
+strongest test there is. The fifteenth is a deliberately high-S signature no
+low-S signer can reproduce; it decodes and recovers a key, as intended. Decoded
+fields are kept as their raw five-bit groups so unknown fields survive a round
+trip. The payee is recovered from the signature; when an `n` field names it,
+only a low-S signature verifies, as with libsecp256k1.
+
+**Milestone met** on the decoding side: invoices from both Core Lightning and
+LND decode with the right hashes and payees, and clp3 paid both. Producing
+invoices that the two accept and pay is straightforward from here — the encoder
+reproduces the spec's examples — but has not been driven live yet, because the
+daemon's receive path still takes preimages from a file rather than minting
+invoices. That is the last piece of "cl-payments as a wallet" and belongs with
+the RPC that Phase 8's chain view will also need.
 
 ## Phase 8 — on-chain handling
 
@@ -498,11 +524,12 @@ routed end to end.
 
 ## Status
 
-**Phases 0–6 are done, except for sending.** cl-payments opens channels,
-accepts them, announces them, receives payments with the onion read, FORWARDS
-payments between two other implementations' nodes with readable failures in
-every rejection path, and closes cooperatively — each step verified against
-Core Lightning on the private signet.
+**Phases 0–7 are done.** cl-payments opens channels, accepts them, announces
+them, receives payments with the onion read, forwards payments between two other
+implementations' nodes with readable failures in every rejection path, PAYS
+invoices from both Core Lightning and LND over routes learned from gossip with
+retry around channels that turn out empty, and closes cooperatively — each step
+verified against real implementations on the private signet.
 
 Verified against real implementations on the private signet:
 
@@ -522,14 +549,19 @@ Verified against real implementations on the private signet:
 - cln3 **paid cln4 through clp3**: onion peeled, HTLC forwarded over `315x2x0`,
   preimage relayed upstream, 1030 msat fee kept. Every rejection path returns a
   failure onion CLN decodes and attributes correctly.
+- **clp3 paid** cln4 directly, cln1 three hops away, and lnd1 on a second
+  attempt after routing around cln3's empty channel. Invoices from both
+  implementations decode; LND reports `SETTLED`.
 
-Offline suite: 632 checks across two gates, every new check mutation-verified.
+Offline suite: 762 checks across two gates, every new check mutation-verified.
 
-**Next:** Phase 7 (BOLT #11 invoices), then the sending half of Phase 6 —
-pathfinding over the graph we already hold, an onion for the route, and
-`update_add_htlc` offered by us — so a cl-payments node can PAY as well as
-receive and forward. Then Phase 8, on-chain handling, which is what makes any
-of the above safe against a peer that stops cooperating.
+**Next: Phase 8**, on-chain handling — the chain view the daemon has been
+missing (which also unblocks the two skipped forwarding checks and removes the
+height parameter from `clp-pay.sh`), watching for commitment transactions,
+sweeping after the CSV delay, penalising a revoked commitment, and resolving
+HTLCs on chain. It is what makes everything above safe against a peer that
+stops cooperating; until then every channel here is safe only because both
+ends behave.
 
 Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
 state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the

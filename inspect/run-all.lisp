@@ -22,6 +22,7 @@
   (run-live-tests)
   (run-onion-tests)
   (run-invoice-tests)
+  (run-route-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-channel-tests)

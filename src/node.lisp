@@ -33,6 +33,7 @@
                     (#:gs #:cl-payments.gossip) (#:m #:cl-payments.commitment)
                     (#:f #:cl-payments.features) (#:lv #:cl-payments.live)
                     (#:on #:cl-payments.onion) (#:fw #:cl-payments.forward)
+                    (#:inv #:cl-payments.invoice) (#:rt #:cl-payments.route)
                     (#:tr #:cl-transport) (#:bt #:bordeaux-threads)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:secp #:secp256k1-fast))
@@ -50,7 +51,7 @@
    #:sc-local-commitment-number #:sc-remote-commitment-number
    #:channel-keys #:derive-channel-keys #:ck-pub
    #:ck-index #:ck-funding #:ck-revocation #:ck-payment #:ck-delayed #:ck-htlc #:ck-seed
-   #:node-error))
+   #:node-error #:pay-invoice #:node-router #:run-command-loop))
 
 (in-package #:cl-payments.node)
 
@@ -231,6 +232,13 @@
   ;; channels, whose peers run on two threads; without this, the outgoing send
   ;; races the incoming peer's next message over the same state.
   (htlc-lock (bt:make-recursive-lock "htlc"))
+  ;; The routing graph, as gossip describes it, and the payments WE originated:
+  ;; payment-hash hex -> payment.  Both are what the sending half needs and
+  ;; the forwarding half never did.
+  (router (gs:make-router))
+  (router-lock (bt:make-lock "router"))
+  (payments (make-hash-table :test 'equal))
+  (origin-htlcs (make-hash-table :test 'equal))    ; (cid-hex . id) -> payment
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -969,7 +977,8 @@
   (with-live-channel (sc lc node payload "update_fulfill_htlc")
     (let ((h (lv:receive-fulfill lc payload)))
       (nlog node "update_fulfill_htlc ~d: preimage verified" (lv:hr-id h))
-      (relay-resolution node sc (lv:hr-id h) :fulfill :preimage (lv:hr-preimage h)))))
+      (relay-resolution node sc (lv:hr-id h) :fulfill :preimage (lv:hr-preimage h))
+      (resolve-origin node sc (lv:hr-id h) :fulfill :preimage (lv:hr-preimage h)))))
 
 (defun handle-update-fail (node peer payload)
   (declare (ignore peer))
@@ -979,7 +988,8 @@
            (reason (w:r-varbytes r)))
       (lv:receive-fail lc id)
       (nlog node "update_fail_htlc ~d" id)
-      (relay-resolution node sc id :fail :reason reason))))
+      (relay-resolution node sc id :fail :reason reason)
+      (resolve-origin node sc id :fail :reason reason))))
 
 (defun handle-update-fail-malformed (node peer payload)
   (declare (ignore peer))
@@ -990,7 +1000,8 @@
       (let ((code (w:r-u16 r)))
         (lv:receive-fail lc id)
         (nlog node "update_fail_malformed_htlc ~d: failure code #x~x" id code)
-        (relay-resolution node sc id :malformed :malformed-code code)))))
+        (relay-resolution node sc id :malformed :malformed-code code)
+        (resolve-origin node sc id :malformed :malformed-code code)))))
 
 (defun handle-update-fee (node peer payload)
   (declare (ignore peer))
@@ -1023,6 +1034,239 @@
       (nlog node "closing_signed: their signature verifies — agreed, closing tx ~a"
             (bw:hash->hex (btx:tx-txid tx))))))
 
+
+;;; ----------------------------------------------------------------------------
+;;; Gossip: keep the graph
+;;;
+;;; The forwarding half could ignore gossip — a forwarding node is told where
+;;; to send by the onion.  A SENDING node has to choose, and can only choose
+;;; among channels it has heard of.
+;;; ----------------------------------------------------------------------------
+
+(defun ingest-gossip (node type payload)
+  (bt:with-lock-held ((node-router-lock node))
+    (gs:ingest (node-router node) type payload)))
+
+(defun request-gossip (node peer)
+  "Ask a freshly connected peer for its whole graph.  A peer that has not been
+   asked forwards only NEW gossip, and a quiet network then looks like an empty
+   one."
+  (declare (ignore node))
+  (ignore-errors
+   (p:send-message peer gs:+msg-gossip-timestamp-filter+
+                   (gs:encode-gossip-timestamp-filter (w:chain-hash)))))
+
+;;; ----------------------------------------------------------------------------
+;;; Paying
+;;; ----------------------------------------------------------------------------
+
+(defstruct (payment (:conc-name pay-))
+  payment-hash amount-msat decoded      ; DECODED, not INVOICE: pay-invoice is the function
+  hops shared-secrets
+  sc htlc-id                ; the HTLC we offered, and on which channel
+  (status :pending) preimage failure
+  result-path               ; where to write the outcome, if a command asked
+  bolt11 height exclude attempt)   ; enough to try again around a failed channel
+
+(defun own-edges (node)
+  "Our live channels as edges FROM us.  Gossip may or may not have relayed our
+   own announcements back to us; either way we know these better — the
+   capacity is our actual spendable balance, not an advertised maximum."
+  (let ((out '()))
+    (maphash (lambda (k sc) (declare (ignore k))
+               (let ((lc (sc-live sc)))
+                 (when (and lc (sc-scid sc) (not (lv:live-closed-p lc))
+                            (gethash (%hex (sc-peer-id sc)) (node-peers node)))
+                   (push (rt:make-edge :from (node-id node) :to (sc-peer-id sc) :scid (sc-scid sc)
+                                       :policy (fw:make-policy)
+                                       :capacity-msat (lv:live-local-balance-msat lc))
+                         out))))
+             (node-channels node))
+    out))
+
+(defun all-edges (node)
+  "Our own channels as WE know them, plus everyone else's as gossip describes
+   them.  Gossip's edges out of our own node are dropped: they include channels
+   we announced but cannot use (the script-opened ones with no live state), and
+   for the rest they would only duplicate what own-edges says with less
+   information."
+  (append (own-edges node)
+          (remove-if (lambda (e) (equalp (c:octets (rt:edge-from e)) (c:octets (node-id node))))
+                     (bt:with-lock-held ((node-router-lock node))
+                       (rt:router-edges (node-router node))))))
+
+(defun write-result (payment)
+  (when (pay-result-path payment)
+    (ignore-errors
+     (with-open-file (s (pay-result-path payment) :direction :output :if-exists :supersede)
+       (let ((*print-pretty* nil))
+         (prin1 (list :status (pay-status payment)
+                      :payment-hash (%hex (pay-payment-hash payment))
+                      :amount-msat (pay-amount-msat payment)
+                      :fee-msat (and (pay-hops payment)
+                                     (rt:total-fee-msat (pay-hops payment) (pay-amount-msat payment)))
+                      :hops (length (pay-hops payment))
+                      :preimage (and (pay-preimage payment) (%hex (pay-preimage payment)))
+                      :failure (pay-failure payment))
+                s)
+         (terpri s))))))
+
+(defconstant +max-payment-attempts+ 5)
+
+(defun pay-invoice (node bolt11 &key current-height result-path (amount-msat nil))
+  "Pay an invoice: decode it, find a route, build the onion, offer the HTLC.
+   Returns the payment record; the outcome arrives later, on the channel the
+   HTLC went out on, as a fulfil or a failure — and a TRANSIENT failure that
+   names a channel leads to another attempt around it."
+  (attempt-payment node bolt11 :current-height current-height :result-path result-path
+                               :amount-msat amount-msat :exclude '() :attempt 1))
+
+(defun attempt-payment (node bolt11 &key current-height result-path amount-msat exclude attempt)
+  (let* ((invoice (inv:decode-invoice bolt11))
+         (amount (or (inv:inv-amount-msat invoice) amount-msat
+                     (error 'node-error :detail "invoice has no amount and none was given")))
+         (hash (inv:inv-payment-hash invoice)))
+    (unless (eq (inv:inv-network invoice) (w:net-name w:*network*))
+      (error 'node-error :detail (format nil "invoice is for ~a, we are on ~a"
+                                         (inv:inv-network invoice) (w:net-name w:*network*))))
+    (when (inv:inv-expired-p invoice) (error 'node-error :detail "invoice has expired"))
+    (unless current-height (error 'node-error :detail "need the current block height"))
+    (bt:with-recursive-lock-held ((node-htlc-lock node))
+      (let* ((hops (rt:find-route (all-edges node) (node-id node) (inv:inv-payee invoice) amount
+                                  :final-cltv-delta (inv:inv-min-final-cltv-expiry-delta invoice)
+                                  :current-height current-height :exclude exclude))
+             (first-hop (first hops))
+             (out-sc (find-outgoing node (rt:hop-scid first-hop)))
+             (out-peer (and out-sc (gethash (%hex (sc-peer-id out-sc)) (node-peers node)))))
+        (unless (and out-sc out-peer)
+          (error 'node-error :detail "route's first hop is not one of our connected channels"))
+        ;; One payload per hop.  Node i's payload says what node i+1 must
+        ;; receive and over which channel; the last says it is the recipient.
+        (let* ((payloads
+                 (loop for (h next) on hops
+                       collect (on:encode-hop-payload
+                                (if next
+                                    (on:make-hop-payload :amount-msat (rt:hop-amount-msat next)
+                                                         :cltv-expiry (rt:hop-cltv-expiry next)
+                                                         :scid (rt:hop-scid next))
+                                    (on:make-hop-payload :amount-msat (rt:hop-amount-msat h)
+                                                         :cltv-expiry (rt:hop-cltv-expiry h)
+                                                         :payment-secret (inv:inv-payment-secret invoice)
+                                                         :total-msat amount)))))
+               (session-key (c:generate-key)))
+          (multiple-value-bind (onion secrets)
+              (on:create-onion session-key (mapcar #'rt:hop-node hops) payloads hash)
+            (let* ((lc (sc-live out-sc))
+                   (msg (lv:send-add lc (rt:hop-amount-msat first-hop) hash
+                                     (rt:hop-cltv-expiry first-hop) onion))
+                   (id (1- (lv:live-next-htlc-id lc)))
+                   (payment (make-payment :payment-hash hash :amount-msat amount :decoded invoice
+                                          :hops hops :shared-secrets secrets
+                                          :sc out-sc :htlc-id id :result-path result-path
+                                          :bolt11 bolt11 :height current-height
+                                          :exclude exclude :attempt attempt)))
+              (setf (gethash (%hex hash) (node-payments node)) payment
+                    (gethash (cons (%hex (sc-channel-id out-sc)) id) (node-origin-htlcs node)) payment)
+              (p:send-message out-peer msg nil)
+              (nlog node "paying ~d msat to ~a (attempt ~d): ~{~a~^ -> ~}, fee ~d msat, HTLC ~d~@[, excluding ~{~a~^ ~}~]"
+                    amount (subseq (%hex (inv:inv-payee invoice)) 0 16) attempt
+                    (mapcar (lambda (h) (gs:scid-string (rt:hop-scid h))) hops)
+                    (rt:total-fee-msat hops amount) id
+                    (mapcar #'gs:scid-string exclude))
+              (write-result payment)
+              (maybe-commit node out-peer out-sc)
+              (save-channels node)
+              payment)))))))
+
+(defun resolve-origin (node sc id kind &key preimage reason malformed-code)
+  "An HTLC WE offered was resolved.  Was it a payment of ours?"
+  (let* ((key (cons (%hex (sc-channel-id sc)) id))
+         (payment (gethash key (node-origin-htlcs node))))
+    (when payment
+      (remhash key (node-origin-htlcs node))
+      (ecase kind
+        (:fulfill
+         (setf (pay-status payment) :complete (pay-preimage payment) preimage)
+         (nlog node "  PAYMENT COMPLETE: ~d msat, preimage ~a"
+               (pay-amount-msat payment) (subseq (%hex preimage) 0 16)))
+        (:fail
+         (multiple-value-bind (hop failure) (on:decrypt-failure-packet (pay-shared-secrets payment) reason)
+           (let* ((code (and failure (on:parse-failure-message failure)))
+                  ;; The channel hop I was asked to forward over is hop I+1's.
+                  (blamed (and hop (< (1+ hop) (length (pay-hops payment)))
+                               (rt:hop-scid (nth (1+ hop) (pay-hops payment)))))
+                  (retry-p (and code blamed
+                                (not (fw:failure-permanent-p code))
+                                (< (pay-attempt payment) +max-payment-attempts+))))
+             (setf (pay-failure payment) (if hop
+                                             (list :hop hop :code (and code (fw:failure-name code))
+                                                   :node (%hex (rt:hop-node (nth hop (pay-hops payment)))))
+                                             (list :unreadable t)))
+             (cond
+               (retry-p
+                ;; A transient failure names a channel that would not carry the
+                ;; payment right now.  Gossip could not have told us that; a
+                ;; retry around it is the only way to learn it.
+                (nlog node "  attempt ~d failed at hop ~d (~(~a~)) — retrying without ~a"
+                      (pay-attempt payment) hop (fw:failure-name code) (gs:scid-string blamed))
+                (handler-case
+                    (attempt-payment node (pay-bolt11 payment)
+                                     :current-height (pay-height payment)
+                                     :result-path (pay-result-path payment)
+                                     :amount-msat (pay-amount-msat payment)
+                                     :exclude (cons blamed (pay-exclude payment))
+                                     :attempt (1+ (pay-attempt payment)))
+                  (error (e)
+                    (setf (pay-status payment) :failed
+                          (pay-failure payment) (append (pay-failure payment) (list :then (princ-to-string e))))
+                    (nlog node "  PAYMENT FAILED: ~a" (pay-failure payment))
+                    (write-result payment))))
+               (t
+                (setf (pay-status payment) :failed)
+                (nlog node "  PAYMENT FAILED: ~a" (pay-failure payment)))))))
+        (:malformed
+         (setf (pay-status payment) :failed
+               (pay-failure payment) (list :hop 0 :code :bad-onion :failure-code malformed-code))
+         (nlog node "  PAYMENT FAILED: first hop could not read our onion (#x~x)" malformed-code)))
+      (unless (and (eq kind :fail) (eq (pay-status payment) :pending))
+        (write-result payment)))))
+
+;;; ----------------------------------------------------------------------------
+;;; Commands
+;;;
+;;; The daemon has no RPC.  It watches <dir>/commands/ for files containing one
+;;; form and writes the outcome beside them.  Enough to drive it from a shell,
+;;; without inventing a protocol before there is a need for one.
+;;; ----------------------------------------------------------------------------
+
+(defun run-command-loop (node)
+  (let ((dir (merge-pathnames "commands/" (node-dir node))))
+    (ensure-directories-exist dir)
+    (loop
+      (dolist (f (directory (merge-pathnames "*.cmd" dir)))
+        (let* ((form (handler-case (with-open-file (s f) (read s)) (error () nil)))
+               (result (make-pathname :type "result" :defaults f)))
+          (delete-file f)
+          (handler-case
+              (ecase (first form)
+                (:pay (pay-invoice node (getf (rest form) :bolt11)
+                                   :current-height (getf (rest form) :height)
+                                   :amount-msat (getf (rest form) :amount-msat)
+                                   :result-path result))
+                (:graph
+                 (with-open-file (s result :direction :output :if-exists :supersede)
+                   (bt:with-lock-held ((node-router-lock node))
+                     (format s "(:channels ~d :nodes ~d :edges ~d :own ~d)~%"
+                             (gs:router-channel-count (node-router node))
+                             (gs:router-node-count (node-router node))
+                             (length (rt:router-edges (node-router node)))
+                             (length (own-edges node)))))))
+            (error (e)
+              (nlog node "command ~a failed: ~a" (first form) e)
+              (with-open-file (s result :direction :output :if-exists :supersede)
+                (format s "(:status :error :message ~s)~%" (princ-to-string e)))))))
+      (sleep 0.5))))
+
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+
         (lambda (pr payload) (handle-open-channel node pr payload)))
@@ -1044,10 +1288,9 @@
   (p:on peer u:+msg-update-fee+ (lambda (pr pl) (handle-update-fee node pr pl)))
   (p:on peer lv::+msg-shutdown+ (lambda (pr pl) (handle-shutdown node pr pl)))
   (p:on peer lv::+msg-closing-signed+ (lambda (pr pl) (handle-closing-signed node pr pl)))
-  ;; Gossip is accepted and ignored for now; the point of logging it is that a
-  ;; silent daemon is indistinguishable from a wedged one.
-  (p:on peer gs:+msg-channel-announcement+ (lambda (pr pl) (declare (ignore pr pl)) nil))
-  (p:on peer gs:+msg-channel-update+ (lambda (pr pl) (declare (ignore pr pl)) nil)))
+  (dolist (ty (list gs:+msg-channel-announcement+ gs:+msg-channel-update+ gs:+msg-node-announcement+))
+    (let ((type ty))
+      (p:on peer type (lambda (pr pl) (declare (ignore pr)) (ingest-gossip node type pl))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Connections
@@ -1077,6 +1320,7 @@
               (subseq (%hex (p:peer-node-id peer)) 0 16)
               (length (channels-with node (p:peer-node-id peer))))
         (readvertise node peer)
+        (request-gossip node peer)
         (unwind-protect (p:run-read-loop peer)
           (unregister-peer node peer)
           (nlog node "peer ~a disconnected" (subseq (%hex (p:peer-node-id peer)) 0 16))))
@@ -1099,6 +1343,7 @@
       (register-peer node peer)
       (nlog node "connected to ~a" (subseq (%hex node-id) 0 16))
       (readvertise node peer)
+      (request-gossip node peer)
       (if keep-alive
           (unwind-protect (p:run-read-loop peer)
             (unregister-peer node peer))

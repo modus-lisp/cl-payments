@@ -33,6 +33,10 @@
                      :direction :output :if-exists :supersede)
     (format s "~d~%" (sb-posix:getpid)))
   (cl-payments.node:start node)
+  ;; Commands arrive as files; see RUN-COMMAND-LOOP.  Its own thread, so the
+  ;; main one stays free to keep the process alive.
+  (bordeaux-threads:make-thread (lambda () (cl-payments.node:run-command-loop node))
+                                :name "clp-commands")
   (let ((uri (env "CLP_CONNECT")))
     (when uri
       ;; Dial on its OWN thread: this one has to stay free to keep the process
