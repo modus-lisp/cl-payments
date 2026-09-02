@@ -49,6 +49,11 @@ run_gate "loopback" "$SBCL" --non-interactive \
   --load inspect/loopback-test.lisp \
   --eval '(unless (loopback-test:run) (sb-ext:exit :code 1))'
 
+# Own process: two daemons over TCP, threads and all.
+run_gate "daemon" "$SBCL" --non-interactive \
+  --load inspect/daemon-test.lisp \
+  --eval '(unless (daemon-test:run) (sb-ext:exit :code 1))'
+
 echo "== $pass passed, $fail failed =="
 if [ "$fail" -gt 0 ]; then
   echo "failed: ${failed[*]}"

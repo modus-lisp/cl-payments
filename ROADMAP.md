@@ -516,6 +516,37 @@ penalises us — the one test that is genuinely dangerous anywhere but here.
 
 ---
 
+## Testing, and what each layer of it can see
+
+Three offline gates, all in CI, every new check mutation-verified before it
+counts:
+
+- **vectors** — every module against the spec's own numbers (BOLT #3, #4, #8,
+  #11 vectors reproduce byte for byte) and against properties the spec states.
+- **loopback** — the transport and peer stack against itself over a real socket.
+- **daemon** — two `node` instances in one process over TCP, real threads: open,
+  lock in, pay each way, fail an unknown hash and read the reason, close, reload
+  from disk. This is the gate that checks `node.lisp`'s wiring — which message
+  triggers which reply, on which thread, under which lock — the code that until
+  it existed was checked only by watching a session against Core Lightning.
+
+What offline gates cannot see is a *symmetric* mistake: both ends of a
+two-party test making the same error still agree with each other. Mutation
+testing found exactly one of those (which side's revocation basepoint guards a
+commitment) and it now has a direct property check. Everything else of that
+kind is caught by the fourth layer:
+
+- **`integration.sh`** on the devnet — the whole cl-payments story against Core
+  Lightning and LND, pass/fail per step: accept an open, get announced, receive
+  with the onion read, forward, relay a failure, pay both implementations,
+  cooperative close. Not in CI (it needs bitcoind, CLN and LND), but it turns
+  "worked when I watched it" into something anyone re-runs in a minute.
+
+The daemon gate found a real bug on its first run: secp256k1-fast's entry
+points ran on shared scratch buffers unless the caller remembered to wrap them,
+and two daemons deriving keys on several threads produced the point at infinity.
+The library's entry points now bind their own scratch (`b691fdd`, pushed).
+
 ## Non-goals (for now)
 
 Watchtowers, dual funding, splicing, BOLT #12 offers, trampoline routing. Each is

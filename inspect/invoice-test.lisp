@@ -116,6 +116,22 @@
         (check (format nil "~d msat round-trips through the hrp" msat)
                (= msat (inv::parse-amount (inv::format-amount msat))))))
 
+    ;; Many keys, not one: the recovery id is right for about half of all
+    ;; signatures if taken naively from the signer, and a single fixed key
+    ;; passes or fails by luck.  Sixteen keys make luck unlikely enough.
+    (with-gate ("invoice: signatures recover to the signer for many keys")
+      (loop for i from 1 to 16
+            do (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "invoice-test/many/~d" i)))))
+                      (inv (inv:sign-invoice
+                            (inv::make-invoice-for :network :signet :amount-msat (* i 1000)
+                                                   :payment-hash (c:sha256 (c:ascii->bytes (format nil "h~d" i)))
+                                                   :payment-secret (c:sha256 (c:ascii->bytes (format nil "s~d" i)))
+                                                   :description "k" :timestamp (+ 1756000000 i))
+                            k))
+                      (back (inv:decode-invoice (inv:encode-invoice inv))))
+                 (check (format nil "key ~d recovers to its signer" i)
+                        (equalp (inv:inv-payee back) (c:compressed-pubkey (c:pubkey-of k)))))))
+
     (with-gate ("invoice: we produce invoices we can decode, signed by our key")
       (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes "invoice-test/key"))))
              (pre (c:sha256 (c:ascii->bytes "invoice-test/preimage")))
@@ -136,6 +152,13 @@
         (check-equal "description round-trips" (inv:inv-description back) "cl-payments test")
         (check-equal "expiry round-trips" (inv:inv-expiry back) 600)
         (check-equal "min_final_cltv round-trips" (inv:inv-min-final-cltv-expiry-delta back) 40)
+        ;; A recovery id outside 0..3 must be refused outright, not masked
+        ;; down to one of them — the same signature bytes with a different id
+        ;; would otherwise decode to a different, valid-looking payee.
+        (let ((bad-id (copy-structure inv)))
+          (setf (inv:inv-recovery-id bad-id) 5)
+          (check-signals "recovery id 5 is refused" inv:invoice-error
+                         (inv:decode-invoice (inv:encode-invoice bad-id))))
         ;; Tamper with one data character: the checksum or the signature must catch it.
         (let ((bad (copy-seq str)))
           (setf (char bad 30) (if (char= (char bad 30) #\q) #\p #\q))

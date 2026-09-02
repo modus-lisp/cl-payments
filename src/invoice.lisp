@@ -322,12 +322,23 @@
 (defun sign-invoice (inv privkey)
   "Sign in place and return the invoice.  RFC 6979 makes this deterministic,
    which is what lets the spec's examples be reproduced exactly."
-  (let ((hash (signing-hash (hrp-of inv) (data-groups inv))))
+  (let ((hash (signing-hash (hrp-of inv) (data-groups inv)))
+        (ours (c:compressed-pubkey (c:pubkey-of privkey))))
     (multiple-value-bind (r s v) (secp:ecdsa-sign-raw privkey (c:octets hash))
-      (setf (inv-signature inv) (c:bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s))
-            (inv-recovery-id inv) v
-            (inv-payee inv) (c:compressed-pubkey (c:pubkey-of privkey)))
-      inv)))
+      (declare (ignore v))
+      ;; The recovery id is found by RECOVERING, not taken from the signer.
+      ;; A signer that computes it before low-S normalisation is wrong for
+      ;; every signature it flips — half of them — and an invoice with the
+      ;; wrong id decodes to a different, perfectly valid-looking payee.  Trying
+      ;; both ids against our own key costs two point multiplications and
+      ;; cannot be wrong.
+      (let ((recid (loop for id in '(0 1 2 3)
+                         when (equalp (recover-pubkey hash r s id) ours) return id
+                         finally (fail "could not find a recovery id for our own signature"))))
+        (setf (inv-signature inv) (c:bytes (secp:int-to-bytes32 r) (secp:int-to-bytes32 s))
+              (inv-recovery-id inv) recid
+              (inv-payee inv) ours)
+        inv))))
 
 (defun make-invoice-for (&key network amount-msat payment-hash payment-secret description
                              (timestamp (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))

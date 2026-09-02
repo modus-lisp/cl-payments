@@ -49,7 +49,7 @@
    #:live-local-commit-index #:live-remote-commit-index #:live-htlcs
    #:live-awaiting-revocation-p #:live-feerate-per-kw #:live-capacity-sat
    #:live-remote-shutdown-script #:live-local-shutdown-script #:live-closed-p
-   #:live-closing-txid #:live-pending-changes-p #:live-next-htlc-id
+   #:live-closing-txid #:live-pending-changes-p #:live-next-htlc-id #:live-opener
    #:htlc-rec #:hr-id #:hr-direction #:hr-amount-msat #:hr-payment-hash
    #:hr-cltv-expiry #:hr-resolution #:hr-preimage #:hr-onion
    #:local-spec #:remote-spec #:spec-to-local-msat #:spec-to-remote-msat #:spec-htlcs
@@ -58,6 +58,7 @@
    #:send-add #:receive-add
    #:send-fulfill #:receive-fulfill #:send-fail #:send-fail-malformed #:receive-fail #:receive-fee
    #:send-commit #:receive-commit #:receive-revocation
+   #:initial-commitment-signature #:verify-initial-commitment
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
    ;; closing
@@ -232,8 +233,10 @@
   tx htlc-outputs   ; htlc-outputs: list of (index htlc-rec witness-script), output order
   revocation-pubkey delayed-pubkey to-self-delay feerate)
 
-(defun %build (lc spec &key ours point)
-  "Build the commitment described by SPEC.  OURS says whose commitment it is."
+(defun %build (lc spec &key ours point index)
+  "Build the commitment described by SPEC.  OURS says whose commitment it is;
+   INDEX overrides the commitment number (the funding handshake signs number 0
+   before any cycle has run)."
   (let* ((rev-base   (if ours (live-remote-revocation-basepoint lc) (pub (live-revocation-priv lc))))
          (del-base   (if ours (pub (live-delayed-priv lc)) (live-remote-delayed-basepoint lc)))
          (own-htlc-base   (if ours (pub (live-htlc-priv lc)) (live-remote-htlc-basepoint lc)))
@@ -258,7 +261,7 @@
         (m:build-commitment
          :funding-txid (live-funding-txid lc) :funding-output-index (live-funding-index lc)
          :funding-amount-sat (live-capacity-sat lc)
-         :commitment-number (if ours (1+ (live-local-commit-index lc)) (1+ (live-remote-commit-index lc)))
+         :commitment-number (or index (if ours (1+ (live-local-commit-index lc)) (1+ (live-remote-commit-index lc))))
          :obscuring (m:obscuring-factor
                      (if (eq (live-opener lc) :local) (pub (live-payment-priv lc)) (live-remote-payment-basepoint lc))
                      (if (eq (live-opener lc) :local) (live-remote-payment-basepoint lc) (pub (live-payment-priv lc))))
@@ -460,6 +463,22 @@
      (u:make-commitment-signed :channel-id (live-channel-id lc) :signature sig
                                :htlc-signatures htlc-sigs))))
 
+(defun initial-commitment-signature (lc)
+  "The opener's signature over the accepter's commitment 0 — what
+   funding_created carries.  Built from the remote spec exactly as the funding
+   handshake leaves it, at their FIRST per-commitment point."
+  (let ((built (%build lc (live-remote-spec lc) :ours nil :point (live-remote-current-point lc) :index 0)))
+    (m:sign-commitment (b-tx built) (live-funding-priv lc) (pub (live-funding-priv lc))
+                       (live-remote-funding-pubkey lc) (live-capacity-sat lc))))
+
+(defun verify-initial-commitment (lc sig)
+  "Their signature over OUR commitment 0 — funding_signed for the opener,
+   funding_created for the accepter.  Without it the funding output is a 2-of-2
+   we can never spend alone."
+  (let ((built (%build lc (live-local-spec lc) :ours t :point (local-point lc 0) :index 0)))
+    (m:verify-commitment (b-tx built) sig (pub (live-funding-priv lc)) (live-remote-funding-pubkey lc)
+                         (live-capacity-sat lc) (live-remote-funding-pubkey lc))))
+
 (defun receive-commit (lc msg)
   "They signed OUR next commitment.  Verify every signature, then — and only
    then — revoke the previous one.  Returns the revoke_and_ack message.
@@ -646,6 +665,9 @@
   (let* ((tx (build-closing-tx lc fee-sat))
          (sig (m:sign-commitment tx (live-funding-priv lc) (pub (live-funding-priv lc))
                                  (live-remote-funding-pubkey lc) (live-capacity-sat lc))))
+    ;; Proposing IS committing: the transaction is signed and may be broadcast
+    ;; by the peer the moment it agrees.
+    (setf (live-closed-p lc) t (live-closing-txid lc) (btx:tx-txid tx))
     (values (encode-closing-signed (live-channel-id lc) fee-sat sig :min-fee fee-sat :max-fee fee-sat)
             tx sig)))
 

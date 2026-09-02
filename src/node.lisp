@@ -51,7 +51,9 @@
    #:sc-local-commitment-number #:sc-remote-commitment-number
    #:channel-keys #:derive-channel-keys #:ck-pub
    #:ck-index #:ck-funding #:ck-revocation #:ck-payment #:ck-delayed #:ck-htlc #:ck-seed
-   #:node-error #:pay-invoice #:node-router #:run-command-loop))
+   #:node-error #:pay-invoice #:node-router #:run-command-loop
+   #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
+   #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
 
@@ -144,6 +146,7 @@
   "Write the channel table.  Written to a temporary file and renamed, so a crash
    mid-write leaves the previous good file rather than a truncated one — losing
    channel state is losing the ability to claim your own money."
+  (bt:with-lock-held ((node-save-lock node))
   (let* ((path (merge-pathnames "channels.sexp" (node-dir node)))
          (tmp (merge-pathnames "channels.sexp.tmp" (node-dir node))))
     (with-open-file (s tmp :direction :output :if-exists :supersede)
@@ -176,7 +179,7 @@
                    (terpri s))
                  (node-channels node))))
     (rename-file tmp path)
-    path))
+    path)))
 
 (defun load-channels (node)
   (let ((path (merge-pathnames "channels.sexp" (node-dir node))))
@@ -239,6 +242,10 @@
   (router-lock (bt:make-lock "router"))
   (payments (make-hash-table :test 'equal))
   (origin-htlcs (make-hash-table :test 'equal))    ; (cid-hex . id) -> payment
+  ;; Persisting is temp-file-and-rename, which is atomic against a crash and
+  ;; not at all against a second thread doing the same thing: two writers race
+  ;; on the temp file and one of them renames what the other just deleted.
+  (save-lock (bt:make-lock "save"))
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -494,7 +501,10 @@
 ;;; ----------------------------------------------------------------------------
 
 (defstruct (pending-open (:conc-name po-))
-  temporary-channel-id keys open-msg)
+  temporary-channel-id keys open-msg
+  ;; the opener's side of the handshake
+  (role :accepter) funding-sat push-msat fund-fn broadcast-fn channel-id
+  funding-txid funding-index accept-msg live)
 
 (defun next-key-index (node)
   "One past the highest index in use.  Reusing an index reuses a funding key
@@ -1025,14 +1035,18 @@
     (nlog node "shutdown received for ~a" (gs:scid-string (or (sc-scid sc) (gs:make-scid 0 0 0))))
     (unless (lv:live-local-shutdown-script lc)
       (p:send-message peer (lv:send-shutdown lc (our-shutdown-script node sc)) nil)
-      (nlog node "  our shutdown sent"))))
+      (nlog node "  our shutdown sent"))
+    (maybe-propose-close node peer sc)))
 
 (defun handle-closing-signed (node peer payload)
   (with-live-channel (sc lc node payload "closing_signed")
-    (multiple-value-bind (reply tx) (lv:receive-closing-signed lc payload)
-      (p:send-message peer reply nil)
-      (nlog node "closing_signed: their signature verifies — agreed, closing tx ~a"
-            (bw:hash->hex (btx:tx-txid tx))))))
+    (let ((already (lv:live-closed-p lc)))
+      (multiple-value-bind (reply tx) (lv:receive-closing-signed lc payload)
+        ;; If we PROPOSED, their closing_signed is the agreement, and answering
+        ;; it would start a second round.  Verify and stop.
+        (unless already (p:send-message peer reply nil))
+        (nlog node "closing_signed: their signature verifies — ~a, closing tx ~a"
+              (if already "agreed to our proposal" "agreed") (bw:hash->hex (btx:tx-txid tx)))))))
 
 
 ;;; ----------------------------------------------------------------------------
@@ -1267,11 +1281,189 @@
                 (format s "(:status :error :message ~s)~%" (princ-to-string e)))))))
       (sleep 0.5))))
 
+
+;;; ----------------------------------------------------------------------------
+;;; Opening a channel, from the daemon
+;;;
+;;; The script that opened channels until now ran the same handshake with
+;;; bitcoind on the other end of a shell pipe.  Here the funding transaction is
+;;; whatever FUND-FN returns: the daemon-to-daemon test fabricates one, and the
+;;; devnet builds one with bitcoin-cli.  What the daemon insists on is the
+;;; ORDER — the transaction is not broadcast until the peer has signed our
+;;; first commitment — because broadcasting first hands the peer a funding
+;;; output we can never spend alone.
+;;; ----------------------------------------------------------------------------
+
+(defun open-channel-to (node peer-id funding-sat &key (push-msat 0) fund-fn (announce t))
+  "Start a channel with a connected peer.  FUND-FN receives the funding
+   witness script and returns (values txid output-index broadcast-fn); the
+   transaction must exist but must NOT be broadcast until BROADCAST-FN is
+   called.  Returns the temporary channel id."
+  (let* ((peer (or (gethash (%hex peer-id) (node-peers node))
+                   (error 'node-error :detail "peer is not connected")))
+         (index (next-key-index node))
+         (keys (derive-channel-keys (node-privkey node) index))
+         (temp-id (c:octets (ironclad:random-data 32))))
+    (bt:with-recursive-lock-held ((node-htlc-lock node))
+      (setf (gethash (%hex temp-id) (node-pending node))
+            (make-pending-open :temporary-channel-id temp-id :keys keys :role :opener
+                               :funding-sat funding-sat :push-msat push-msat :fund-fn fund-fn))
+      (p:send-message
+       peer
+       (ch:encode-open-channel
+        (ch:make-open-channel
+         :chain-hash (w:chain-hash) :temporary-channel-id temp-id
+         :funding-satoshis funding-sat :push-msat push-msat
+         :dust-limit-satoshis 546 :max-htlc-value-in-flight-msat (* funding-sat 1000)
+         :channel-reserve-satoshis (max 546 (floor funding-sat 100)) :htlc-minimum-msat 1
+         :feerate-per-kw 2500 :to-self-delay 144 :max-accepted-htlcs 30
+         :funding-pubkey (ck-pub (ck-funding keys))
+         :revocation-basepoint (ck-pub (ck-revocation keys))
+         :payment-basepoint (ck-pub (ck-payment keys))
+         :delayed-payment-basepoint (ck-pub (ck-delayed keys))
+         :htlc-basepoint (ck-pub (ck-htlc keys))
+         :first-per-commitment-point (k:per-commitment-point (ck-seed keys) k:+max-commitment-index+)
+         :channel-flags (if announce 1 0)))
+       nil)
+      (nlog node "open_channel sent to ~a: ~d sat, ~d msat pushed (key index ~d)"
+            (subseq (%hex peer-id) 0 16) funding-sat push-msat index)
+      temp-id)))
+
+(defun handle-accept-channel (node peer payload)
+  "They accepted.  Build the funding transaction, sign THEIR first commitment,
+   send funding_created — and keep the transaction to ourselves."
+  (handler-case
+      (let* ((ac (ch:parse-accept-channel payload))
+             (po (gethash (%hex (ch:ac-temporary-channel-id ac)) (node-pending node))))
+        (unless (and po (eq (po-role po) :opener))
+          (nlog node "accept_channel for a channel we did not open — ignoring")
+          (return-from handle-accept-channel nil))
+        (let* ((keys (po-keys po))
+               (funding-sat (po-funding-sat po)) (push (po-push-msat po))
+               (script (m:funding-script (ck-pub (ck-funding keys)) (ch:ac-funding-pubkey ac))))
+          (multiple-value-bind (txid index broadcast-fn) (funcall (po-fund-fn po) script)
+            (let* ((cid (ch:channel-id txid index))
+                   (lc (lv:make-live
+                        :channel-id cid :funding-txid txid :funding-index index
+                        :capacity-sat funding-sat :opener :local
+                        :funding-priv (ck-funding keys) :revocation-priv (ck-revocation keys)
+                        :payment-priv (ck-payment keys) :delayed-priv (ck-delayed keys)
+                        :htlc-priv (ck-htlc keys) :seed (ck-seed keys)
+                        :remote-funding-pubkey (ch:ac-funding-pubkey ac)
+                        :remote-revocation-basepoint (ch:ac-revocation-basepoint ac)
+                        :remote-payment-basepoint (ch:ac-payment-basepoint ac)
+                        :remote-delayed-basepoint (ch:ac-delayed-payment-basepoint ac)
+                        :remote-htlc-basepoint (ch:ac-htlc-basepoint ac)
+                        :local-dust-limit 546 :remote-dust-limit (ch:ac-dust-limit-satoshis ac)
+                        ;; They chose the delay on OUR to_local; we chose theirs.
+                        :local-to-self-delay (ch:ac-to-self-delay ac) :remote-to-self-delay 144
+                        :feerate-per-kw 2500
+                        :local-msat (- (* funding-sat 1000) push) :remote-msat push
+                        :remote-first-point (ch:ac-first-per-commitment-point ac)))
+                   (sig (lv:initial-commitment-signature lc)))
+              (setf (po-accept-msg po) ac (po-live po) lc (po-channel-id po) cid
+                    (po-funding-txid po) txid (po-funding-index po) index
+                    (po-broadcast-fn po) broadcast-fn)
+              ;; Re-key the pending entry by the real channel id: funding_signed
+              ;; will name that, not the temporary one.
+              (remhash (%hex (ch:ac-temporary-channel-id ac)) (node-pending node))
+              (setf (gethash (%hex cid) (node-pending node)) po)
+              (p:send-message
+               peer
+               (ch:encode-funding-created
+                (ch:make-funding-created :temporary-channel-id (ch:ac-temporary-channel-id ac)
+                                         :funding-txid txid :funding-output-index index
+                                         :signature sig))
+               nil)
+              (nlog node "  accept_channel: funding ~a:~d, their commitment signed — funding_created sent"
+                    (subseq (%hex txid) 0 16) index)))))
+    (error (e) (nlog node "bad accept_channel: ~a" e))))
+
+(defun handle-funding-signed (node peer payload)
+  "Their signature over OUR first commitment.  Only once it verifies is the
+   funding transaction allowed out of the building."
+  (handler-case
+      (let* ((fs (ch:parse-funding-signed payload))
+             (cid (ch:fs-channel-id fs))
+             (po (gethash (%hex cid) (node-pending node))))
+        (unless (and po (eq (po-role po) :opener) (po-live po))
+          (nlog node "funding_signed for an unknown channel — ignoring")
+          (return-from handle-funding-signed nil))
+        (let ((lc (po-live po)))
+          (unless (lv:verify-initial-commitment lc (ch:fs-signature fs))
+            (nlog node "  funding_signed: their signature over our commitment does NOT verify — abandoning")
+            (remhash (%hex cid) (node-pending node))
+            (return-from handle-funding-signed nil))
+          (remhash (%hex cid) (node-pending node))
+          (setf (gethash (%hex cid) (node-channels node))
+                (make-stored-channel
+                 :channel-id cid :peer-id (p:peer-node-id peer)
+                 :funding-txid (po-funding-txid po) :funding-index (po-funding-index po)
+                 :capacity-sat (po-funding-sat po)
+                 :local-msat (lv:live-local-balance-msat lc) :remote-msat (lv:live-remote-balance-msat lc)
+                 :key-index (ck-index (po-keys po))
+                 :remote-funding-pubkey (ch:ac-funding-pubkey (po-accept-msg po))
+                 :live lc))
+          (save-channels node)
+          (nlog node "  funding_signed verified — channel ~a is ours to fund" (subseq (%hex cid) 0 16))
+          (when (po-broadcast-fn po)
+            (funcall (po-broadcast-fn po))
+            (nlog node "  funding transaction broadcast"))))
+    (error (e) (nlog node "bad funding_signed: ~a" e))))
+
+(defun funding-confirmed (node channel-id &key scid)
+  "The funding transaction has enough confirmations: tell the peer with
+   channel_ready.  Called by whoever watches the chain — a test, the devnet
+   script, and eventually Phase 8."
+  (let* ((sc (gethash (%hex channel-id) (node-channels node)))
+         (peer (and sc (gethash (%hex (sc-peer-id sc)) (node-peers node)))))
+    (unless (and sc peer) (error 'node-error :detail "no such live channel with a connected peer"))
+    (when scid (setf (sc-scid sc) scid))
+    (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+      (p:send-message
+       peer
+       (ch:encode-channel-ready
+        (ch:make-channel-ready :channel-id channel-id
+                               :second-per-commitment-point
+                               (k:per-commitment-point (ck-seed keys) (1- k:+max-commitment-index+))))
+       nil)
+      (save-channels node)
+      (nlog node "channel_ready sent for ~a" (subseq (%hex channel-id) 0 16)))))
+
+(defun close-channel (node channel-id)
+  "Begin a cooperative close: send shutdown.  The rest follows from the peer's
+   shutdown — see HANDLE-SHUTDOWN — and, if we opened, our closing_signed."
+  (let* ((sc (gethash (%hex channel-id) (node-channels node)))
+         (peer (and sc (gethash (%hex (sc-peer-id sc)) (node-peers node)))))
+    (unless (and sc (sc-live sc) peer) (error 'node-error :detail "no such live channel with a connected peer"))
+    (bt:with-recursive-lock-held ((node-htlc-lock node))
+      (p:send-message peer (lv:send-shutdown (sc-live sc) (our-shutdown-script node sc)) nil)
+      (save-channels node)
+      (nlog node "shutdown sent for ~a" (subseq (%hex channel-id) 0 16)))))
+
+(defconstant +closing-fee-sat+ 1000)
+
+(defun maybe-propose-close (node peer sc)
+  "Both shutdowns are in.  The OPENER proposes the fee — it pays it — and the
+   accepter only ever answers."
+  (let ((lc (sc-live sc)))
+    (when (and (eq (lv:live-opener lc) :local)
+               (lv:live-local-shutdown-script lc) (lv:live-remote-shutdown-script lc)
+               (not (lv:live-closed-p lc)) (null (lv:live-htlcs lc)))
+      (multiple-value-bind (msg tx) (lv:propose-close lc +closing-fee-sat+)
+        (p:send-message peer msg nil)
+        (nlog node "  closing_signed proposed at ~d sat — closing tx ~a"
+              +closing-fee-sat+ (bw:hash->hex (btx:tx-txid tx)))))))
+
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+
         (lambda (pr payload) (handle-open-channel node pr payload)))
   (p:on peer ch:+msg-funding-created+
         (lambda (pr payload) (handle-funding-created node pr payload)))
+  (p:on peer ch:+msg-accept-channel+
+        (lambda (pr payload) (handle-accept-channel node pr payload)))
+  (p:on peer ch:+msg-funding-signed+
+        (lambda (pr payload) (handle-funding-signed node pr payload)))
   (p:on peer u:+msg-channel-reestablish+
         (lambda (pr payload) (handle-reestablish node pr payload)))
   (p:on peer +msg-announcement-signatures+

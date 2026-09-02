@@ -206,6 +206,26 @@
                  (let ((bad (copy-seq sig-b))) (setf (aref bad 5) (logxor (aref bad 5) 1))
                    (not (spendable-p tx sig-a a-pub bad b-pub fscript cap))))))
 
+      ;; A property check, because the two-party cycle cannot see it: if BOTH
+      ;; ends put the wrong side's revocation basepoint into a commitment, they
+      ;; still agree with each other and every signature verifies.  Against a
+      ;; real peer the channel fails at the first commitment_signed.  So check
+      ;; the built transaction directly: OUR commitment's to_local must be
+      ;; guarded by a revocation key derived from THEIR basepoint and OUR point.
+      (with-gate ("live: our commitment is punishable by them, not by us")
+        (let* ((n (lv:live-local-commit-index a))
+               (point (lv::local-point a n))
+               (built (lv::%build a (lv:local-spec a) :ours t :point point))
+               (their-rev-base (lt-pub (lt-key "b/r")))
+               (our-rev-base (lt-pub (lt-key "a/r")))
+               (right (m:p2wsh (m:to-local-script (k:derive-revocation-pubkey their-rev-base point) 144
+                                                  (k:derive-pubkey (lt-pub (lt-key "a/d")) point))))
+               (wrong (m:p2wsh (m:to-local-script (k:derive-revocation-pubkey our-rev-base point) 144
+                                                  (k:derive-pubkey (lt-pub (lt-key "a/d")) point))))
+               (scripts (mapcar #'btx:txout-script (btx:tx-outputs (lv::b-tx built)))))
+          (check "to_local uses THEIR revocation basepoint" (member right scripts :test #'equalp))
+          (check "and not ours" (not (member wrong scripts :test #'equalp)))))
+
       (with-gate ("live: cooperative close")
         (let ((a-spk (m:p2wpkh (lt-pub (lt-key "a/close"))))
               (b-spk (m:p2wpkh (lt-pub (lt-key "b/close")))))
