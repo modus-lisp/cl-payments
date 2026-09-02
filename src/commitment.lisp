@@ -51,6 +51,7 @@
    #:htlc-payment-hash #:offered-htlc-script #:received-htlc-script
    ;; the transaction
    #:build-commitment #:sign-commitment #:verify-commitment #:commitment-sighash
+   #:sig->der #:funding-witness
    ;; second-stage HTLC transactions
    #:htlc-tx-script #:build-htlc-tx #:htlc-tx-fee #:sign-htlc-tx #:htlc-tx-sighash
    #:commitment-error))
@@ -445,6 +446,34 @@
             (s (secp:bytes-to-int (subseq signature 32 64))))
         (and (secp:ecdsa-verify (c:parse-pubkey signer-pubkey) hash r s) t))
     (error () nil)))
+
+(defconstant +sighash-all-byte+ 1)
+
+(defun sig->der (sig64 &optional (sighash-type +sighash-all-byte+))
+  "The 64-byte compact signature the wire carries, as the DER form Bitcoin
+   script requires, with the sighash byte appended.
+
+   Two encodings for one signature because the two audiences differ: BOLT #1
+   wants fixed-size fields, Bitcoin wants what OpenSSL produced in 2009.  The
+   conversion is at the boundary — a compact signature never goes on chain and a
+   DER one never goes on the wire.  Each INTEGER is minimally encoded, with a
+   leading zero only when the high bit is set; BIP66 rejects anything else."
+  (flet ((int (bytes)
+           (let* ((start (or (position-if-not #'zerop bytes) (1- (length bytes))))
+                  (body (subseq bytes start))
+                  (body (if (logbitp 7 (aref body 0)) (bytes (vector 0) body) body)))
+             (bytes (vector #x02 (length body)) body))))
+    (let* ((r (int (subseq sig64 0 32))) (s (int (subseq sig64 32 64)))
+           (seq (bytes r s)))
+      (bytes (vector #x30 (length seq)) seq (vector sighash-type)))))
+
+(defun funding-witness (sig-a pubkey-a sig-b pubkey-b funding-script)
+  "The witness that spends a funding output: an empty element for
+   CHECKMULTISIG's off-by-one, the two signatures IN THE SCRIPT'S KEY ORDER, and
+   the script itself.  Signatures out of order fail even when both are valid."
+  (let ((pairs (sort (list (cons (c:octets pubkey-a) sig-a) (cons (c:octets pubkey-b) sig-b))
+                     (lambda (x y) (string< (c:bytes->hex (car x)) (c:bytes->hex (car y)))))))
+    (list (bytes) (sig->der (cdr (first pairs))) (sig->der (cdr (second pairs))) funding-script)))
 
 (defun sign-commitment (tx funding-privkey local-funding-pubkey remote-funding-pubkey
                         funding-amount-sat)

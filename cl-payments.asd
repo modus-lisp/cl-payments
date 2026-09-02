@@ -32,6 +32,7 @@
      (:file "channel")     ; BOLT #2: opening a channel
      (:file "updates")     ; BOLT #2: the HTLC lifecycle and its state machine
      (:file "forward")    ; BOLT #4: the forwarding decision
+     (:file "live")       ; BOLT #2: the commitment cycle on a live channel
      (:file "node"))))     ; the daemon: listener, peer registry, channel state
   :in-order-to ((test-op (test-op "cl-payments/test"))))
 
@@ -55,5 +56,6 @@
                              (:file "channel-test")
                              (:file "updates-test")
                              (:file "forward-test")
+                             (:file "live-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))
