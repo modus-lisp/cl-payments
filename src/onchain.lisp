@@ -34,7 +34,9 @@
   (:export
    #:classify-spend #:onchain-error
    #:sweep-to-remote #:sweep-to-local #:penalty
-   #:to-remote-output #:to-local-output))
+   #:to-remote-output #:to-local-output
+   #:their-htlc-outputs #:claim-htlcs-from-their-commitment
+   #:our-htlc-second-stage #:sweep-second-stage))
 
 (in-package #:cl-payments.onchain)
 
@@ -112,6 +114,145 @@
       (multiple-value-bind (idx value) (%find-output tx (m:p2wsh script))
         (values idx value script rev del delay)))))
 
+
+;;; ----------------------------------------------------------------------------
+;;; HTLC outputs
+;;;
+;;; An HTLC output on a published commitment is money in dispute, and both
+;;; sides have a claim on it with a deadline.  If the HTLC was ours to receive
+;;; and we know the preimage, we take it — before the expiry lets the other
+;;; side take it back.  If it was ours to pay and the expiry has passed, we
+;;; take it back — before the other side produces a preimage.  Whoever moves
+;;; first, with a valid claim, wins.  So these are built the moment they can
+;;; be, and the watcher broadcasts them without waiting to be asked.
+;;;
+;;; On THEIR commitment the claims are direct.  On OURS they go through the
+;;; second-stage HTLC-success / HTLC-timeout transactions the peer pre-signed
+;;; — that is what the htlc_signatures in every commitment_signed were for —
+;;; and the second stage pays to a delayed output we sweep like to_local.
+;;; ----------------------------------------------------------------------------
+
+(defun %htlc-keys (lc point ours)
+  "Keys for HTLC scripts in a commitment at POINT.  OURS says whose commitment.
+   Returns (values revocation-pubkey local-htlc-pubkey remote-htlc-pubkey our-htlc-priv)
+   where local/remote are the commitment OWNER's view."
+  (let* ((rev-base (if ours (lv::live-remote-revocation-basepoint lc) (lv:pub (lv::live-revocation-priv lc))))
+         (own-base (if ours (lv:pub (lv::live-htlc-priv lc)) (lv::live-remote-htlc-basepoint lc)))
+         (other-base (if ours (lv::live-remote-htlc-basepoint lc) (lv:pub (lv::live-htlc-priv lc)))))
+    (values (k:derive-revocation-pubkey rev-base point)
+            (k:derive-pubkey own-base point)
+            (k:derive-pubkey other-base point)
+            (k:derive-privkey (lv::live-htlc-priv lc) point))))
+
+(defun their-htlc-outputs (lc tx n)
+  "Every HTLC output in THEIR commitment N that we can locate: a list of
+   (index value script rec) with REC in OUR view (:offered = we pay)."
+  (let ((point (lv:remote-point-for lc n))
+        (htlcs (lv:remote-htlcs-at lc n)))
+    (when (and point htlcs)
+      (multiple-value-bind (rev their-htlc our-htlc) (%htlc-keys lc point nil)
+        (let ((found '()) (start 0))
+          ;; Same ordering rule as the commitment itself: by amount then script,
+          ;; then expiry — so scan in that order and never reuse an output.
+          (dolist (rec (sort (copy-list htlcs) #'<
+                             :key (lambda (h) (+ (* (floor (lv:hr-amount-msat h) 1000) 1000000) (lv:hr-cltv-expiry h)))))
+            (let* ((script (ecase (lv:hr-direction rec)
+                             ;; We pay: in THEIR commitment that is one they RECEIVE.
+                             (:offered (m:received-htlc-script rev our-htlc their-htlc
+                                                               (lv:hr-payment-hash rec) (lv:hr-cltv-expiry rec)))
+                             (:received (m:offered-htlc-script rev our-htlc their-htlc (lv:hr-payment-hash rec)))))
+                   (idx (position (m:p2wsh script) (btx:tx-outputs tx) :start start
+                                  :key #'btx:txout-script :test #'equalp)))
+              (when idx
+                (setf start (1+ idx))
+                (push (list idx (btx:txout-value (nth idx (btx:tx-outputs tx))) script rec) found))))
+          (nreverse found))))))
+
+(defun claim-htlcs-from-their-commitment (lc tx n dest-script preimages &key height (fee-sat 500))
+  "Direct claims on THEIR commitment's HTLC outputs.  PREIMAGES is a list of
+   32-byte preimages we know.  Returns the transactions we can make right now:
+   a preimage claim for each HTLC they offered us that we can settle, and a
+   timeout claim for each we offered them whose expiry HEIGHT has passed."
+  (let ((point (lv:remote-point-for lc n)) (out '()))
+    (when point
+      (multiple-value-bind (rev their-htlc our-htlc our-priv) (%htlc-keys lc point nil)
+        (declare (ignore rev their-htlc our-htlc))
+        (dolist (o (their-htlc-outputs lc tx n))
+          (destructuring-bind (idx value script rec) o
+            (ecase (lv:hr-direction rec)
+              (:received
+               (let ((pre (find (lv:hr-payment-hash rec) preimages
+                                :key (lambda (p) (c:sha256 p)) :test #'equalp)))
+                 (when pre
+                   ;; <sig> <preimage>: size 32 takes the hash branch, CHECKSIG
+                   ;; against remote_htlcpubkey — which, in their commitment, is us.
+                   (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx #xffffffff)) dest-script value fee-sat))
+                          (sig (%sign tx2 0 script value our-priv)))
+                     (push (%with-witnesses tx2 (list (list sig (c:octets pre) script))) out)))))
+              (:offered
+               (when (and height (>= height (lv:hr-cltv-expiry rec)))
+                 ;; <sig> <>: an empty element is not 32 bytes, so the OP_ELSE
+                 ;; branch: CLTV against the expiry, then CHECKSIG against us.
+                 (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx #xfffffffe)) dest-script value fee-sat))
+                        (tx2 (btx:parse-tx (bw:make-reader (btx:serialize-tx
+                                            (btx:make-tx :version 2 :inputs (btx:tx-inputs tx2) :outputs (btx:tx-outputs tx2)
+                                                         :witnesses (list nil) :locktime (lv:hr-cltv-expiry rec) :segwit-p t)))))
+                        (sig (%sign tx2 0 script value our-priv)))
+                   (push (%with-witnesses tx2 (list (list sig (c:bytes) script))) out)))))))))
+    (nreverse out)))
+
+(defun our-htlc-second-stage (lc dest-script preimages &key height (fee-sat 500))
+  "The pre-signed second-stage transactions on OUR published commitment:
+   HTLC-success for each received HTLC whose preimage we hold, HTLC-timeout for
+   each offered HTLC past its expiry.  Each spends one HTLC output to a delayed
+   output; SWEEP-SECOND-STAGE takes it from there.  DEST-SCRIPT is unused here
+   — the second stage's destination is fixed by the protocol — but kept for
+   symmetry with the direct claims."
+  (declare (ignore dest-script fee-sat))
+  (let* ((built (lv:built-local lc))
+         (point (lv:local-point lc (lv:live-local-commit-index lc)))
+         (their-sigs (lv:live-local-commit-htlc-sigs lc))
+         (out '()))
+    (multiple-value-bind (rev our-htlc their-htlc our-priv) (%htlc-keys lc point t)
+      (declare (ignore rev our-htlc their-htlc))
+      (loop for (idx rec script) in (lv:b-htlc-outputs built)
+            for their-sig in their-sigs
+            do (let* ((amount (floor (lv:hr-amount-msat rec) 1000))
+                      (htx (lv::%htlc-tx built t idx rec))
+                      (our-sig (m:sign-htlc-tx htx our-priv script amount))
+                      (der-theirs (m:sig->der their-sig)) (der-ours (m:sig->der our-sig)))
+                 (ecase (lv:hr-direction rec)
+                   (:received
+                    (let ((pre (find (lv:hr-payment-hash rec) preimages :key (lambda (p) (c:sha256 p)) :test #'equalp)))
+                      (when pre
+                        ;; 0 <remotehtlcsig> <localhtlcsig> <preimage> <script>
+                        (push (list :success rec
+                                    (%with-witnesses htx (list (list (c:bytes) der-theirs der-ours (c:octets pre) script))))
+                              out))))
+                   (:offered
+                    (when (and height (>= height (lv:hr-cltv-expiry rec)))
+                      ;; 0 <remotehtlcsig> <localhtlcsig> <> <script>, locktime = expiry
+                      (push (list :timeout rec
+                                  (%with-witnesses htx (list (list (c:bytes) der-theirs der-ours (c:bytes) script))))
+                            out)))))))
+    (nreverse out)))
+
+(defun sweep-second-stage (lc htlc-tx dest-script &key (fee-sat 500))
+  "Claim the delayed output of one of OUR second-stage HTLC transactions, after
+   the CSV delay — the same shape as to_local, with the same keys."
+  (let* ((point (lv:local-point lc (lv:live-local-commit-index lc)))
+         (rev (k:derive-revocation-pubkey (lv::live-remote-revocation-basepoint lc) point))
+         (del (k:derive-pubkey (lv:pub (lv::live-delayed-priv lc)) point))
+         (delay (lv::live-local-to-self-delay lc))
+         (script (m:htlc-tx-script rev delay del))
+         (value (btx:txout-value (first (btx:tx-outputs htlc-tx)))))
+    (unless (equalp (btx:txout-script (first (btx:tx-outputs htlc-tx))) (m:p2wsh script))
+      (fail "not one of our second-stage HTLC transactions"))
+    (let* ((tx (%sweep-tx (list (list (btx:tx-txid htlc-tx) 0 delay)) dest-script value fee-sat))
+           (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
+           (sig (%sign tx 0 script value priv)))
+      (%with-witnesses tx (list (list sig (c:bytes) script))))))
+
 ;;; ----------------------------------------------------------------------------
 ;;; Building the answering transactions
 ;;; ----------------------------------------------------------------------------
@@ -182,20 +323,29 @@
   (let ((secret (or (lv:revoked-secret-for lc n) (fail "commitment ~d is not revoked" n))))
     (multiple-value-bind (lidx lvalue lscript) (to-local-output lc their-revoked-tx :theirs t :n n)
       (multiple-value-bind (ridx rvalue) (to-remote-output lc their-revoked-tx)
-        (unless (or lidx ridx) (fail "nothing to claim in commitment ~d" n))
-        (let* ((inputs (append (and lidx (list (list (btx:tx-txid their-revoked-tx) lidx #xffffffff)))
-                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx #xffffffff)))))
-               (total (+ (or lvalue 0) (or rvalue 0)))
-               (tx (%sweep-tx inputs dest-script total fee-sat))
+        (let* ((htlcs (their-htlc-outputs lc their-revoked-tx n))
+               (rev-pub (k:derive-revocation-pubkey (lv:pub (lv::live-revocation-priv lc)) (lv:remote-point-for lc n)))
+               (inputs (append (and lidx (list (list (btx:tx-txid their-revoked-tx) lidx #xffffffff)))
+                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx #xffffffff)))
+                               (loop for (idx) in htlcs collect (list (btx:tx-txid their-revoked-tx) idx #xffffffff))))
+               (total (+ (or lvalue 0) (or rvalue 0) (reduce #'+ htlcs :key #'second)))
                (rev-priv (k:derive-revocation-privkey (lv::live-revocation-priv lc) (secp:bytes-to-int secret)))
                (pay-pub (lv:pub (lv::live-payment-priv lc)))
                (witnesses '()) (i 0))
-          (when lidx
-            ;; <sig> 1 <script>: the OP_IF branch, guarded by the revocation key.
-            (push (list (%sign tx i lscript lvalue rev-priv) (vector 1) lscript) witnesses)
-            (incf i))
-          (when ridx
-            (push (list (%sign tx i (%p2wpkh-script-code pay-pub) rvalue (lv::live-payment-priv lc))
-                        (c:octets pay-pub))
-                  witnesses))
-          (%with-witnesses tx (nreverse witnesses)))))))
+          (unless inputs (fail "nothing to claim in commitment ~d" n))
+          (let ((tx (%sweep-tx inputs dest-script total fee-sat)))
+            (when lidx
+              ;; <sig> 1 <script>: the OP_IF branch, guarded by the revocation key.
+              (push (list (%sign tx i lscript lvalue rev-priv) (vector 1) lscript) witnesses)
+              (incf i))
+            (when ridx
+              (push (list (%sign tx i (%p2wpkh-script-code pay-pub) rvalue (lv::live-payment-priv lc))
+                          (c:octets pay-pub))
+                    witnesses)
+              (incf i))
+            ;; Every HTLC output, whichever way it pointed: <sig> <revocationpubkey>
+            ;; takes the OP_DUP OP_HASH160 branch at the top of both scripts.
+            (loop for (idx value script) in htlcs
+                  do (push (list (%sign tx i script value rev-priv) (c:octets rev-pub) script) witnesses)
+                     (incf i))
+            (%with-witnesses tx (nreverse witnesses))))))))

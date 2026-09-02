@@ -505,7 +505,7 @@ daemon's receive path still takes preimages from a file rather than minting
 invoices. That is the last piece of "cl-payments as a wallet" and belongs with
 the RPC that Phase 8's chain view will also need.
 
-## Phase 8 — on-chain handling  **[DONE, except HTLC outputs]**
+## Phase 8 — on-chain handling  **[DONE]**
 
 BOLT #5. `src/chain.lisp` is the chain view — one small protocol, bitcoind over
 bitcoin-cli behind it for the daemon and an in-memory chain for gates.
@@ -520,9 +520,19 @@ Every transaction is spent under cl-consensus's interpreter with CSV on, and
 the daemon gate ends with B publishing a revoked commitment: A's watcher builds
 and broadcasts the penalty, and B's own delayed sweep finds the output gone.
 
-Not yet: HTLC outputs on a published commitment (timeout and success paths),
-and a real fee estimate for sweeps (a fixed 500 sat). Both are needed before
-this is safe with HTLCs in flight at close time.
+HTLC outputs too. On THEIR commitment the claims are direct: preimage in hand,
+take a received HTLC at once; expiry passed, take an offered one back. On OURS
+they go through the second-stage HTLC-success / HTLC-timeout transactions the
+peer pre-signed — that is what every `htlc_signatures` field was for — and the
+second stage pays to a delayed output swept like to_local. A revoked commitment's
+HTLC outputs fall to the penalty with everything else, via the revocation key.
+The watcher runs all of this every block until nothing is left, and each output
+is answered once; the close transaction and the claims made are persisted so a
+restart mid-resolution resumes. Which HTLCs were in each commitment we signed for
+the peer is kept, because a revoked commitment's scripts cannot be rebuilt
+without their hashes and expiries.
+
+Not yet: a real fee estimate for sweeps and closes (fixed satoshis).
 
 **Milestone met, both halves, against Core Lightning on the devnet:**
 
@@ -582,8 +592,7 @@ routed end to end.
 
 ## Status
 
-**Phases 0–8 are done, with the HTLC-output caveat under Phase 8.** cl-payments
-opens channels, accepts them, announces
+**Phases 0–8 are done.** cl-payments opens channels, accepts them, announces
 them, receives payments with the onion read, forwards payments between two other
 implementations' nodes with readable failures in every rejection path, PAYS
 invoices from both Core Lightning and LND over routes learned from gossip with
@@ -617,12 +626,10 @@ Verified against real implementations on the private signet:
 
 Offline suite: 762 checks across two gates, every new check mutation-verified.
 
-**Next:** HTLC outputs on a published commitment — the timeout and success
-second-stage transactions, and their revocation paths — so a close with HTLCs
-in flight resolves rather than strands them; a real fee estimate for sweeps and
-closes instead of fixed satoshis; minting invoices in the daemon (the encoder is
-proven, the receive path still reads preimages from a file); and an RPC so
-`commands/` can retire. After that the non-goals list is where the roadmap goes.
+**Next:** a real fee estimate for sweeps and closes instead of fixed satoshis;
+minting invoices in the daemon (the encoder is proven, the receive path still
+reads preimages from a file); and an RPC so `commands/` can retire. After that
+the non-goals list is where the roadmap goes.
 
 Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
 state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the

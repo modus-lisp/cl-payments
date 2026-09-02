@@ -56,11 +56,13 @@
    ;; transitions — each returns the message(s) to send, or NIL
    #:set-remote-next-point #:set-remote-current-point
    #:send-add #:receive-add
-   #:send-fulfill #:receive-fulfill #:send-fail #:send-fail-malformed #:receive-fail #:receive-fee
+   #:send-fulfill #:receive-fulfill #:send-fail #:send-fail-malformed #:receive-fail #:receive-fee #:send-fee
    #:send-commit #:receive-commit #:receive-revocation
    #:initial-commitment-signature #:verify-initial-commitment
    #:local-commitment-tx #:commitment-number-of #:remote-point-for #:revoked-secret-for
-   #:live-local-commit-sig #:local-point #:pub #:previous-commitment-tx
+   #:live-local-commit-sig #:live-local-commit-htlc-sigs #:local-point #:pub #:previous-commitment-tx
+   #:remote-htlcs-at #:built-local #:b-tx #:b-htlc-outputs #:b-revocation-pubkey #:b-delayed-pubkey
+   #:b-to-self-delay #:b-feerate
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
    ;; closing
@@ -137,6 +139,11 @@
   ;; revoked state and prove the counterparty punishes it.  A real node must
   ;; never keep this, let alone broadcast it — it is a signed confession.
   prev-commit-sig prev-spec prev-index
+  ;; Which HTLCs were in each commitment we signed for THEM: (index . htlcs).
+  ;; A revoked commitment's HTLC outputs can only be claimed if we can rebuild
+  ;; their scripts, and that needs the payment hash and expiry of each — which
+  ;; nothing else remembers once the HTLC is resolved.
+  (remote-history '())
   ;; --- closing --------------------------------------------------------------
   local-shutdown-script remote-shutdown-script
   (closed-p nil) closing-txid)
@@ -429,6 +436,13 @@
   (setf (live-remote-proposed lc) (append (live-remote-proposed lc) (list (list :fail id))))
   id)
 
+(defun send-fee (lc feerate)
+  "update_fee.  Only the opener sends it, because only the opener pays it."
+  (unless (eq (live-opener lc) :local) (fail "only the opener may send update_fee"))
+  (when (< feerate 253) (fail "feerate ~d per kw is below the floor" feerate))
+  (setf (live-local-proposed lc) (append (live-local-proposed lc) (list (list :fee feerate))))
+  (u:encode-update-fee (u:make-update-fee :channel-id (live-channel-id lc) :feerate-per-kw feerate)))
+
 (defun receive-fee (lc feerate)
   "update_fee.  Only the opener may send it — they pay the fee — and a zero
    feerate would make every commitment unrelayable."
@@ -465,6 +479,7 @@
          (htlc-sigs (loop for (idx rec script) in (b-htlc-outputs built)
                           collect (m:sign-htlc-tx (%htlc-tx built nil idx rec) htlc-priv
                                                   script (floor (hr-amount-msat rec) 1000)))))
+    (push (cons (1+ (live-remote-commit-index lc)) (copy-list (spec-htlcs spec))) (live-remote-history lc))
     (setf (live-remote-next-commit lc) (cons (1+ (live-remote-commit-index lc)) spec)
           (live-local-signed lc) (append (live-local-signed lc) (live-local-proposed lc))
           (live-local-proposed lc) '()
@@ -576,6 +591,16 @@
                                    :outputs (btx:tx-outputs tx) :locktime (btx:tx-locktime tx)
                                    :witnesses (list (m:funding-witness our-sig our-pub sig (live-remote-funding-pubkey lc) script))
                                    :segwit-p t)))))))
+
+(defun remote-htlcs-at (lc n)
+  "The HTLCs (our view) in THEIR commitment N, or NIL if none / unknown."
+  (cdr (assoc n (live-remote-history lc))))
+
+(defun built-local (lc)
+  "The BUILT record for our current commitment: outputs, HTLC positions and
+   scripts, keys.  What second-stage transactions are made from."
+  (%build lc (live-local-spec lc) :ours t :point (local-point lc (live-local-commit-index lc))
+          :index (live-local-commit-index lc)))
 
 (defun commitment-number-of (lc tx)
   "Which commitment a broadcast transaction is, read back out of its obscured
@@ -835,7 +860,9 @@
         :prev-commit-sig (hx (live-prev-commit-sig lc)) :prev-index (live-prev-index lc)
         :prev-spec (and (live-prev-spec lc) (spec->plist (live-prev-spec lc)))
         :local-commit-htlc-sigs (mapcar #'hx (live-local-commit-htlc-sigs lc))
-        :revocations (k:shachain->plist (live-revocations lc))))
+        :revocations (k:shachain->plist (live-revocations lc))
+        :remote-history (loop for (n . htlcs) in (live-remote-history lc)
+                              collect (cons n (mapcar #'htlc->plist htlcs)))))
 
 (defun plist->live (p)
   (flet ((g (k) (getf p k)))
@@ -866,4 +893,6 @@
                 :prev-commit-sig (uh (g :prev-commit-sig)) :prev-index (g :prev-index)
                 :prev-spec (and (g :prev-spec) (plist->spec (g :prev-spec)))
                 :local-commit-htlc-sigs (mapcar #'uh (g :local-commit-htlc-sigs))
-                :revocations (if (g :revocations) (k:plist->shachain (g :revocations)) (k:make-shachain)))))
+                :revocations (if (g :revocations) (k:plist->shachain (g :revocations)) (k:make-shachain))
+                :remote-history (loop for (n . htlcs) in (g :remote-history)
+                                      collect (cons n (mapcar #'plist->htlc htlcs))))))

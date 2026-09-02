@@ -116,6 +116,96 @@
               (check "A: :mutual-close" (eq :mutual-close (oc:classify-spend a tx)))
               (check "B: :mutual-close" (eq :mutual-close (oc:classify-spend b tx))))))
 
+        (with-gate ("onchain: HTLCs in flight when a commitment is published")
+          (multiple-value-bind (a2 b2 fs2 cap2) (make-live-pair)
+            (declare (ignore fs2 cap2))
+            ;; A offers B an HTLC; both sides commit it; nobody settles it.
+            (let* ((pre (c:sha256 (c:ascii->bytes "onchain/htlc-pre")))
+                   (hash (c:sha256 pre)) (expiry 700))
+              (oc-cycle a2 b2)   ; some history first, so indices are not 0
+              (lv:receive-add b2 (payload (lv:send-add a2 60000000 hash expiry (c:zeros u:+onion-packet-size+))))
+              (lv:receive-revocation a2 (payload (lv:receive-commit b2 (payload (lv:send-commit a2)))))
+              (lv:receive-revocation b2 (payload (lv:receive-commit a2 (payload (lv:send-commit b2)))))
+              (check "the HTLC is in both commitments"
+                     (and (= 1 (length (lv:live-htlcs a2))) (= 1 (length (lv:live-htlcs b2)))))
+              (let* ((a-tx (lv:local-commitment-tx a2))     ; A force-closes
+                     (b-tx (lv:local-commitment-tx b2))     ; or B does
+                     (dest2 (m:p2wpkh (lt-pub (lt-key "sweep2")))))
+
+                ;; ---- B claims from A's commitment, with the preimage, at once -----
+                (let* ((n (lv:live-local-commit-index a2))
+                       (outs (oc:their-htlc-outputs b2 a-tx n))
+                       (claims (oc:claim-htlcs-from-their-commitment b2 a-tx n dest2 (list pre))))
+                  (check "B locates the HTLC output in A's commitment" (= 1 (length outs)))
+                  (check "B builds one preimage claim" (= 1 (length claims)))
+                  (when (and outs claims)
+                    (destructuring-bind (idx value script rec) (first outs)
+                      (declare (ignore script rec))
+                      (check "B's preimage claim spends under cl-consensus"
+                             (oc-spends-p (first claims) (btx:txout-script (nth idx (btx:tx-outputs a-tx))) value
+                                          :flags '(:p2sh :witness :csv :cltv)))))
+                  (check "without the preimage B can build nothing"
+                         (null (oc:claim-htlcs-from-their-commitment b2 a-tx n dest2 '()))))
+
+                ;; ---- A's own second stage on A's commitment: timeout after expiry -
+                (check "before expiry A has no timeout to make"
+                       (null (oc:our-htlc-second-stage a2 dest2 '() :height (1- expiry))))
+                (let ((stage (oc:our-htlc-second-stage a2 dest2 '() :height expiry)))
+                  (check "at expiry A builds an HTLC-timeout" (and (= 1 (length stage)) (eq :timeout (first (first stage)))))
+                  (when stage
+                    (let* ((htx (third (first stage)))
+                           (outs (lv:b-htlc-outputs (lv:built-local a2)))
+                           (idx (first (first outs))) (value (floor (lv:hr-amount-msat (second (first outs))) 1000)))
+                      (check "the HTLC-timeout, signed by both, spends the HTLC output"
+                             (oc-spends-p htx (btx:txout-script (nth idx (btx:tx-outputs a-tx))) value
+                                          :flags '(:p2sh :witness :csv :cltv)))
+                      (check "its locktime is the expiry" (= expiry (btx:tx-locktime htx)))
+                      ;; ---- and then the delayed output is A's, after the CSV --------
+                      (let ((sweep (oc:sweep-second-stage a2 htx dest2)))
+                        (check "A sweeps the second-stage output after the delay"
+                               (oc-spends-p sweep (btx:txout-script (first (btx:tx-outputs htx)))
+                                            (btx:txout-value (first (btx:tx-outputs htx)))))))))
+
+                ;; ---- B's second stage on B's commitment: success with the preimage -
+                (let ((stage (oc:our-htlc-second-stage b2 dest2 (list pre))))
+                  (check "B builds an HTLC-success" (and (= 1 (length stage)) (eq :success (first (first stage)))))
+                  (when stage
+                    (let* ((htx (third (first stage)))
+                           (outs (lv:b-htlc-outputs (lv:built-local b2)))
+                           (idx (first (first outs))) (value (floor (lv:hr-amount-msat (second (first outs))) 1000)))
+                      (check "the HTLC-success spends B's HTLC output"
+                             (oc-spends-p htx (btx:txout-script (nth idx (btx:tx-outputs b-tx))) value
+                                          :flags '(:p2sh :witness :csv :cltv))))))
+
+                ;; ---- A times out its offered HTLC on B's commitment, directly ------
+                (let* ((n (lv:live-local-commit-index b2))
+                       (early (oc:claim-htlcs-from-their-commitment a2 b-tx n dest2 '() :height (1- expiry)))
+                       (claims (oc:claim-htlcs-from-their-commitment a2 b-tx n dest2 '() :height expiry)))
+                  (check "before expiry A cannot reclaim" (null early))
+                  (check "at expiry A builds a timeout claim" (= 1 (length claims)))
+                  (when claims
+                    (destructuring-bind (idx value script rec) (first (oc:their-htlc-outputs a2 b-tx n))
+                      (declare (ignore script rec))
+                      (check "the timeout claim spends under CLTV"
+                             (oc-spends-p (first claims) (btx:txout-script (nth idx (btx:tx-outputs b-tx))) value
+                                          :flags '(:p2sh :witness :csv :cltv))))))
+
+                ;; ---- revoked WITH an HTLC: the penalty takes that too --------------
+                ;; Advance B past this commitment (a fee update will do), then punish
+                ;; the captured b-tx as revoked.
+                (let ((n (lv:live-local-commit-index b2)))
+                  (lv:send-fee a2 2600) (lv:receive-fee b2 2600)
+                  (lv:receive-revocation a2 (payload (lv:receive-commit b2 (payload (lv:send-commit a2)))))
+                  (check "B's commitment with the HTLC is now revoked at A" (and (lv:revoked-secret-for a2 n) t))
+                  (let ((pen (oc:penalty a2 b-tx n dest2)))
+                    (check "the penalty has three inputs: to_local, to_remote, and the HTLC"
+                           (= 3 (length (btx:tx-inputs pen))))
+                    (destructuring-bind (hidx hvalue) (subseq (first (oc:their-htlc-outputs a2 b-tx n)) 0 2)
+                      (check "the HTLC input spends via the revocation key"
+                             (handler-case (bs:verify-input pen 2 (btx:txout-script (nth hidx (btx:tx-outputs b-tx))) hvalue
+                                                            :flags '(:p2sh :witness :csv :cltv))
+                               (error () nil))))))))))
+
         (with-gate ("onchain: revocation secrets survive persistence")
           (let ((back (lv:plist->live (lv:live->plist b))))
             (check "the reloaded channel can still punish commitment 1"

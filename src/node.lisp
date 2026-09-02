@@ -86,6 +86,9 @@
   scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig
   ;; On-chain resolution: what spent the funding output, and what we did.
   close-kind close-txid close-height sweep-txid
+  close-tx                  ; the spending transaction itself, for HTLC claims
+  (claimed '())             ; (output-index . txid) of HTLC outputs we have answered
+  (second-stage '())        ; (htlc-txid . height-confirmed-or-nil) awaiting their delay
   ;; The commitment-cycle state, for channels the daemon accepted.  Channels
   ;; opened by inspect/open-channel.lisp predate this and have none: they are
   ;; announced and routable in the graph, but no HTLC can cross them.
@@ -182,7 +185,10 @@
                                 :close-kind (sc-close-kind sc)
                                 :close-txid (let ((k (sc-close-txid sc))) (and k (%hex k)))
                                 :close-height (sc-close-height sc)
-                                :sweep-txid (let ((k (sc-sweep-txid sc))) (and k (%hex k))))
+                                :sweep-txid (let ((k (sc-sweep-txid sc))) (and k (%hex k)))
+                                :close-tx (let ((tx (sc-close-tx sc))) (and tx (%hex (btx:serialize-tx tx))))
+                                :claimed (mapcar (lambda (c) (cons (car c) (%hex (cdr c)))) (sc-claimed sc))
+                                :second-stage (mapcar (lambda (c) (cons (%hex (car c)) (cdr c))) (sc-second-stage sc)))
                           s)
                    (terpri s))
                  (node-channels node))))
@@ -221,7 +227,11 @@
                             :close-kind (getf form :close-kind)
                             :close-txid (let ((v (getf form :close-txid))) (and v (%unhex v)))
                             :close-height (getf form :close-height)
-                            :sweep-txid (let ((v (getf form :sweep-txid))) (and v (%unhex v))))))
+                            :sweep-txid (let ((v (getf form :sweep-txid))) (and v (%unhex v)))
+                            :close-tx (let ((v (getf form :close-tx)))
+                                        (and v (btx:parse-tx (bw:make-reader (%unhex v)))))
+                            :claimed (mapcar (lambda (c) (cons (car c) (%unhex (cdr c)))) (getf form :claimed))
+                            :second-stage (mapcar (lambda (c) (cons (%unhex (car c)) (cdr c))) (getf form :second-stage)))))
                    (setf (gethash (%hex (sc-channel-id sc)) (node-channels node)) sc)))))
     (hash-table-count (node-channels node))))
 
@@ -1546,7 +1556,8 @@
   "The funding output of SC was spent by TX at HEIGHT.  Decide and act."
   (let ((lc (sc-live sc)))
     (multiple-value-bind (kind n) (oc:classify-spend lc tx)
-      (setf (sc-close-kind sc) kind (sc-close-txid sc) (btx:tx-txid tx) (sc-close-height sc) height)
+      (setf (sc-close-kind sc) kind (sc-close-txid sc) (btx:tx-txid tx) (sc-close-height sc) height
+            (sc-close-tx sc) tx)
       (nlog node "funding of ~a spent at height ~d by ~a: ~(~a~)~@[ (commitment ~d)~]"
             (subseq (%hex (sc-channel-id sc)) 0 16) height (subseq (bw:hash->hex (btx:tx-txid tx)) 0 16) kind n)
       (handler-case
@@ -1569,6 +1580,59 @@
             (:unknown (nlog node "  UNRECOGNISED spend of our funding output — cannot answer it")))
         (error (e) (nlog node "  answering the spend failed: ~a" e)))
       (save-channels node))))
+
+
+(defun %broadcast-claim (node sc label tx idx)
+  (chn:chain-broadcast (node-chain node) tx)
+  (push (cons idx (btx:tx-txid tx)) (sc-claimed sc))
+  (nlog node "  ~a for HTLC output ~d: ~a" label idx (bw:hash->hex (btx:tx-txid tx))))
+
+(defun resolve-htlcs (node sc)
+  "Every block, for a channel resolved on chain: claim what can be claimed
+   now.  Deadlines cut both ways — a received HTLC must be claimed before its
+   expiry lets the peer take it back, an offered one only after — so this runs
+   until nothing is left, and each output is answered once."
+  (let* ((lc (sc-live sc)) (tx (sc-close-tx sc)) (height (node-height node))
+         (dest (our-sweep-script node sc))
+         (preimages (known-preimages node))
+         (done (lambda (idx) (assoc idx (sc-claimed sc)))))
+    (when (and lc tx)
+      (case (sc-close-kind sc)
+        (:their-commitment
+         (let ((n (lv:commitment-number-of lc tx)))
+           (dolist (claim (oc:claim-htlcs-from-their-commitment lc tx n dest preimages :height height))
+             (let ((idx (btx:txin-prev-index (first (btx:tx-inputs claim)))))
+               (unless (funcall done idx)
+                 (%broadcast-claim node sc "direct claim" claim idx))))))
+        (:our-commitment
+         ;; Second stage first: the pre-signed HTLC-success / HTLC-timeout.
+         (dolist (entry (oc:our-htlc-second-stage lc dest preimages :height height))
+           (destructuring-bind (kind rec htx) entry
+             (declare (ignore rec))
+             (let ((idx (btx:txin-prev-index (first (btx:tx-inputs htx)))))
+               (unless (funcall done idx)
+                 (%broadcast-claim node sc (format nil "HTLC-~(~a~)" kind) htx idx)
+                 (push (cons (btx:tx-txid htx) nil) (sc-second-stage sc))))))
+         ;; Then the delayed outputs of any second stage that has confirmed.
+         (dolist (entry (sc-second-stage sc))
+           (destructuring-bind (htxid . confirmed-at) entry
+             (unless confirmed-at
+               (let ((h (chn:chain-tx-position (node-chain node) htxid)))
+                 (when h (setf (cdr entry) h))))
+             (when (and (cdr entry)
+                        (>= height (+ (cdr entry) (lv::live-local-to-self-delay lc)))
+                        (not (assoc (list :stage htxid) (sc-claimed sc) :test #'equalp)))
+               (let* ((htx (%find-tx node htxid (cdr entry))))
+                 (when htx
+                   (let ((sweep (oc:sweep-second-stage lc htx dest)))
+                     (chn:chain-broadcast (node-chain node) sweep)
+                     (push (cons (list :stage htxid) (btx:tx-txid sweep)) (sc-claimed sc))
+                     (nlog node "  swept second-stage ~a: ~a" (subseq (bw:hash->hex htxid) 0 16)
+                           (bw:hash->hex (btx:tx-txid sweep)))))))))))
+      (save-channels node))))
+
+(defun %find-tx (node txid height)
+  (find txid (chn:chain-block-txs (node-chain node) height) :key #'btx:tx-txid :test #'equalp))
 
 (defun check-delayed-sweeps (node)
   "Our own force-closes whose CSV delay has now elapsed."
@@ -1608,7 +1672,12 @@
       (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
             do (scan-block node height))
       (setf (node-scanned-height node) h)
-      (check-delayed-sweeps node))
+      (check-delayed-sweeps node)
+      (maphash (lambda (k sc) (declare (ignore k))
+                 (when (member (sc-close-kind sc) '(:their-commitment :our-commitment))
+                   (handler-case (bt:with-recursive-lock-held ((node-htlc-lock node)) (resolve-htlcs node sc))
+                     (error (e) (nlog node "htlc resolution on ~a: ~a" (subseq (%hex (sc-channel-id sc)) 0 16) e)))))
+               (node-channels node)))
     h))
 
 (defun start-watcher (node &key (interval 3))
