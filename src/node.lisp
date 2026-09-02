@@ -34,6 +34,7 @@
                     (#:f #:cl-payments.features) (#:lv #:cl-payments.live)
                     (#:on #:cl-payments.onion) (#:fw #:cl-payments.forward)
                     (#:inv #:cl-payments.invoice) (#:rt #:cl-payments.route)
+                    (#:chn #:cl-payments.chain) (#:oc #:cl-payments.onchain)
                     (#:tr #:cl-transport) (#:bt #:bordeaux-threads)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:secp #:secp256k1-fast))
@@ -53,6 +54,7 @@
    #:ck-index #:ck-funding #:ck-revocation #:ck-payment #:ck-delayed #:ck-htlc #:ck-seed
    #:node-error #:pay-invoice #:node-router #:run-command-loop
    #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
+   #:node-chain #:node-height #:start-watcher #:force-close #:watch-once
    #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
@@ -82,6 +84,8 @@
   ;; peer contributed.
   (key-index 0)
   scid remote-funding-pubkey remote-node-sig remote-bitcoin-sig
+  ;; On-chain resolution: what spent the funding output, and what we did.
+  close-kind close-txid close-height sweep-txid
   ;; The commitment-cycle state, for channels the daemon accepted.  Channels
   ;; opened by inspect/open-channel.lisp predate this and have none: they are
   ;; announced and routable in the graph, but no HTLC can cross them.
@@ -174,7 +178,11 @@
                                 (let ((k (sc-remote-node-sig sc))) (and k (%hex k)))
                                 :remote-bitcoin-sig
                                 (let ((k (sc-remote-bitcoin-sig sc))) (and k (%hex k)))
-                                :live (let ((l (sc-live sc))) (and l (lv:live->plist l))))
+                                :live (let ((l (sc-live sc))) (and l (lv:live->plist l)))
+                                :close-kind (sc-close-kind sc)
+                                :close-txid (let ((k (sc-close-txid sc))) (and k (%hex k)))
+                                :close-height (sc-close-height sc)
+                                :sweep-txid (let ((k (sc-sweep-txid sc))) (and k (%hex k))))
                           s)
                    (terpri s))
                  (node-channels node))))
@@ -209,7 +217,11 @@
                             :remote-bitcoin-sig
                             (let ((v (getf form :remote-bitcoin-sig)))
                               (and v (%unhex v)))
-                            :live (let ((v (getf form :live))) (and v (lv:plist->live v))))))
+                            :live (let ((v (getf form :live))) (and v (lv:plist->live v)))
+                            :close-kind (getf form :close-kind)
+                            :close-txid (let ((v (getf form :close-txid))) (and v (%unhex v)))
+                            :close-height (getf form :close-height)
+                            :sweep-txid (let ((v (getf form :sweep-txid))) (and v (%unhex v))))))
                    (setf (gethash (%hex (sc-channel-id sc)) (node-channels node)) sc)))))
     (hash-table-count (node-channels node))))
 
@@ -246,6 +258,9 @@
   ;; not at all against a second thread doing the same thing: two writers race
   ;; on the temp file and one of them renames what the other just deleted.
   (save-lock (bt:make-lock "save"))
+  ;; The chain view (Phase 8): a chain backend, the height it last reported,
+  ;; and how far the watcher has scanned for spends of our funding outputs.
+  chain (height nil) (scanned-height nil) watcher-thread
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -880,7 +895,7 @@
                                             :peer-connected-p (and out-peer (p:peer-alive-p out-peer) t)
                                             :available-msat (if out-lc (lv:live-local-balance-msat out-lc) 0)
                                             :pending-htlcs (if out-lc (length (lv:live-htlcs out-lc)) 0))
-                                 :current-height nil)))
+                                 :current-height (node-height node))))
                          (cond
                            ((not (fw:forward-decision-ok-p decision))
                             (let ((code (fw:forward-decision-failure-code decision)))
@@ -1144,6 +1159,7 @@
       (error 'node-error :detail (format nil "invoice is for ~a, we are on ~a"
                                          (inv:inv-network invoice) (w:net-name w:*network*))))
     (when (inv:inv-expired-p invoice) (error 'node-error :detail "invoice has expired"))
+    (unless current-height (setf current-height (node-height node)))
     (unless current-height (error 'node-error :detail "need the current block height"))
     (bt:with-recursive-lock-held ((node-htlc-lock node))
       (let* ((hops (rt:find-route (all-edges node) (node-id node) (inv:inv-payee invoice) amount
@@ -1267,6 +1283,27 @@
                                    :current-height (getf (rest form) :height)
                                    :amount-msat (getf (rest form) :amount-msat)
                                    :result-path result))
+                (:force-close
+                 (let ((txid (force-close node (%unhex (getf (rest form) :channel)))))
+                   (with-open-file (s result :direction :output :if-exists :supersede)
+                     (format s "(:status :broadcast :txid ~s)~%" (bw:hash->hex txid)))))
+                (:publish-revoked
+                 ;; Deliberately publish a state we revoked.  This LOSES the
+                 ;; channel's funds to the peer; it exists to prove, on a devnet,
+                 ;; that the peer's penalty is real.
+                 (let* ((sc (gethash (getf (rest form) :channel) (node-channels node)))
+                        (tx (and sc (sc-live sc) (lv:previous-commitment-tx (sc-live sc)))))
+                   (unless tx (error 'node-error :detail "no revoked commitment to publish"))
+                   (chn:chain-broadcast (node-chain node) tx)
+                   (nlog node "CHEATING on purpose: published revoked commitment ~d of ~a: ~a"
+                         (lv::live-prev-index (sc-live sc)) (subseq (getf (rest form) :channel) 0 16)
+                         (bw:hash->hex (btx:tx-txid tx)))
+                   (with-open-file (s result :direction :output :if-exists :supersede)
+                     (format s "(:status :broadcast :txid ~s)~%" (bw:hash->hex (btx:tx-txid tx))))))
+                (:close
+                 (close-channel node (%unhex (getf (rest form) :channel)))
+                 (with-open-file (s result :direction :output :if-exists :supersede)
+                   (format s "(:status :shutdown-sent)~%")))
                 (:graph
                  (with-open-file (s result :direction :output :if-exists :supersede)
                    (bt:with-lock-held ((node-router-lock node))
@@ -1454,6 +1491,141 @@
         (p:send-message peer msg nil)
         (nlog node "  closing_signed proposed at ~d sat — closing tx ~a"
               +closing-fee-sat+ (bw:hash->hex (btx:tx-txid tx)))))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; Watching the chain
+;;;
+;;; Three duties, all of them things the daemon used to leave to a human:
+;;;   * confirm fundings, and say channel_ready when they are deep enough;
+;;;   * notice a spend of any funding output, decide what it was, and answer
+;;;     it — sweep, penalty, or a delayed sweep once the CSV has run out;
+;;;   * know the height, so payments and forwarding checks stop needing it
+;;;     passed in.
+;;; ----------------------------------------------------------------------------
+
+(defconstant +funding-depth+ 1
+  "Confirmations before we call a funding locked in.  One is right for a
+   devnet we mine ourselves; a real deployment wants more, because a reorg
+   that drops the funding transaction drops the channel with it.")
+
+(defun funding-outpoints (node)
+  "(txid-bytes index sc) for every live channel that is not yet resolved."
+  (let ((out '()))
+    (maphash (lambda (k sc) (declare (ignore k))
+               (when (and (sc-live sc) (null (sc-close-kind sc)))
+                 (push (list (c:octets (sc-funding-txid sc)) (sc-funding-index sc) sc) out)))
+             (node-channels node))
+    out))
+
+(defun check-fundings (node)
+  "Channels with live state but no scid: has the funding confirmed?  Assign
+   the scid and send channel_ready.  The peer must be connected — a
+   channel_ready to nobody is a channel_ready never sent, and we come back
+   next block."
+  (maphash (lambda (k sc) (declare (ignore k))
+             (when (and (sc-live sc) (null (sc-scid sc)) (null (sc-close-kind sc))
+                        (gethash (%hex (sc-peer-id sc)) (node-peers node)))
+               (multiple-value-bind (height idx) (chn:chain-tx-position (node-chain node) (sc-funding-txid sc))
+                 (when (and height (>= (1+ (- (node-height node) height)) +funding-depth+))
+                   (let ((scid (gs:make-scid height idx (sc-funding-index sc))))
+                     (nlog node "funding of ~a confirmed at ~a" (subseq (%hex (sc-channel-id sc)) 0 16)
+                           (gs:scid-string scid))
+                     (handler-case (funding-confirmed node (sc-channel-id sc) :scid scid)
+                       (error (e) (nlog node "  channel_ready failed: ~a" e))))))))
+           (node-channels node)))
+
+(defun our-sweep-script (node sc) (our-shutdown-script node sc))
+
+(defun answer-spend (node sc tx height)
+  "The funding output of SC was spent by TX at HEIGHT.  Decide and act."
+  (let ((lc (sc-live sc)))
+    (multiple-value-bind (kind n) (oc:classify-spend lc tx)
+      (setf (sc-close-kind sc) kind (sc-close-txid sc) (btx:tx-txid tx) (sc-close-height sc) height)
+      (nlog node "funding of ~a spent at height ~d by ~a: ~(~a~)~@[ (commitment ~d)~]"
+            (subseq (%hex (sc-channel-id sc)) 0 16) height (subseq (bw:hash->hex (btx:tx-txid tx)) 0 16) kind n)
+      (handler-case
+          (ecase kind
+            (:mutual-close (setf (lv:live-closed-p lc) t))
+            (:their-commitment
+             (let ((sweep (oc:sweep-to-remote lc tx (our-sweep-script node sc))))
+               (chn:chain-broadcast (node-chain node) sweep)
+               (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
+               (nlog node "  swept our to_remote: ~a" (bw:hash->hex (btx:tx-txid sweep)))))
+            (:revoked
+             ;; They published a state they had revoked.  Everything in that
+             ;; commitment is ours to take, and the only deadline is their delay.
+             (let ((pen (oc:penalty lc tx n (our-sweep-script node sc))))
+               (chn:chain-broadcast (node-chain node) pen)
+               (setf (sc-sweep-txid sc) (btx:tx-txid pen))
+               (nlog node "  REVOKED COMMITMENT ~d PUBLISHED — penalty broadcast: ~a" n (bw:hash->hex (btx:tx-txid pen)))))
+            (:our-commitment
+             (nlog node "  our own commitment; to_local sweepable after ~d blocks" (lv::live-local-to-self-delay lc)))
+            (:unknown (nlog node "  UNRECOGNISED spend of our funding output — cannot answer it")))
+        (error (e) (nlog node "  answering the spend failed: ~a" e)))
+      (save-channels node))))
+
+(defun check-delayed-sweeps (node)
+  "Our own force-closes whose CSV delay has now elapsed."
+  (maphash (lambda (k sc) (declare (ignore k))
+             (when (and (eq (sc-close-kind sc) :our-commitment) (null (sc-sweep-txid sc))
+                        (>= (node-height node) (+ (sc-close-height sc) (lv::live-local-to-self-delay (sc-live sc)))))
+               (handler-case
+                   (let* ((ours (lv:local-commitment-tx (sc-live sc)))
+                          (sweep (oc:sweep-to-local (sc-live sc) ours (our-sweep-script node sc))))
+                     (chn:chain-broadcast (node-chain node) sweep)
+                     (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
+                     (save-channels node)
+                     (nlog node "delay elapsed on ~a — swept our to_local: ~a"
+                           (subseq (%hex (sc-channel-id sc)) 0 16) (bw:hash->hex (btx:tx-txid sweep))))
+                 (error (e) (nlog node "to_local sweep failed: ~a" e)))))
+           (node-channels node)))
+
+(defun scan-block (node height)
+  "Look through one block for spends of our funding outputs."
+  (let ((outpoints (funding-outpoints node)))
+    (when outpoints
+      (dolist (tx (chn:chain-block-txs (node-chain node) height))
+        (dolist (in (btx:tx-inputs tx))
+          (let ((hit (find-if (lambda (o) (and (equalp (first o) (btx:txin-prev-hash in))
+                                               (= (second o) (btx:txin-prev-index in))))
+                              outpoints)))
+            (when hit
+              (bt:with-recursive-lock-held ((node-htlc-lock node))
+                (answer-spend node (third hit) tx height)))))))))
+
+(defun watch-once (node)
+  "One pass: new height?  Then fundings, new blocks, and delayed sweeps."
+  (let ((h (chn:chain-height (node-chain node))))
+    (unless (eql h (node-height node))
+      (setf (node-height node) h)
+      (check-fundings node)
+      (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
+            do (scan-block node height))
+      (setf (node-scanned-height node) h)
+      (check-delayed-sweeps node))
+    h))
+
+(defun start-watcher (node &key (interval 3))
+  (setf (node-watcher-thread node)
+        (bt:make-thread (lambda ()
+                          (loop while (node-alive-p node)
+                                do (handler-case (watch-once node)
+                                     (error (e) (nlog node "watcher: ~a" e)))
+                                   (sleep interval)))
+                        :name "clp-watcher")))
+
+(defun force-close (node channel-id)
+  "Publish our current commitment.  Unilateral, and final: after this the
+   channel resolves on chain, and our balance is ours only after the delay."
+  (let* ((sc (gethash (%hex channel-id) (node-channels node)))
+         (lc (and sc (sc-live sc))))
+    (unless lc (error 'node-error :detail "no such live channel"))
+    (let ((tx (or (lv:local-commitment-tx lc) (error 'node-error :detail "peer never signed a commitment"))))
+      (chn:chain-broadcast (node-chain node) tx)
+      (nlog node "FORCE-CLOSE: broadcast our commitment ~d for ~a: ~a"
+            (lv:live-local-commit-index lc) (subseq (%hex channel-id) 0 16) (bw:hash->hex (btx:tx-txid tx)))
+      (btx:tx-txid tx))))
 
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+

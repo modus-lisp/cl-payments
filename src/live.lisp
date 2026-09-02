@@ -60,7 +60,7 @@
    #:send-commit #:receive-commit #:receive-revocation
    #:initial-commitment-signature #:verify-initial-commitment
    #:local-commitment-tx #:commitment-number-of #:remote-point-for #:revoked-secret-for
-   #:live-local-commit-sig #:local-point #:pub
+   #:live-local-commit-sig #:local-point #:pub #:previous-commitment-tx
    #:fully-committed-received-htlcs #:can-send-commit-p
    #:reestablish-message
    ;; closing
@@ -132,6 +132,11 @@
   ;; force-close is broadcasting that commitment, which needs both halves of
   ;; the 2-of-2; verifying theirs and forgetting it would leave us unable to.
   local-commit-sig local-commit-htlc-sigs
+  ;; The commitment BEFORE the current one, with their signature over it.
+  ;; This exists for exactly one purpose: to let a devnet node publish a
+  ;; revoked state and prove the counterparty punishes it.  A real node must
+  ;; never keep this, let alone broadcast it — it is a signed confession.
+  prev-commit-sig prev-spec prev-index
   ;; --- closing --------------------------------------------------------------
   local-shutdown-script remote-shutdown-script
   (closed-p nil) closing-txid)
@@ -514,7 +519,10 @@
                  (unless (%verify64 sig hash their-htlc-pub)
                    (fail "their htlc_signature for HTLC ~d does not verify" (hr-id rec))))))
     ;; Everything checks.  Adopt the new commitment and revoke the old one.
-    (setf (live-local-spec lc) spec
+    (setf (live-prev-commit-sig lc) (live-local-commit-sig lc)
+          (live-prev-spec lc) (live-local-spec lc)
+          (live-prev-index lc) (live-local-commit-index lc)
+          (live-local-spec lc) spec
           (live-local-commit-index lc) n
           (live-local-commit-sig lc) (u:cs-signature cs)
           (live-local-commit-htlc-sigs lc) (u:cs-htlc-signatures cs)
@@ -551,6 +559,23 @@
                                                                                (live-remote-funding-pubkey lc) script))
                                            :segwit-p t))))
               built))))
+
+(defun previous-commitment-tx (lc)
+  "Our PREVIOUS commitment, fully signed — a state we have revoked.  Publishing
+   it hands the peer everything in the channel.  Devnet use only, to verify
+   that the punishment is real."
+  (let ((sig (or (live-prev-commit-sig lc) (return-from previous-commitment-tx nil)))
+        (built (%build lc (live-prev-spec lc) :ours t :point (local-point lc (live-prev-index lc))
+                       :index (live-prev-index lc))))
+    (let* ((tx (b-tx built)) (our-pub (pub (live-funding-priv lc)))
+           (our-sig (m:sign-commitment tx (live-funding-priv lc) our-pub (live-remote-funding-pubkey lc) (live-capacity-sat lc)))
+           (script (m:funding-script our-pub (live-remote-funding-pubkey lc))))
+      (btx:parse-tx (bw:make-reader
+                     (btx:serialize-tx
+                      (btx:make-tx :version (btx:tx-version tx) :inputs (btx:tx-inputs tx)
+                                   :outputs (btx:tx-outputs tx) :locktime (btx:tx-locktime tx)
+                                   :witnesses (list (m:funding-witness our-sig our-pub sig (live-remote-funding-pubkey lc) script))
+                                   :segwit-p t)))))))
 
 (defun commitment-number-of (lc tx)
   "Which commitment a broadcast transaction is, read back out of its obscured

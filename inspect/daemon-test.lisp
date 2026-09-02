@@ -27,7 +27,9 @@
   (:local-nicknames (#:c #:cl-payments.crypto) (#:w #:cl-payments.wire)
                     (#:n #:cl-payments.node) (#:lv #:cl-payments.live)
                     (#:inv #:cl-payments.invoice) (#:secp #:secp256k1-fast)
-                    (#:btx #:cl-consensus.tx) (#:bt #:bordeaux-threads))
+                    (#:btx #:cl-consensus.tx) (#:bt #:bordeaux-threads)
+                    (#:chn #:cl-payments.chain) (#:oc #:cl-payments.onchain)
+                    (#:m #:cl-payments.commitment) (#:bs #:cl-consensus.script) (#:bw #:cl-consensus.wire))
   (:export #:run))
 
 (in-package #:daemon-test)
@@ -75,12 +77,28 @@
 
 (defun live-of (node) (let ((sc (only-channel node))) (and sc (n::sc-live sc))))
 
+(defun fake-funding-tx (script value)
+  "A transaction paying VALUE to the funding script, from nowhere.  The mock
+   chain does not validate inputs, only records outputs and spends."
+  (btx:parse-tx (bw:make-reader
+                 (btx:serialize-tx
+                  (btx:make-tx :version 2
+                               :inputs (list (btx:make-txin :prev-hash (c:sha256 script) :prev-index 0 :script #() :sequence #xffffffff))
+                               :outputs (list (btx:make-txout :value value :script (m:p2wsh script)))
+                               :witnesses (list nil) :locktime 0 :segwit-p nil)))))
+
+(defun spends-p (tx in prevout-script amount)
+  (handler-case (bs:verify-input tx in prevout-script amount :flags '(:p2sh :witness :csv)) (error () nil)))
+
 (defun run ()
   (setf *checks* 0 *fails* 0)
   (w:select-network :signet)
   (format t "~&=== daemon: two nodes, one channel, both directions, and a close ===~%")
   (let* ((pa (free-port 19700)) (pb (free-port (1+ pa)))
-         (a (fresh-node "a" pa)) (b (fresh-node "b" pb)))
+         (a (fresh-node "a" pa)) (b (fresh-node "b" pb))
+         ;; ONE mock chain, seen by both: what A broadcasts, B's watcher sees.
+         (chain (chn:make-mock-chain :height 100)))
+    (setf (n:node-chain a) chain (n:node-chain b) chain)
     (n:start a) (n:start b)
     (unwind-protect
          (progn
@@ -93,9 +111,10 @@
            (let ((broadcast-called nil))
              (n:open-channel-to a (n:node-id b) 1000000 :push-msat 200000000
                                 :fund-fn (lambda (script)
-                                           ;; a funding "transaction" that is just a name
-                                           (values (c:sha256 (c:bytes (c:ascii->bytes "funding") script)) 0
-                                                   (lambda () (setf broadcast-called t)))))
+                                           (let ((ftx (fake-funding-tx script 1000000)))
+                                             (values (btx:tx-txid ftx) 0
+                                                     (lambda () (setf broadcast-called t)
+                                                       (chn:chain-broadcast chain ftx))))))
              (wait-for "B accepted and A recorded the channel" 5
                        (lambda () (and (live-of a) (live-of b))))
              (ok "the funding tx was 'broadcast' only after funding_signed" broadcast-called)
@@ -109,13 +128,13 @@
                       (= 200000000 (lv:live-local-balance-msat (live-of b)))
                       (= 200000000 (lv:live-remote-balance-msat (live-of a))))))
 
-           ;; ---- lock in --------------------------------------------------------
+           ;; ---- lock in: the chain confirms the funding, the watchers notice ----
            (let ((cid (n::sc-channel-id (only-channel a))))
-             ;; A short channel id names WHERE the funding confirmed; with no
-             ;; chain, the test assigns one.  Routing needs it even for a direct
-             ;; payment, because the first hop is looked up by scid.
-             (let ((scid (cl-payments.gossip:make-scid 100 1 0)))
-               (n:funding-confirmed a cid :scid scid) (n:funding-confirmed b cid :scid scid))
+             (chn:mock-mine chain 1)
+             (n:watch-once a) (n:watch-once b)
+             (wait-for "both watchers assigned the scid from the chain" 5
+                       (lambda () (and (n::sc-scid (only-channel a)) (n::sc-scid (only-channel b))
+                                       (string= "101x0x0" (cl-payments.gossip:scid-string (n::sc-scid (only-channel a)))))))
              (wait-for "both ends hold the other's next per-commitment point" 5
                        (lambda () (and (lv::live-remote-next-point (live-of a))
                                        (lv::live-remote-next-point (live-of b)))))
@@ -179,18 +198,38 @@
                            (lambda () (and (null (lv:live-htlcs (live-of a))) (null (lv:live-htlcs (live-of b))))))
                  (ok "A's balance is restored" (= 770000000 (lv:live-local-balance-msat (live-of a))))))
 
-             ;; ---- close, initiated by the accepter; the opener proposes the fee -----
-             (n:close-channel b cid)
-             (wait-for "both ends closed" 10 (lambda () (and (lv:live-closed-p (live-of a)) (lv:live-closed-p (live-of b)))))
-             (ok "both ends built the same closing transaction"
-                 (equalp (lv:live-closing-txid (live-of a)) (lv:live-closing-txid (live-of b))))
+             ;; ---- B publishes a REVOKED commitment; A's watcher punishes it ------
+             ;; B's previous commitment is a state B revoked when it accepted the
+             ;; next one.  Broadcasting it is theft; A must take everything.
+             (let* ((cheat (lv:previous-commitment-tx (live-of b))))
+               (ok "B holds a signed previous (revoked) commitment" (and cheat t))
+               (chn:chain-broadcast chain cheat)
+               (chn:mock-mine chain 1)
+               (n:watch-once a) (n:watch-once b)
+               (ok "A classified the spend as :revoked" (eq :revoked (n::sc-close-kind (only-channel a))))
+               (ok "B knows it published its own commitment" (eq :our-commitment (n::sc-close-kind (only-channel b))))
+               (let ((pen (find (n::sc-sweep-txid (only-channel a)) (chn:mock-mempool chain) :key #'btx:tx-txid :test #'equalp)))
+                 (ok "A broadcast a penalty" (and pen t))
+                 (when pen
+                   (multiple-value-bind (lidx lvalue) (oc:to-local-output (live-of a) cheat :theirs t :n (lv::live-prev-index (live-of b)))
+                     (ok "the penalty spends B's to_local with the revocation key"
+                         (spends-p pen 0 (btx:txout-script (nth lidx (btx:tx-outputs cheat))) lvalue))
+                     (ok "and takes it all to A's address"
+                         (equalp (btx:txout-script (first (btx:tx-outputs pen))) (n::our-sweep-script a (only-channel a))))))
+                 ;; B, having cheated, waits out its own delay and tries to sweep —
+                 ;; but the penalty has already spent the output.
+                 (chn:mock-mine chain 1)
+                 (chn:mock-mine chain 200)
+                 (n:watch-once b)
+                 (ok "B's delayed sweep finds the output already gone"
+                     (not (chn:chain-txout-unspent-p chain (btx:tx-txid cheat) 0)))))
 
              ;; ---- and it all survived being written to disk ------------------------
              (let ((reloaded (n:make-node :dir (n:node-dir a) :port 0 :log nil)))
                (n:load-channels reloaded)
-               (ok "A's state reloads closed, with the final balance"
-                   (let ((lc (live-of reloaded)))
-                     (and lc (lv:live-closed-p lc) (= 770000000 (lv:live-local-balance-msat lc))))))))
+               (ok "A's state reloads with the close recorded"
+                   (let ((sc (only-channel reloaded)))
+                     (and sc (eq :revoked (n::sc-close-kind sc)) (n::sc-sweep-txid sc)))))))
       (ignore-errors (n:stop a)) (ignore-errors (n:stop b))))
   (format t "~&~%~d check~:p, ~d failure~:p~%" *checks* *fails*)
   (zerop *fails*))

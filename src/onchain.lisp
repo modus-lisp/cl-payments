@@ -60,7 +60,14 @@
        (values :our-commitment (lv:live-local-commit-index lc)))
       (t
        (let ((n (lv:commitment-number-of lc tx)))
-         (cond ((lv:revoked-secret-for lc n) (values :revoked n))
+         (cond
+           ;; An OLD commitment of ours — one we revoked.  Recognised by its
+           ;; to_local being guarded by our delayed key at that number.  Nothing
+           ;; good follows for us: the peer holds its revocation secret.
+           ((and (<= n (lv:live-local-commit-index lc))
+                 (ignore-errors (%own-to-local-at lc tx n)))
+            (values :our-commitment n))
+           ((lv:revoked-secret-for lc n) (values :revoked n))
                ((or (= n (lv:live-remote-commit-index lc))
                     (= n (1+ (lv:live-remote-commit-index lc))))
                 (values :their-commitment n))
@@ -79,6 +86,14 @@
    remotekey — no per-commitment tweak, which is the point of the option: we
    can find and spend it without knowing which commitment this was)."
   (%find-output their-tx (m:to-remote-scriptpubkey (lv:pub (lv::live-payment-priv lc)))))
+
+(defun %own-to-local-at (lc tx n)
+  "Index of OUR to_local in TX if TX is our commitment number N."
+  (let* ((point (lv:local-point lc n))
+         (script (m:to-local-script (k:derive-revocation-pubkey (lv::live-remote-revocation-basepoint lc) point)
+                                    (lv::live-local-to-self-delay lc)
+                                    (k:derive-pubkey (lv:pub (lv::live-delayed-priv lc)) point))))
+    (%find-output tx (m:p2wsh script))))
 
 (defun to-local-output (lc tx &key theirs n)
   "The delayed output.  For OUR commitment: our delayed key, their revocation

@@ -7,6 +7,7 @@
 ;;;;   CLP_DIR      node directory, holding node.key and channels.sexp (required)
 ;;;;   CLP_PORT     port to listen on                        (default 9935)
 ;;;;   CLP_NETWORK  mainnet | testnet | signet | regtest     (default signet)
+;;;;   CLP_BITCOIN_CLI  "bitcoin-cli -signet -datadir=..." — the chain view (optional)
 ;;;;   CLP_CONNECT  optional <node_id>@host:port to dial on startup
 ;;;;
 ;;;;   CLP_DIR=/mnt/lisp/signet/clp1 CLP_PORT=9931 \
@@ -32,7 +33,14 @@
   (with-open-file (s (merge-pathnames "clp.pid" (uiop:ensure-directory-pathname dir))
                      :direction :output :if-exists :supersede)
     (format s "~d~%" (sb-posix:getpid)))
+  ;; A chain view, if we were told where bitcoind is.  Without one the daemon
+  ;; still runs — it just cannot confirm fundings, see closes, or punish.
+  (let ((cli (env "CLP_BITCOIN_CLI")))
+    (when cli
+      (setf (cl-payments.node:node-chain node) (cl-payments.chain:make-bitcoind cli))
+      (format t "~&chain view: ~a~%" cli)))
   (cl-payments.node:start node)
+  (when (cl-payments.node:node-chain node) (cl-payments.node:start-watcher node))
   ;; Commands arrive as files; see RUN-COMMAND-LOOP.  Its own thread, so the
   ;; main one stays free to keep the process alive.
   (bordeaux-threads:make-thread (lambda () (cl-payments.node:run-command-loop node))
