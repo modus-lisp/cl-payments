@@ -36,7 +36,8 @@
    #:sweep-to-remote #:sweep-to-local #:penalty
    #:to-remote-output #:to-local-output
    #:their-htlc-outputs #:claim-htlcs-from-their-commitment
-   #:our-htlc-second-stage #:sweep-second-stage))
+   #:our-htlc-second-stage #:sweep-second-stage
+   #:fee-for #:+vsize-p2wpkh-input+ #:+vsize-script-input+ #:+vsize-output+ #:+vsize-overhead+))
 
 (in-package #:cl-payments.onchain)
 
@@ -74,6 +75,29 @@
                     (= n (1+ (lv:live-remote-commit-index lc))))
                 (values :their-commitment n))
                (t (values :unknown n))))))))
+
+;;; ----------------------------------------------------------------------------
+;;; Fees
+;;;
+;;; Sweeps race a deadline, so their fee has to be one the network relays and
+;;; mines promptly — and it has to be chosen BEFORE signing, because it changes
+;;; the output value the signature covers.  So the fee comes from a vsize
+;;; estimate by input kind rather than from measuring the signed transaction.
+;;; The estimates are the standard ones and err a few bytes high; overpaying a
+;;; few satoshi is nothing next to losing the race.
+;;; ----------------------------------------------------------------------------
+
+(defconstant +vsize-overhead+ 11 "version, counts, locktime, segwit marker.")
+(defconstant +vsize-output+ 31 "one P2WPKH output.")
+(defconstant +vsize-p2wpkh-input+ 68)
+(defconstant +vsize-script-input+ 150
+  "A P2WSH input with one signature and a to_local- or HTLC-sized script.")
+
+(defun fee-for (feerate-per-kvb &key (p2wpkh-inputs 0) (script-inputs 0) (outputs 1))
+  "Satoshis, for a transaction of that shape at FEERATE-PER-KVB."
+  (let ((vsize (+ +vsize-overhead+ (* outputs +vsize-output+)
+                  (* p2wpkh-inputs +vsize-p2wpkh-input+) (* script-inputs +vsize-script-input+))))
+    (max 1 (ceiling (* vsize feerate-per-kvb) 1000))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Finding outputs
@@ -168,7 +192,7 @@
                 (push (list idx (btx:txout-value (nth idx (btx:tx-outputs tx))) script rec) found))))
           (nreverse found))))))
 
-(defun claim-htlcs-from-their-commitment (lc tx n dest-script preimages &key height (fee-sat 500))
+(defun claim-htlcs-from-their-commitment (lc tx n dest-script preimages &key height feerate (fee-sat (if feerate (fee-for feerate :script-inputs 1) 500)))
   "Direct claims on THEIR commitment's HTLC outputs.  PREIMAGES is a list of
    32-byte preimages we know.  Returns the transactions we can make right now:
    a preimage claim for each HTLC they offered us that we can settle, and a
@@ -237,7 +261,7 @@
                             out)))))))
     (nreverse out)))
 
-(defun sweep-second-stage (lc htlc-tx dest-script &key (fee-sat 500))
+(defun sweep-second-stage (lc htlc-tx dest-script &key feerate (fee-sat (if feerate (fee-for feerate :script-inputs 1) 500)))
   "Claim the delayed output of one of OUR second-stage HTLC transactions, after
    the CSV delay — the same shape as to_local, with the same keys."
   (let* ((point (lv:local-point lc (lv:live-local-commit-index lc)))
@@ -289,7 +313,7 @@
   "BIP143: a P2WPKH input's scriptCode is the classic P2PKH script."
   (c:bytes (vector #x76 #xa9 #x14) (bw:hash160 (c:octets pubkey)) (vector #x88 #xac)))
 
-(defun sweep-to-remote (lc their-tx dest-script &key (fee-sat 500))
+(defun sweep-to-remote (lc their-tx dest-script &key feerate (fee-sat (if feerate (fee-for feerate :p2wpkh-inputs 1) 500)))
   "Claim our to_remote from THEIR commitment.  Spendable immediately: no delay
    binds it, because it is their commitment, and the delay is on THEIR side."
   (multiple-value-bind (idx value) (to-remote-output lc their-tx)
@@ -299,7 +323,7 @@
            (sig (%sign tx 0 (%p2wpkh-script-code pub) value (lv::live-payment-priv lc))))
       (%with-witnesses tx (list (list sig (c:octets pub)))))))
 
-(defun sweep-to-local (lc our-tx dest-script &key (fee-sat 500))
+(defun sweep-to-local (lc our-tx dest-script &key feerate (fee-sat (if feerate (fee-for feerate :script-inputs 1) 500)))
   "Claim our to_local from OUR commitment, after the CSV delay.  The input's
    nSequence carries the delay: that is how OP_CHECKSEQUENCEVERIFY learns the
    transaction is old enough, and a sweep with the wrong sequence is rejected
@@ -314,7 +338,7 @@
       ;; <sig> <> <script>: the empty element takes the OP_ELSE branch.
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
 
-(defun penalty (lc their-revoked-tx n dest-script &key (fee-sat 500))
+(defun penalty (lc their-revoked-tx n dest-script &key feerate (fee-sat nil))
   "They published commitment N, which they revoked.  Take their to_local with
    the revocation key — and our own to_remote while we are at it, in one
    transaction.  The revocation private key exists only because they handed us
@@ -333,7 +357,12 @@
                (pay-pub (lv:pub (lv::live-payment-priv lc)))
                (witnesses '()) (i 0))
           (unless inputs (fail "nothing to claim in commitment ~d" n))
-          (let ((tx (%sweep-tx inputs dest-script total fee-sat)))
+          (let ((tx (%sweep-tx inputs dest-script total
+                               (or fee-sat
+                                   (if feerate
+                                       (fee-for feerate :p2wpkh-inputs (if ridx 1 0)
+                                                        :script-inputs (+ (if lidx 1 0) (length htlcs)))
+                                       500)))))
             (when lidx
               ;; <sig> 1 <script>: the OP_IF branch, guarded by the revocation key.
               (push (list (%sign tx i lscript lvalue rev-priv) (vector 1) lscript) witnesses)

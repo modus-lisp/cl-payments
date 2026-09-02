@@ -206,6 +206,25 @@
                                                             :flags '(:p2sh :witness :csv :cltv))
                                (error () nil))))))))))
 
+        (with-gate ("onchain: fees follow the feerate")
+          (check-equal "a P2WPKH sweep at 1 sat/vB" (oc:fee-for 1000 :p2wpkh-inputs 1) 110)
+          (check-equal "the same at 10 sat/vB" (oc:fee-for 10000 :p2wpkh-inputs 1) 1100)
+          (check "a penalty with three script inputs costs more than one"
+                 (> (oc:fee-for 2000 :script-inputs 3) (oc:fee-for 2000 :script-inputs 1)))
+          (check "never zero" (>= (oc:fee-for 1 :p2wpkh-inputs 1) 1))
+          ;; and the builders actually use it: the same sweep at two rates
+          (let* ((their (lv:local-commitment-tx a))
+                 (cheap (oc:sweep-to-remote b their dest :feerate 1000))
+                 (dear (oc:sweep-to-remote b their dest :feerate 20000)))
+            (multiple-value-bind (idx value) (oc:to-remote-output b their)
+              (declare (ignore idx))
+              (check "a higher feerate leaves less in the sweep"
+                     (< (btx:txout-value (first (btx:tx-outputs dear))) (btx:txout-value (first (btx:tx-outputs cheap)))))
+              (check-equal "and the cheap one paid exactly its estimate"
+                           (- value (btx:txout-value (first (btx:tx-outputs cheap)))) (oc:fee-for 1000 :p2wpkh-inputs 1))
+              (check "the mock chain reports a feerate above the floor"
+                     (>= (chn:chain-feerate (chn:make-mock-chain)) 1000)))))
+
         (with-gate ("onchain: revocation secrets survive persistence")
           (let ((back (lv:plist->live (lv:live->plist b))))
             (check "the reloaded channel can still punish commitment 1"

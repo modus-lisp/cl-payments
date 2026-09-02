@@ -271,6 +271,7 @@
   ;; The chain view (Phase 8): a chain backend, the height it last reported,
   ;; and how far the watcher has scanned for spends of our funding outputs.
   chain (height nil) (scanned-height nil) watcher-thread
+  (feerate 1000)                     ; sat/kvB, refreshed by the watcher each block
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -1493,7 +1494,9 @@
       (save-channels node)
       (nlog node "shutdown sent for ~a" (subseq (%hex channel-id) 0 16)))))
 
-(defconstant +closing-fee-sat+ 1000)
+(defun closing-fee-sat (node)
+  "A mutual close is one P2WSH input and two outputs; ~170 vB."
+  (max 300 (ceiling (* 170 (node-feerate node)) 1000)))
 
 (defun maybe-propose-close (node peer sc)
   "Both shutdowns are in.  The OPENER proposes the fee — it pays it — and the
@@ -1502,10 +1505,11 @@
     (when (and (eq (lv:live-opener lc) :local)
                (lv:live-local-shutdown-script lc) (lv:live-remote-shutdown-script lc)
                (not (lv:live-closed-p lc)) (null (lv:live-htlcs lc)))
-      (multiple-value-bind (msg tx) (lv:propose-close lc +closing-fee-sat+)
-        (p:send-message peer msg nil)
-        (nlog node "  closing_signed proposed at ~d sat — closing tx ~a"
-              +closing-fee-sat+ (bw:hash->hex (btx:tx-txid tx)))))))
+      (let ((fee (closing-fee-sat node)))
+        (multiple-value-bind (msg tx) (lv:propose-close lc fee)
+          (p:send-message peer msg nil)
+          (nlog node "  closing_signed proposed at ~d sat — closing tx ~a"
+                fee (bw:hash->hex (btx:tx-txid tx))))))))
 
 
 ;;; ----------------------------------------------------------------------------
@@ -1564,14 +1568,14 @@
           (ecase kind
             (:mutual-close (setf (lv:live-closed-p lc) t))
             (:their-commitment
-             (let ((sweep (oc:sweep-to-remote lc tx (our-sweep-script node sc))))
+             (let ((sweep (oc:sweep-to-remote lc tx (our-sweep-script node sc) :feerate (node-feerate node))))
                (chn:chain-broadcast (node-chain node) sweep)
                (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
                (nlog node "  swept our to_remote: ~a" (bw:hash->hex (btx:tx-txid sweep)))))
             (:revoked
              ;; They published a state they had revoked.  Everything in that
              ;; commitment is ours to take, and the only deadline is their delay.
-             (let ((pen (oc:penalty lc tx n (our-sweep-script node sc))))
+             (let ((pen (oc:penalty lc tx n (our-sweep-script node sc) :feerate (node-feerate node))))
                (chn:chain-broadcast (node-chain node) pen)
                (setf (sc-sweep-txid sc) (btx:tx-txid pen))
                (nlog node "  REVOKED COMMITMENT ~d PUBLISHED — penalty broadcast: ~a" n (bw:hash->hex (btx:tx-txid pen)))))
@@ -1600,7 +1604,7 @@
       (case (sc-close-kind sc)
         (:their-commitment
          (let ((n (lv:commitment-number-of lc tx)))
-           (dolist (claim (oc:claim-htlcs-from-their-commitment lc tx n dest preimages :height height))
+           (dolist (claim (oc:claim-htlcs-from-their-commitment lc tx n dest preimages :height height :feerate (node-feerate node)))
              (let ((idx (btx:txin-prev-index (first (btx:tx-inputs claim)))))
                (unless (funcall done idx)
                  (%broadcast-claim node sc "direct claim" claim idx))))))
@@ -1624,7 +1628,7 @@
                         (not (assoc (list :stage htxid) (sc-claimed sc) :test #'equalp)))
                (let* ((htx (%find-tx node htxid (cdr entry))))
                  (when htx
-                   (let ((sweep (oc:sweep-second-stage lc htx dest)))
+                   (let ((sweep (oc:sweep-second-stage lc htx dest :feerate (node-feerate node))))
                      (chn:chain-broadcast (node-chain node) sweep)
                      (push (cons (list :stage htxid) (btx:tx-txid sweep)) (sc-claimed sc))
                      (nlog node "  swept second-stage ~a: ~a" (subseq (bw:hash->hex htxid) 0 16)
@@ -1641,7 +1645,7 @@
                         (>= (node-height node) (+ (sc-close-height sc) (lv::live-local-to-self-delay (sc-live sc)))))
                (handler-case
                    (let* ((ours (lv:local-commitment-tx (sc-live sc)))
-                          (sweep (oc:sweep-to-local (sc-live sc) ours (our-sweep-script node sc))))
+                          (sweep (oc:sweep-to-local (sc-live sc) ours (our-sweep-script node sc) :feerate (node-feerate node))))
                      (chn:chain-broadcast (node-chain node) sweep)
                      (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
                      (save-channels node)
@@ -1668,6 +1672,7 @@
   (let ((h (chn:chain-height (node-chain node))))
     (unless (eql h (node-height node))
       (setf (node-height node) h)
+      (setf (node-feerate node) (handler-case (chn:chain-feerate (node-chain node)) (error () (node-feerate node))))
       (check-fundings node)
       (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
             do (scan-block node height))

@@ -20,7 +20,7 @@
   (:nicknames #:ln-chain)
   (:export
    #:chain-height #:chain-block-txs #:chain-txout-unspent-p #:chain-broadcast
-   #:chain-confirmations #:chain-tx-position #:chain-error
+   #:chain-confirmations #:chain-tx-position #:chain-feerate #:chain-error
    #:bitcoind #:make-bitcoind
    #:mock-chain #:make-mock-chain #:mock-mine #:mock-mempool))
 
@@ -40,6 +40,12 @@
   (:documentation "Confirmations of a transaction, or NIL if unknown."))
 (defgeneric chain-tx-position (chain txid-bytes)
   (:documentation "(values height index) of a confirmed transaction, or NIL."))
+(defgeneric chain-feerate (chain)
+  (:documentation "A feerate to pay, in satoshi per 1000 virtual bytes.  Never
+   below the relay floor: a sweep that is cheaper than that is a sweep nobody
+   relays, and the deadline it was racing does not wait."))
+
+(defconstant +feerate-floor+ 1000 "1 sat/vB: Core's default minimum relay fee.")
 
 ;;; ----------------------------------------------------------------------------
 ;;; bitcoind, over bitcoin-cli
@@ -89,6 +95,31 @@
                 (chain-error () nil))))
     (and json (%json-field json "confirmations"))))
 
+(defun %btc->sat (str)
+  "\"0.00001234\" -> 1234, exactly.  Decimal strings are not floats; reading
+   them as floats and multiplying by 1e8 is how a fee ends up one satoshi off."
+  (let* ((dot (position #\. str))
+         (whole (parse-integer str :end (or dot (length str))))
+         (frac (if dot (subseq str (1+ dot)) ""))
+         (frac (subseq (concatenate 'string frac "00000000") 0 8)))
+    (+ (* whole 100000000) (parse-integer frac))))
+
+(defun %json-decimal (json key)
+  "A decimal-number field as satoshis, or NIL."
+  (let* ((k (format nil "\"~a\": " key)) (at (search k json)))
+    (when at
+      (let* ((start (+ at (length k)))
+             (end (position-if-not (lambda (ch) (or (digit-char-p ch) (char= ch #\.))) json :start start)))
+        (ignore-errors (%btc->sat (subseq json start end)))))))
+
+(defmethod chain-feerate ((chain bitcoind))
+  ;; estimatesmartfee answers in BTC/kvB, or with an "errors" field when it has
+  ;; nothing to say — on a chain whose mempool has never been full, that is
+  ;; always.  Then the node's own relay minimum is the honest number.
+  (let ((est (%json-decimal (handler-case (%cli chain "estimatesmartfee" "6") (chain-error () "")) "feerate"))
+        (min (%json-decimal (handler-case (%cli chain "getmempoolinfo") (chain-error () "")) "mempoolminfee")))
+    (max +feerate-floor+ (or est 0) (or min 0))))
+
 (defmethod chain-tx-position ((chain bitcoind) txid)
   (let ((json (handler-case (%cli chain "getrawtransaction" (bw:hash->hex txid) "true")
                 (chain-error () nil))))
@@ -122,6 +153,7 @@
   (chain-height chain))
 
 (defmethod chain-height ((chain mock-chain)) (1- (length (mock-blocks chain))))
+(defmethod chain-feerate ((chain mock-chain)) 2000)
 (defmethod chain-block-txs ((chain mock-chain) height) (aref (mock-blocks chain) height))
 (defmethod chain-broadcast ((chain mock-chain) tx) (push tx (mock-mempool chain)) (bw:hash->hex (btx:tx-txid tx)))
 
