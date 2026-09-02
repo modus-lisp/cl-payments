@@ -637,9 +637,29 @@ channel), a cooperative close, a force-close with the to_local swept after the
 delay, and a deliberately published revoked commitment that Core Lightning
 punished. 24 of 24.
 
-What a production node would still want, in order: more than one confirmation
-before a funding is locked in; watchtower-style outsourcing of the penalty;
-anchor outputs, so fees can be bumped after the fact; and the non-goals below.
+The three things a production node still wanted are done too:
+
+- **Funding depth.** Three confirmations by default (`CLP_FUNDING_DEPTH`), and
+  as opener the larger of ours and the peer's `minimum_depth`.
+- **Watchtowers.** At every revocation the daemon pre-signs the penalty for the
+  commitment just revoked and hands each configured tower a blob encrypted
+  under the revoked transaction's own txid, hinted by its first sixteen bytes.
+  The tower learns nothing until the transaction appears on chain, then
+  broadcasts the penalty. Any daemon is a tower if asked (`:watch` over the
+  control socket); the daemon gate's third node punishes B's cheat before A
+  sees the block. On the devnet clp1 holds clp3's blobs — Core Lightning does
+  not cheat, so there the tower can only be shown to hold what it was given.
+- **Anchor outputs.** The Appendix F commitment format, byte for byte across
+  all nine vectors; negotiated with any peer that advertises it, which Core
+  Lightning does by default; the 1-CSV to_remote and HTLC claims; a
+  zero-fee second stage funded by an input of ours and re-signed after the
+  peer's SINGLE|ANYONECANPAY signature; and a child-pays-for-parent bump of a
+  published commitment through its anchor. Inputs of our own come from a
+  minimal UTXO tracker the watcher feeds: our sweeps and penalties, and a
+  deposit address (`:address`). `integration.sh` runs its 25 steps against
+  Core Lightning over anchor channels.
+
+Left as non-goals: what follows.
 
 Carried forward: channels opened by `inspect/open-channel.lisp` predate the live
 state and cannot carry HTLCs (CLN's channeld gives up on them — reopen from the

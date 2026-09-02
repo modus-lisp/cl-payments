@@ -20,7 +20,7 @@
 (defun lt-key (label) (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "live-test/~a" label)))))
 (defun lt-pub (k) (c:compressed-pubkey (c:pubkey-of k)))
 
-(defun make-live-pair ()
+(defun make-live-pair (&key anchors)
   "A opened the channel with 1_000_000 sat, pushing 200_000 to B."
   (let* ((fund-txid (c:sha256 (c:ascii->bytes "live-test/funding")))
          (cap 1000000) (a-msat 800000000) (b-msat 200000000)
@@ -34,7 +34,7 @@
     (flet ((mk (mine theirs opener local remote my-seed their-seed my-delay their-delay)
              (let ((lc (lv:make-live
                         :channel-id cid :funding-txid fund-txid :funding-index 0 :capacity-sat cap
-                        :opener opener
+                        :opener opener :anchors-p anchors
                         :funding-priv (getf mine :funding) :revocation-priv (getf mine :revocation)
                         :payment-priv (getf mine :payment) :delayed-priv (getf mine :delayed)
                         :htlc-priv (getf mine :htlc) :seed my-seed

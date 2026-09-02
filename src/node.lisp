@@ -57,6 +57,7 @@
    #:node-chain #:node-height #:start-watcher #:force-close #:watch-once
    #:mint-invoice #:node-invoices #:handle-command #:start-control-server #:node-control-port
    #:node-funding-depth #:node-towers #:node-tower-store #:offer-to-towers #:control-call
+   #:node-utxos #:deposit-script #:deposit-privkey
    #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
@@ -290,6 +291,10 @@
   ;; when WE are a tower, the blobs we hold: hint hex -> encrypted penalty.
   (towers '())
   (tower-store (make-hash-table :test 'equal))
+  ;; Outputs we can spend on our own: sweeps and penalties that paid to us,
+  ;; and deposits to the address (:address) hands out.  What anchor channels
+  ;; need for fees.  Persisted in utxos.sexp.
+  (utxos '())
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -1338,6 +1343,10 @@
            (save-tower-store node)
            (r "(:status :watching :held ~d)" (hash-table-count (node-tower-store node))))
           (:tower-status (r "(:held ~d)" (hash-table-count (node-tower-store node))))
+          (:address
+           (r "(:script ~s :note ~s)" (%hex (deposit-script node))
+              "P2WPKH; pay it and the watcher records the UTXO for anchor fees"))
+          (:utxos (r "(:count ~d :total-sat ~d)" (length (node-utxos node)) (reduce #'+ (node-utxos node) :key #'oc:utxo-value)))
           (:info
            (r "(:id ~s :height ~a :feerate ~d :peers ~d :channels ~d)" (%hex (node-id node)) (node-height node)
               (node-feerate node) (node-peer-count node) (node-channel-count node))))
@@ -1683,11 +1692,26 @@
          ;; Second stage first: the pre-signed HTLC-success / HTLC-timeout.
          (dolist (entry (oc:our-htlc-second-stage lc dest preimages :height height))
            (destructuring-bind (kind rec htx) entry
-             (declare (ignore rec))
              (let ((idx (btx:txin-prev-index (first (btx:tx-inputs htx)))))
                (unless (funcall done idx)
-                 (%broadcast-claim node sc (format nil "HTLC-~(~a~)" kind) htx idx)
-                 (push (cons (btx:tx-txid htx) nil) (sc-second-stage sc))))))
+                 (let ((final htx))
+                   ;; Zero-fee on anchor channels: it needs an input of ours.
+                   (when (lv:live-anchors-p lc)
+                     (let ((u (spendable-utxo node 2000)))
+                       (if u
+                           (let* ((built (lv:built-local lc))
+                                  (out (find idx (lv:b-htlc-outputs built) :key #'first))
+                                  (their-der (second (first (btx:tx-witnesses htx))))
+                                  (pre (and (eq kind :success)
+                                            (find (lv:hr-payment-hash rec) preimages :key (lambda (p) (c:sha256 p)) :test #'equalp))))
+                             (setf final (oc:fund-second-stage lc htx their-der (third out)
+                                                               (floor (lv:hr-amount-msat rec) 1000) pre u (node-feerate node)))
+                             (setf (node-utxos node) (remove u (node-utxos node))) (save-utxos node))
+                           (progn (nlog node "  HTLC-~(~a~) for output ~d needs an input for its fee and we have none" kind idx)
+                                  (setf final nil)))))
+                   (when final
+                     (%broadcast-claim node sc (format nil "HTLC-~(~a~)" kind) final idx)
+                     (push (cons (btx:tx-txid final) nil) (sc-second-stage sc))))))))
          ;; Then the delayed outputs of any second stage that has confirmed.
          (dolist (entry (sc-second-stage sc))
            (destructuring-bind (htxid . confirmed-at) entry
@@ -1755,6 +1779,8 @@
       (check-fundings node)
       (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
             do (scan-block node height)
+               (handler-case (dolist (tx (chn:chain-block-txs (node-chain node) height)) (note-our-outputs node tx))
+                 (error (e) (nlog node "utxo scan: ~a" e)))
                (handler-case (tower-check-block node height)
                  (error (e) (nlog node "tower scan: ~a" e))))
       (setf (node-scanned-height node) h)
@@ -1785,6 +1811,19 @@
       (chn:chain-broadcast (node-chain node) tx)
       (nlog node "FORCE-CLOSE: broadcast our commitment ~d for ~a: ~a"
             (lv:live-local-commit-index lc) (subseq (%hex channel-id) 0 16) (bw:hash->hex (btx:tx-txid tx)))
+      ;; An anchor commitment carries whatever fee it was signed at; bring it
+      ;; to today's rate through its anchor, if we have an input to do it with.
+      (when (lv:live-anchors-p lc)
+        (let ((u (spendable-utxo node 5000)))
+          (if u
+              (handler-case
+                  (let ((bump (oc:bump-with-anchor lc tx u (node-feerate node))))
+                    (chn:chain-broadcast (node-chain node) bump)
+                    (setf (node-utxos node) (remove u (node-utxos node))) (save-utxos node)
+                    (nlog node "  anchor bump broadcast: ~a (parent+child at ~d sat/kvB)"
+                          (bw:hash->hex (btx:tx-txid bump)) (node-feerate node)))
+                (error (e) (nlog node "  anchor bump failed: ~a" e)))
+              (nlog node "  no input to bump the anchor with; the commitment carries its own fee"))))
       (btx:tx-txid tx))))
 
 
@@ -1919,6 +1958,69 @@
             (remhash hint (node-tower-store node))
             (save-tower-store node)))))))
 
+
+;;; ----------------------------------------------------------------------------
+;;; Outputs of our own
+;;; ----------------------------------------------------------------------------
+
+(defun deposit-privkey (node) (%derive-scalar (node-privkey node) 0 "deposit"))
+(defun deposit-script (node) (m:p2wpkh (ck-pub (deposit-privkey node))))
+
+(defun our-scripts (node)
+  "Every scriptPubKey an output could pay us at: the deposit address and each
+   channel's sweep address, with the key for it."
+  (let ((out (list (cons (deposit-script node) (deposit-privkey node)))))
+    (maphash (lambda (k sc) (declare (ignore k))
+               (push (cons (our-sweep-script node sc) (%derive-scalar (node-privkey node) (sc-key-index sc) "close")) out))
+             (node-channels node))
+    out))
+
+(defun utxos-path (node) (merge-pathnames "utxos.sexp" (node-dir node)))
+
+(defun save-utxos (node)
+  (bt:with-lock-held ((node-save-lock node))
+    (with-open-file (s (utxos-path node) :direction :output :if-exists :supersede)
+      (let ((*print-pretty* nil))
+        (dolist (u (node-utxos node))
+          (prin1 (list :txid (%hex (oc:utxo-txid u)) :vout (oc:utxo-vout u) :value (oc:utxo-value u)
+                       :privkey (oc:utxo-privkey u))
+                 s)
+          (terpri s))))))
+
+(defun load-utxos (node)
+  (when (probe-file (utxos-path node))
+    (with-open-file (s (utxos-path node))
+      (setf (node-utxos node)
+            (loop for f = (read s nil) while f
+                  collect (oc:make-utxo :txid (%unhex (getf f :txid)) :vout (getf f :vout)
+                                        :value (getf f :value) :privkey (getf f :privkey)))))))
+
+(defun note-our-outputs (node tx)
+  "Record any output of TX that pays one of our scripts, and drop any of our
+   UTXOs that TX spends."
+  (let ((scripts (our-scripts node)) (changed nil))
+    (dolist (in (btx:tx-inputs tx))
+      (let ((spent (find-if (lambda (u) (and (equalp (oc:utxo-txid u) (btx:txin-prev-hash in))
+                                             (= (oc:utxo-vout u) (btx:txin-prev-index in))))
+                            (node-utxos node))))
+        (when spent (setf (node-utxos node) (remove spent (node-utxos node)) changed t))))
+    (loop for out in (btx:tx-outputs tx) for i from 0
+          do (let ((hit (assoc (btx:txout-script out) scripts :test #'equalp)))
+               (when (and hit (not (find-if (lambda (u) (and (equalp (oc:utxo-txid u) (btx:tx-txid tx)) (= (oc:utxo-vout u) i)))
+                                            (node-utxos node))))
+                 (push (oc:make-utxo :txid (btx:tx-txid tx) :vout i :value (btx:txout-value out) :privkey (cdr hit))
+                       (node-utxos node))
+                 (setf changed t)
+                 (nlog node "  received ~d sat at an address of ours (~a:~d)" (btx:txout-value out)
+                       (subseq (bw:hash->hex (btx:tx-txid tx)) 0 16) i))))
+    (when changed (save-utxos node))))
+
+(defun spendable-utxo (node &optional (at-least 1000))
+  "The largest UTXO we hold worth at least AT-LEAST sat, or NIL."
+  (let ((best (reduce (lambda (a b) (if (and b (> (oc:utxo-value b) (oc:utxo-value a))) b a))
+                      (node-utxos node) :initial-value nil)))
+    (and best (>= (oc:utxo-value best) at-least) best)))
+
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+
         (lambda (pr payload) (handle-open-channel node pr payload)))
@@ -2017,6 +2119,7 @@
   (let ((n (load-channels node)))
     (nlog node "loaded ~d channel~:p from ~a" n (node-dir node)))
   (load-tower-store node)
+  (load-utxos node)
   (setf (node-listener-closer node)
         (tr:expose (lambda (stream peer-plist)
                      (declare (ignore peer-plist))

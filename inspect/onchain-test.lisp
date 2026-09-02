@@ -225,6 +225,58 @@
               (check "the mock chain reports a feerate above the floor"
                      (>= (chn:chain-feerate (chn:make-mock-chain)) 1000)))))
 
+        (with-gate ("onchain: anchor channels — sweeps, funded second stage, and the bump")
+          (multiple-value-bind (a3 b3 fs3 cap3) (make-live-pair :anchors t)
+            (declare (ignore fs3 cap3))
+            (let* ((pre (c:sha256 (c:ascii->bytes "onchain/anchor-pre"))) (hash (c:sha256 pre)) (expiry 700)
+                   (dest3 (m:p2wpkh (lt-pub (lt-key "sweep3"))))
+                   (fee-key (lt-key "fee-utxo"))
+                   (utxo (oc:make-utxo :txid (c:sha256 (c:ascii->bytes "a deposit")) :vout 0 :value 50000 :privkey fee-key)))
+              (oc-cycle a3 b3)
+              (lv:receive-add b3 (payload (lv:send-add a3 60000000 hash expiry (c:zeros u:+onion-packet-size+))))
+              (lv:receive-revocation a3 (payload (lv:receive-commit b3 (payload (lv:send-commit a3)))))
+              (lv:receive-revocation b3 (payload (lv:receive-commit a3 (payload (lv:send-commit b3)))))
+              (let ((a-tx (lv:local-commitment-tx a3)))
+                (check "A's anchor commitment has two anchors"
+                       (= 2 (count 330 (btx:tx-outputs a-tx) :key #'btx:txout-value)))
+                (check "A's commitment spends the funding output" (oc-spends-p a-tx (m:p2wsh fs3) cap3))
+                ;; to_remote: B sweeps through the 1-CSV script path
+                (let ((sweep (oc:sweep-to-remote b3 a-tx dest3)))
+                  (multiple-value-bind (idx value) (oc:to-remote-output b3 a-tx)
+                    (check "B's to_remote is a script output" (and idx t))
+                    (check "B sweeps it with sequence 1 under CSV"
+                           (oc-spends-p sweep (btx:txout-script (nth idx (btx:tx-outputs a-tx))) value))))
+                ;; second stage: A's HTLC-timeout is zero-fee and needs funding
+                (let ((stage (oc:our-htlc-second-stage a3 dest3 '() :height expiry)))
+                  (check "A builds a zero-fee HTLC-timeout" (and stage (eq :timeout (first (first stage)))))
+                  (when stage
+                    (destructuring-bind (kind rec htx) (first stage)
+                      (declare (ignore kind))
+                      (let* ((built (lv:built-local a3))
+                             (out (find (btx:txin-prev-index (first (btx:tx-inputs htx))) (lv:b-htlc-outputs built) :key #'first))
+                             (their-der (second (first (btx:tx-witnesses htx))))
+                             (amount (floor (lv:hr-amount-msat rec) 1000))
+                             (funded (oc:fund-second-stage a3 htx their-der (third out) amount nil utxo 5000)))
+                        (check "the zero-fee tx pays exactly its input" (= amount (btx:txout-value (first (btx:tx-outputs htx)))))
+                        (check "funded: two inputs, two outputs" (and (= 2 (length (btx:tx-inputs funded))) (= 2 (length (btx:tx-outputs funded)))))
+                        (check "input 0 (the HTLC, both signatures) spends under cl-consensus"
+                               (oc-spends-p funded (btx:txout-script (nth (first out) (btx:tx-outputs a-tx))) amount
+                                            :flags '(:p2sh :witness :csv :cltv)))
+                        (check "input 1 (our fee UTXO) spends"
+                               (handler-case (bs:verify-input funded 1 (m:p2wpkh (lt-pub fee-key)) 50000 :flags '(:p2sh :witness :csv :cltv))
+                                 (error () nil)))))))
+                ;; the anchor bump
+                (let ((bump (oc:bump-with-anchor a3 a-tx utxo 5000)))
+                  (multiple-value-bind (aidx ascript) (oc:anchor-output a3 a-tx)
+                    (declare (ignore ascript))
+                    (check "the bump spends A's anchor" (oc-spends-p bump (btx:txout-script (nth aidx (btx:tx-outputs a-tx))) 330))
+                    (check "and the fee UTXO"
+                           (handler-case (bs:verify-input bump 1 (m:p2wpkh (lt-pub fee-key)) 50000 :flags '(:p2sh :witness))
+                             (error () nil)))
+                    (check "paying change back to us" (equalp (btx:txout-script (first (btx:tx-outputs bump))) (m:p2wpkh (lt-pub fee-key))))
+                    (check "B's anchor in A's commitment is a different output, locked to B's funding key"
+                           (let ((bidx (oc:anchor-output b3 a-tx))) (and bidx (/= bidx aidx))))))))))
+
         (with-gate ("onchain: revocation secrets survive persistence")
           (let ((back (lv:plist->live (lv:live->plist b))))
             (check "the reloaded channel can still punish commitment 1"

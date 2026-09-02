@@ -37,7 +37,8 @@
    #:to-remote-output #:to-local-output
    #:their-htlc-outputs #:claim-htlcs-from-their-commitment
    #:our-htlc-second-stage #:sweep-second-stage
-   #:fee-for #:+vsize-p2wpkh-input+ #:+vsize-script-input+ #:+vsize-output+ #:+vsize-overhead+))
+   #:fee-for #:+vsize-p2wpkh-input+ #:+vsize-script-input+ #:+vsize-output+ #:+vsize-overhead+
+   #:fund-second-stage #:anchor-output #:bump-with-anchor #:utxo #:make-utxo #:utxo-txid #:utxo-vout #:utxo-value #:utxo-privkey))
 
 (in-package #:cl-payments.onchain)
 
@@ -285,6 +286,84 @@
            (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
            (sig (%sign tx 0 script value priv)))
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; Inputs of our own
+;;;
+;;; Anchor channels move the fee OFF the commitment: second-stage HTLC
+;;; transactions pay nothing and a commitment may be mined at whatever rate
+;;; it was built at long ago.  Both are fixed the same way — by attaching an
+;;; input we control.  The peer's HTLC signature is SINGLE|ANYONECANPAY, so
+;;; adding an input and a change output leaves it valid; ours is ALL and is
+;;; simply made last.  A UTXO here is one of our own sweep outputs, or a
+;;; deposit: a P2WPKH we hold the key for.
+;;; ----------------------------------------------------------------------------
+
+(defstruct utxo txid vout value privkey)
+
+(defun %utxo-pub (u) (c:compressed-pubkey (c:pubkey-of (utxo-privkey u))))
+
+(defun fund-second-stage (lc htx their-der-sig script htlc-amount-sat preimage-or-nil utxo feerate)
+  "Attach UTXO to a zero-fee second-stage transaction HTX (input 0 already the
+   HTLC output, output 0 already the delayed output) and sign both inputs.
+   PREIMAGE-OR-NIL selects HTLC-success (preimage) or HTLC-timeout (empty)."
+  (let* ((fee (fee-for feerate :script-inputs 1 :p2wpkh-inputs 1 :outputs 2))
+         (change (- (utxo-value utxo) fee)))
+    (when (< change 330) (fail "utxo of ~d sat cannot pay a ~d sat fee" (utxo-value utxo) fee))
+    (let* ((point (lv:local-point lc (lv:live-local-commit-index lc)))
+           (our-priv (k:derive-privkey (lv::live-htlc-priv lc) point))
+           (tx (btx:parse-tx
+                (bw:make-reader
+                 (btx:serialize-tx
+                  (btx:make-tx :version 2
+                               :inputs (list (first (btx:tx-inputs htx))
+                                             (btx:make-txin :prev-hash (c:octets (utxo-txid utxo)) :prev-index (utxo-vout utxo)
+                                                            :script #() :sequence #xffffffff))
+                               :outputs (list (first (btx:tx-outputs htx))
+                                              (btx:make-txout :value change :script (m:p2wpkh (%utxo-pub utxo))))
+                               :witnesses (list nil nil) :locktime (btx:tx-locktime htx) :segwit-p t)))))
+           ;; Ours is SIGHASH_ALL over the FUNDED transaction.  Theirs covered
+           ;; only input 0 and output 0, and both are unchanged.
+           (our-sig (m:sign-htlc-tx tx our-priv script htlc-amount-sat))
+           (fee-sig (%sign tx 1 (%p2wpkh-script-code (%utxo-pub utxo)) (utxo-value utxo) (utxo-privkey utxo))))
+      (%with-witnesses tx (list (list (c:bytes) their-der-sig (m:sig->der our-sig)
+                                      (if preimage-or-nil (c:octets preimage-or-nil) (c:bytes)) script)
+                                (list fee-sig (c:octets (%utxo-pub utxo))))))))
+
+(defun anchor-output (lc commitment-tx)
+  "Our anchor in a published commitment — ours or theirs, it locks to OUR
+   funding key either way.  Returns (values index script) or NIL."
+  (let ((script (m:anchor-script (lv:pub (lv::live-funding-priv lc)))))
+    (let ((idx (%find-output commitment-tx (m:p2wsh script))))
+      (and idx (values idx script)))))
+
+(defun bump-with-anchor (lc commitment-tx utxo feerate)
+  "Child-pays-for-parent: spend our anchor and UTXO together, paying enough
+   that parent and child reach FEERATE.  The commitment's own fee was fixed
+   when it was signed; this is the only way to raise it afterwards."
+  (multiple-value-bind (idx script) (anchor-output lc commitment-tx)
+    (unless idx (fail "no anchor of ours in that commitment"))
+    (let* ((parent-vsize (btx:tx-vsize commitment-tx))
+           (child-vsize (+ +vsize-overhead+ +vsize-script-input+ +vsize-p2wpkh-input+ +vsize-output+))
+           (fee (ceiling (* (+ parent-vsize child-vsize) feerate) 1000))
+           (total (+ m:+anchor-sat+ (utxo-value utxo)))
+           (change (- total fee)))
+      (when (< change 330) (fail "utxo of ~d sat cannot bump a ~d vB commitment at ~d" (utxo-value utxo) parent-vsize feerate))
+      (let* ((tx (btx:parse-tx
+                  (bw:make-reader
+                   (btx:serialize-tx
+                    (btx:make-tx :version 2
+                                 :inputs (list (btx:make-txin :prev-hash (c:octets (btx:tx-txid commitment-tx)) :prev-index idx
+                                                              :script #() :sequence #xffffffff)
+                                               (btx:make-txin :prev-hash (c:octets (utxo-txid utxo)) :prev-index (utxo-vout utxo)
+                                                              :script #() :sequence #xffffffff))
+                                 :outputs (list (btx:make-txout :value change :script (m:p2wpkh (%utxo-pub utxo))))
+                                 :witnesses (list nil nil) :locktime 0 :segwit-p t)))))
+             (anchor-sig (%sign tx 0 script m:+anchor-sat+ (lv::live-funding-priv lc)))
+             (fee-sig (%sign tx 1 (%p2wpkh-script-code (%utxo-pub utxo)) (utxo-value utxo) (utxo-privkey utxo))))
+        (%with-witnesses tx (list (list anchor-sig script)
+                                  (list fee-sig (c:octets (%utxo-pub utxo)))))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Building the answering transactions
