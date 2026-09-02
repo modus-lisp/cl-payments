@@ -1,0 +1,66 @@
+# Bitcoin Core — our OWN signet, for the cl-payments dev environment.
+#
+# This is not a public network.  We hold the block-signing key, so this chain
+# exists only on this box and blocks appear exactly when we mine them.
+#
+# ── Why a private signet and not regtest ───────────────────────────────────
+# regtest throws away the parts of consensus Lightning actually depends on:
+# difficulty is trivial, timestamps are loose, and there is no block signature.
+# A private signet keeps real headers, real (low) proof-of-work, real
+# median-time-past and real BIP325 block-signature validation — the rules
+# cl-consensus validates and that CLTV/CSV timelocks in channels rely on — while
+# still letting us produce a block on demand.  Same consensus, our schedule.
+#
+# ── Why not a public signet ────────────────────────────────────────────────
+# The default signet and Mutinynet are real networks with millions of blocks to
+# sync and a faucet between you and your first coin.  Here the chain starts at
+# height 0 and we mine our own funds, so the environment is reproducible from
+# scratch and a channel-open test confirms the instant we say `mine`.
+
+signet=1
+server=1
+daemon=0
+
+# LND's bitcoind backend normally wants ZMQ, but this v29.1 build (produced for
+# cl-consensus's libbitcoinkernel diff) has no ZMQ compiled in — so LND runs in
+# RPC-polling mode instead, which needs a transaction index.
+txindex=1
+
+# Compact block filters: how a light client (and, later, cl-payments' own
+# on-chain watching) asks "did anything touch my scripts in this block?"
+blockfilterindex=1
+peerblockfilters=1
+
+[signet]
+# Wallets live OUTSIDE the chaindata directory.  Standing up a custom signet
+# means wiping blocks/chainstate whenever the challenge changes, and the
+# block-signing key must survive that — if it doesn't, the chain is unmineable
+# and has to be rebuilt from scratch.
+walletdir=/mnt/lisp/signet/wallets
+
+# OUR block-signing challenge: the scriptPubKey of the `miner` wallet's
+# tb1qfxkgfz8axuhxffs5k2v3j2hpq4geh83q2jd8fu.  Only blocks signed by that key
+# are valid here, which is what makes this a distinct chain from every other
+# signet — and what makes `mine.sh` the only source of blocks.
+#
+# A P2WPKH scriptPubKey (rather than the bare 1-of-1 multisig some guides use)
+# because the descriptor wallet already holds a descriptor matching it, so
+# `walletprocesspsbt` can sign the block without importing anything extra.
+signetchallenge=<your challenge script, see README>
+
+# Fully isolated: no DNS seeds, no automatic outbound peers.  Nobody else has
+# this chain, and we do not want to leak connections to the public signet.
+# `listen` is set explicitly because connect=0 would otherwise disable it — we
+# DO want inbound, so cl-consensus can peer with this node on 38333 and sync
+# from it exactly as it does from the mainnet bitcoind.
+connect=0
+dnsseed=0
+listen=1
+bind=127.0.0.1:38333
+
+rpcbind=127.0.0.1
+rpcport=38332
+rpcallowip=127.0.0.1
+# Signet has no fee history to estimate from; without a fallback, wallet sends
+# and channel opens fail with "insufficient fee data".
+fallbackfee=0.00001

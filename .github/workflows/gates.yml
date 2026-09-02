@@ -12,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # secp256k1-fast and cl-transport are not on Quicklisp; they are
-          # vendored under deps/ and pinned by commit.
+          # cl-consensus, secp256k1-fast and cl-transport are not on Quicklisp;
+          # they are vendored under deps/ and pinned by commit.
           submodules: recursive
       - name: Install SBCL
         run: sudo apt-get update && sudo apt-get install -y sbcl curl

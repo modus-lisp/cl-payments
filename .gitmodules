@@ -4,3 +4,6 @@
 [submodule "deps/cl-transport"]
 	path = deps/cl-transport
 	url = https://github.com/modus-lisp/cl-transport.git
+[submodule "deps/cl-consensus"]
+	path = deps/cl-consensus
+	url = https://github.com/modus-lisp/cl-consensus.git
