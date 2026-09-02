@@ -684,6 +684,9 @@
             (nlog node "  their signature over OUR commitment does not verify — refusing")
             (return-from handle-funding-created nil))
           (nlog node "  their signature over our commitment verifies")
+          ;; It is their signature over our commitment 0: keep it, so a channel
+          ;; that never sees an update can still be force-closed.
+          (setf (lv:live-local-commit-sig lc) (ch:fc-signature fc))
           (p:send-message peer
                           (ch:encode-funding-signed
                            (ch:make-funding-signed :channel-id cid
@@ -1520,6 +1523,7 @@
             (nlog node "  funding_signed: their signature over our commitment does NOT verify — abandoning")
             (remhash (%hex cid) (node-pending node))
             (return-from handle-funding-signed nil))
+          (setf (lv:live-local-commit-sig lc) (ch:fs-signature fs))
           (remhash (%hex cid) (node-pending node))
           (setf (gethash (%hex cid) (node-channels node))
                 (make-stored-channel
