@@ -55,6 +55,7 @@
    #:node-error #:pay-invoice #:node-router #:run-command-loop
    #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
    #:node-chain #:node-height #:start-watcher #:force-close #:watch-once
+   #:mint-invoice #:node-invoices
    #:payment #:pay-status #:pay-preimage #:pay-failure #:pay-amount-msat))
 
 (in-package #:cl-payments.node)
@@ -272,6 +273,10 @@
   ;; and how far the watcher has scanned for spends of our funding outputs.
   chain (height nil) (scanned-height nil) watcher-thread
   (feerate 1000)                     ; sat/kvB, refreshed by the watcher each block
+  ;; Invoices we issued: payment-hash hex -> (preimage bolt11 amount-msat status).
+  ;; The preimage is what makes a payment ours to claim; the record is what
+  ;; lets us say afterwards whether it was.
+  (invoices (make-hash-table :test 'equal))
   (alive-p nil)
   listener-closer
   (lock (bt:make-lock "node"))
@@ -884,6 +889,7 @@
                                          :extra (let ((wr (w:make-writer))) (w:w-u32 wr (lv:hr-cltv-expiry h)) (w:writer-bytes wr))))
                          (pre
                           (p:send-message peer (lv:send-fulfill lc (lv:hr-id h) pre) nil)
+                          (invoice-paid node (lv:hr-payment-hash h) (lv:hr-amount-msat h))
                           (nlog node "  HTLC ~d is for us: onion read, preimage known — fulfilled, ~d msat ours"
                                 (lv:hr-id h) (lv:hr-amount-msat h)))
                          (t
@@ -1320,6 +1326,19 @@
                  (close-channel node (%unhex (getf (rest form) :channel)))
                  (with-open-file (s result :direction :output :if-exists :supersede)
                    (format s "(:status :shutdown-sent)~%")))
+                (:invoice
+                 (multiple-value-bind (bolt11 hash)
+                     (mint-invoice node :amount-msat (getf (rest form) :amount-msat)
+                                        :description (getf (rest form) :description))
+                   (with-open-file (s result :direction :output :if-exists :supersede)
+                     (format s "(:status :ok :bolt11 ~s :payment-hash ~s)~%" bolt11 (%hex hash)))))
+                (:invoice-status
+                 (let ((rec (gethash (getf (rest form) :payment-hash) (node-invoices node))))
+                   (with-open-file (s result :direction :output :if-exists :supersede)
+                     (if rec
+                         (format s "(:status ~s :amount-msat ~d :received-msat ~a)~%"
+                                 (getf rec :status) (getf rec :amount-msat) (getf rec :received-msat))
+                         (format s "(:status :unknown)~%")))))
                 (:graph
                  (with-open-file (s result :direction :output :if-exists :supersede)
                    (bt:with-lock-held ((node-router-lock node))
@@ -1705,6 +1724,44 @@
       (nlog node "FORCE-CLOSE: broadcast our commitment ~d for ~a: ~a"
             (lv:live-local-commit-index lc) (subseq (%hex channel-id) 0 16) (bw:hash->hex (btx:tx-txid tx)))
       (btx:tx-txid tx))))
+
+
+;;; ----------------------------------------------------------------------------
+;;; Invoices
+;;;
+;;; Until now the daemon read preimages from a file and anything paying one of
+;;; those hashes was accepted.  An invoice is the same preimage with a signed
+;;; request wrapped around it: amount, description, expiry, and a payment
+;;; secret so forwarding nodes cannot probe whether we hold it.
+;;; ----------------------------------------------------------------------------
+
+(defun mint-invoice (node &key amount-msat description (expiry 3600))
+  "Create and record an invoice.  Returns (values bolt11 payment-hash)."
+  (let* ((preimage (c:octets (ironclad:random-data 32)))
+         (hash (c:sha256 preimage))
+         (secret (c:octets (ironclad:random-data 32)))
+         (inv (inv:sign-invoice
+               (inv::make-invoice-for :network (w:net-name w:*network*) :amount-msat amount-msat
+                                      :payment-hash hash :payment-secret secret
+                                      :description (or description "") :expiry expiry
+                                      :min-final-cltv 18
+                                      :features (f:features-from '((:payment-secret . :required)
+                                                                   (:var-onion-optin . :required))))
+               (node-privkey node)))
+         (bolt11 (inv:encode-invoice inv)))
+    (bt:with-lock-held ((node-save-lock node))
+      (setf (gethash (%hex hash) (node-invoices node))
+            (list :preimage preimage :bolt11 bolt11 :amount-msat amount-msat :status :unpaid))
+      ;; The preimage file stays the durable record: it is what a restart reads.
+      (with-open-file (s (merge-pathnames "preimages.sexp" (node-dir node))
+                         :direction :output :if-exists :append :if-does-not-exist :create)
+        (format s "~s~%" (%hex preimage))))
+    (nlog node "invoice minted: ~d msat, hash ~a" amount-msat (subseq (%hex hash) 0 16))
+    (values bolt11 hash)))
+
+(defun invoice-paid (node payment-hash amount-msat)
+  (let ((rec (gethash (%hex payment-hash) (node-invoices node))))
+    (when rec (setf (getf rec :status) :paid (getf rec :received-msat) amount-msat))))
 
 (defun install-handlers (node peer)
   (p:on peer ch:+msg-open-channel+

@@ -140,19 +140,15 @@
                                        (lv::live-remote-next-point (live-of b)))))
 
              ;; ---- A pays B -------------------------------------------------------
-             (let* ((pre (c:sha256 (c:ascii->bytes "daemon-test/preimage-1")))
-                    (secret (c:sha256 (c:ascii->bytes "daemon-test/secret-1")))
-                    (bolt11 (inv:encode-invoice
-                             (inv:sign-invoice
-                              (inv::make-invoice-for :network :signet :amount-msat 50000000
-                                                     :payment-hash (c:sha256 pre) :payment-secret secret
-                                                     :description "A pays B" :min-final-cltv 18)
-                              (n:node-privkey b)))))
-               (with-open-file (s (merge-pathnames "preimages.sexp" (n:node-dir b)) :direction :output :if-exists :append :if-does-not-exist :create)
-                 (format s "~s~%" (c:bytes->hex pre)))
+             (multiple-value-bind (bolt11 hash) (n:mint-invoice b :amount-msat 50000000 :description "A pays B")
+               (ok "B minted an invoice A can decode"
+                   (equalp (inv:inv-payee (inv:decode-invoice bolt11)) (n:node-id b)))
                (let ((payment (n:pay-invoice a bolt11 :current-height 100)))
                  (wait-for "A's payment to B completes" 10 (lambda () (eq :complete (n:pay-status payment))))
-                 (ok "A learned the preimage" (equalp (n:pay-preimage payment) pre))
+                 (ok "A learned a preimage that hashes to the invoice"
+                     (equalp (c:sha256 (n:pay-preimage payment)) hash))
+                 (ok "B records the invoice as paid"
+                     (eq :paid (getf (gethash (c:bytes->hex hash) (n:node-invoices b)) :status)))
                  (wait-for "both commitments settle with no HTLCs" 5
                            (lambda () (and (null (lv:live-htlcs (live-of a))) (null (lv:live-htlcs (live-of b)))
                                            (not (lv:live-pending-changes-p (live-of a)))
