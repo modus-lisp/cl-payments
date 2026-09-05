@@ -121,7 +121,12 @@
                                                        (chn:chain-broadcast chain ftx))))))
              (wait-for "B accepted and A recorded the channel" 5
                        (lambda () (and (live-of a) (live-of b))))
-             (ok "the funding tx was 'broadcast' only after funding_signed" broadcast-called)
+             ;; A persists the channel BEFORE it broadcasts (a crash between the
+             ;; two must not leave a funded channel we have no record of), so the
+             ;; broadcast can trail the record by a disk write.  Wait for it —
+             ;; mining before it would leave the funding out of the block.
+             (wait-for "the funding tx was 'broadcast', and only after funding_signed" 5
+                       (lambda () broadcast-called))
              (ok "both ends name the same channel"
                  (and (only-channel a) (only-channel b)
                       (equalp (n::sc-channel-id (only-channel a)) (n::sc-channel-id (only-channel b)))))
