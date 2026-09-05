@@ -239,6 +239,45 @@
       (check "storage stays bounded across the whole sequence"
              (<= (count-if-not #'null (k::shachain-known chain)) 49)))))
 
+(defun test-shachain-persistence-roundtrip ()
+  "Serialising the shachain and reading it back must be a TRUE inverse.  The
+   reload has to reconstruct each secret's bucket from its index, not trust list
+   position — a GAP in the occupied buckets otherwise mislocates secrets and we
+   silently lose the ability to punish the states they cover."
+  (with-gate ("BOLT #3 — shachain persistence round-trip")
+    (let* ((seed (hx (make-string 64 :initial-element #\f)))
+           (chain (k:make-shachain))
+           (n 64))
+      (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
+            do (k:shachain-insert chain i (k:generate-from-seed seed i)))
+      (let ((reloaded (k:plist->shachain (k:shachain->plist chain))))
+        (check "every revoked secret survives ->plist->shachain unchanged"
+               (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
+                     always (equalp (c:octets (k:shachain-lookup reloaded i))
+                                    (c:octets (k:generate-from-seed seed i))))))
+      ;; The regression: occupied buckets {0,3} with a GAP at {1,2}.  A
+      ;; position-based reload drops the tz=3 secret into bucket 1; a correct
+      ;; inverse recomputes the bucket from the index and puts it at 3.
+      (let* ((idx-a k:+max-commitment-index+)             ; ...1111 -> bucket 0
+             (idx-b (- k:+max-commitment-index+ 7))       ; ...1000 -> bucket 3
+             (sec-a (k:generate-from-seed seed idx-a))
+             (sec-b (k:generate-from-seed seed idx-b))
+             (plist (list (list :index idx-a :secret (c:bytes->hex (c:octets sec-a)))
+                          (list :index idx-b :secret (c:bytes->hex (c:octets sec-b)))))
+             (reloaded (k:plist->shachain plist)))
+        (check "gapped reload puts the tz=0 secret in bucket 0"
+               (and (aref (k::shachain-known reloaded) 0)
+                    (equalp (c:octets (aref (k::shachain-known reloaded) 0)) (c:octets sec-a))
+                    (= (aref (k::shachain-indices reloaded) 0) idx-a)))
+        (check "gapped reload puts the tz=3 secret in bucket 3, NOT bucket 1"
+               (and (null (aref (k::shachain-known reloaded) 1))
+                    (aref (k::shachain-known reloaded) 3)
+                    (equalp (c:octets (aref (k::shachain-known reloaded) 3)) (c:octets sec-b))
+                    (= (aref (k::shachain-indices reloaded) 3) idx-b)))
+        (check "both remain retrievable by lookup after the gapped reload"
+               (and (equalp (c:octets (k:shachain-lookup reloaded idx-a)) (c:octets sec-a))
+                    (equalp (c:octets (k:shachain-lookup reloaded idx-b)) (c:octets sec-b))))))))
+
 (defun run-keys-tests ()
   (test-key-derivation-vectors)
   (test-generate-from-seed)
@@ -246,4 +285,5 @@
   (test-hash-argument-order)
   (test-shachain)
   (test-shachain-sequence)
+  (test-shachain-persistence-roundtrip)
   (test-commitment-key-set))

@@ -202,10 +202,19 @@
                                   :secret (c:bytes->hex (c:octets secret)))))
 
 (defun plist->shachain (plist)
+  ;; Reconstruct each secret's BUCKET from its index instead of trusting list
+  ;; position.  SHACHAIN-KNOWN is indexed by trailing-zero count; the serialized
+  ;; order only *happens* to match while the occupied buckets form a contiguous
+  ;; prefix (which pure count-down operation guarantees).  Recomputing the bucket
+  ;; makes this a true inverse of SHACHAIN->PLIST under any gap, reordering, or
+  ;; non-strict insertion path — and losing a bucket is losing the ability to
+  ;; punish the states it covered.
   (let ((chain (make-shachain)))
-    (loop for entry in plist for i from 0
-          do (setf (aref (shachain-known chain) i) (c:hex->bytes (getf entry :secret))
-                   (aref (shachain-indices chain) i) (getf entry :index)))
+    (loop for entry in plist
+          for idx = (getf entry :index)
+          for b = (%count-trailing-zeros idx)
+          do (setf (aref (shachain-known chain) b) (c:hex->bytes (getf entry :secret))
+                   (aref (shachain-indices chain) b) idx))
     chain))
 
 (defun shachain-lookup (chain index)

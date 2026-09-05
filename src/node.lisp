@@ -153,6 +153,22 @@
 (defun %hex (b) (c:bytes->hex b))
 (defun %unhex (s) (c:hex->bytes s))
 
+#+sbcl (eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-posix))
+
+(defun %fsync-stream (s)
+  "Flush S to the OS and, where the platform supports it, on to stable storage.
+   rename() makes a file NAME atomic but says nothing about the data blocks; this
+   is what actually gets the bytes down before we rely on the rename."
+  (finish-output s)
+  #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd s))))
+
+(defun %fsync-dir (dir)
+  "fsync a directory so a rename INTO it is itself durable across power loss."
+  (declare (ignorable dir))
+  #+sbcl (ignore-errors
+           (let ((fd (sb-posix:open (namestring (truename dir)) sb-posix:o-rdonly)))
+             (unwind-protect (sb-posix:fsync fd) (sb-posix:close fd)))))
+
 (defun save-channels (node)
   "Write the channel table.  Written to a temporary file and renamed, so a crash
    mid-write leaves the previous good file rather than a truncated one — losing
@@ -196,8 +212,13 @@
                                 :second-stage (mapcar (lambda (c) (cons (%hex (car c)) (cdr c))) (sc-second-stage sc)))
                           s)
                    (terpri s))
-                 (node-channels node))))
+                 (node-channels node)))
+      ;; Data to stable storage BEFORE the rename — otherwise a power loss can
+      ;; leave an empty channels.sexp after an already-confirmed funding tx,
+      ;; i.e. the orphaned 2-of-2 with no other signer left in the universe.
+      (%fsync-stream s))
     (rename-file tmp path)
+    (%fsync-dir (node-dir node))
     path)))
 
 (defun load-channels (node)
@@ -1933,10 +1954,18 @@
 (defun tower-store-path (node) (merge-pathnames "tower.sexp" (node-dir node)))
 
 (defun save-tower-store (node)
+  ;; Losing these hints is losing the ability to punish a revoked broadcast, so
+  ;; the same durable temp+fsync+rename as the channel table.
   (bt:with-lock-held ((node-save-lock node))
-    (with-open-file (s (tower-store-path node) :direction :output :if-exists :supersede)
-      (let ((*print-pretty* nil))
-        (maphash (lambda (hint blob) (prin1 (list hint blob) s) (terpri s)) (node-tower-store node))))))
+    (let* ((path (tower-store-path node))
+           (tmp (make-pathname :defaults path
+                               :name (concatenate 'string (pathname-name path) "-tmp"))))
+      (with-open-file (s tmp :direction :output :if-exists :supersede)
+        (let ((*print-pretty* nil))
+          (maphash (lambda (hint blob) (prin1 (list hint blob) s) (terpri s)) (node-tower-store node)))
+        (%fsync-stream s))
+      (rename-file tmp path)
+      (%fsync-dir (node-dir node)))))
 
 (defun load-tower-store (node)
   (when (probe-file (tower-store-path node))
@@ -1984,14 +2013,22 @@
 (defun utxos-path (node) (merge-pathnames "utxos.sexp" (node-dir node)))
 
 (defun save-utxos (node)
+  ;; These carry spendable privkeys — durable temp+fsync+rename, never a bare
+  ;; :supersede that a crash can truncate to nothing.
   (bt:with-lock-held ((node-save-lock node))
-    (with-open-file (s (utxos-path node) :direction :output :if-exists :supersede)
-      (let ((*print-pretty* nil))
-        (dolist (u (node-utxos node))
-          (prin1 (list :txid (%hex (oc:utxo-txid u)) :vout (oc:utxo-vout u) :value (oc:utxo-value u)
-                       :privkey (oc:utxo-privkey u))
-                 s)
-          (terpri s))))))
+    (let* ((path (utxos-path node))
+           (tmp (make-pathname :defaults path
+                               :name (concatenate 'string (pathname-name path) "-tmp"))))
+      (with-open-file (s tmp :direction :output :if-exists :supersede)
+        (let ((*print-pretty* nil))
+          (dolist (u (node-utxos node))
+            (prin1 (list :txid (%hex (oc:utxo-txid u)) :vout (oc:utxo-vout u) :value (oc:utxo-value u)
+                         :privkey (oc:utxo-privkey u))
+                   s)
+            (terpri s)))
+        (%fsync-stream s))
+      (rename-file tmp path)
+      (%fsync-dir (node-dir node)))))
 
 (defun load-utxos (node)
   (when (probe-file (utxos-path node))
