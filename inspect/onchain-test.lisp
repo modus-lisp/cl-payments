@@ -206,6 +206,33 @@
                                                             :flags '(:p2sh :witness :csv :cltv))
                                (error () nil))))))))))
 
+        (with-gate ("onchain: every HTLC output in their commitment is located, whatever the ordering")
+          ;; The commitment orders HTLC outputs by value, then script, then cltv.
+          ;; Locating them must not depend on re-deriving that order: equal
+          ;; amounts with different hashes, and expiries past 1,000,000, used
+          ;; to drop outputs from the penalty silently.
+          (let ((rng (sb-ext:seed-random-state 20261009)) (all-found t) (rounds 0))
+            (dotimes (round 12)
+              (multiple-value-bind (a3 b3) (make-live-pair)
+                (oc-cycle a3 b3)
+                (let* ((n-htlcs (+ 2 (random 3 rng)))
+                       (equal-amt (+ 50000000 (* 1000 (random 50 rng)))))
+                  (dotimes (i n-htlcs)
+                    (let ((hash (c:sha256 (c:ascii->bytes (format nil "p3/~d/~d" round i))))
+                          (amt (if (< i 2) equal-amt (+ 50000000 (* 1000 (random 20000 rng)))))
+                          (cltv (if (evenp round) (+ 500 (random 400 rng)) (+ 1000000 (random 600000 rng)))))
+                      (lv:receive-add b3 (payload (lv:send-add a3 amt hash cltv (c:zeros u:+onion-packet-size+))))))
+                  (lv:receive-revocation a3 (payload (lv:receive-commit b3 (payload (lv:send-commit a3)))))
+                  (lv:receive-revocation b3 (payload (lv:receive-commit a3 (payload (lv:send-commit b3)))))
+                  (let* ((a-tx (lv:local-commitment-tx a3))
+                         (n (lv:live-local-commit-index a3))
+                         (outs (oc:their-htlc-outputs b3 a-tx n)))
+                    (incf rounds)
+                    (unless (and (= n-htlcs (length outs))
+                                 (= n-htlcs (length (remove-duplicates (mapcar #'first outs)))))
+                      (setf all-found nil))))))
+            (check (format nil "all HTLC outputs found, each once, in ~d random commitments" rounds) all-found)))
+
         (with-gate ("onchain: fees follow the feerate")
           (check-equal "a P2WPKH sweep at 1 sat/vB" (oc:fee-for 1000 :p2wpkh-inputs 1) 110)
           (check-equal "the same at 10 sat/vB" (oc:fee-for 10000 :p2wpkh-inputs 1) 1100)

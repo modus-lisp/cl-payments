@@ -179,11 +179,11 @@
         (htlcs (lv:remote-htlcs-at lc n)))
     (when (and point htlcs)
       (multiple-value-bind (rev their-htlc our-htlc) (%htlc-keys lc point nil)
-        (let ((found '()) (start 0))
-          ;; Same ordering rule as the commitment itself: by amount then script,
-          ;; then expiry — so scan in that order and never reuse an output.
-          (dolist (rec (sort (copy-list htlcs) #'<
-                             :key (lambda (h) (+ (* (floor (lv:hr-amount-msat h) 1000) 1000000) (lv:hr-cltv-expiry h)))))
+        (let ((found '()) (used '()))
+          ;; Match each HTLC to an output by its exact script AND value, never
+          ;; reusing one.  No ordering is re-derived: a comparator that differs
+          ;; from the commitment's (value, script, cltv) silently dropped outputs.
+          (dolist (rec htlcs)
             (let* ((script (ecase (lv:hr-direction rec)
                              ;; We pay: in THEIR commitment that is one they RECEIVE.
                              (:offered (m:received-htlc-script rev our-htlc their-htlc
@@ -191,12 +191,17 @@
                                                                :anchors (lv:live-anchors-p lc)))
                              (:received (m:offered-htlc-script rev our-htlc their-htlc (lv:hr-payment-hash rec)
                                                                :anchors (lv:live-anchors-p lc)))))
-                   (idx (position (m:p2wsh script) (btx:tx-outputs tx) :start start
-                                  :key #'btx:txout-script :test #'equalp)))
+                   (spk (m:p2wsh script))
+                   (sat (floor (lv:hr-amount-msat rec) 1000))
+                   (idx (loop for o in (btx:tx-outputs tx) for i from 0
+                              when (and (not (member i used))
+                                        (= (btx:txout-value o) sat)
+                                        (equalp (btx:txout-script o) spk))
+                                return i)))
               (when idx
-                (setf start (1+ idx))
+                (push idx used)
                 (push (list idx (btx:txout-value (nth idx (btx:tx-outputs tx))) script rec) found))))
-          (nreverse found))))))
+          (sort found #'< :key #'first))))))
 
 (defun claim-htlcs-from-their-commitment (lc tx n dest-script preimages &key height feerate (fee-sat (if feerate (fee-for feerate :script-inputs 1) 500)))
   "Direct claims on THEIR commitment's HTLC outputs.  PREIMAGES is a list of
