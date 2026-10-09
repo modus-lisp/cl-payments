@@ -67,5 +67,6 @@
                              (:file "invoice-test")
                              (:file "route-test")
                              (:file "onchain-test")
+                             (:file "rail-test")
                              (:file "run-all"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-payments.test '#:run-all)))

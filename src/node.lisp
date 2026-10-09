@@ -262,6 +262,65 @@
                    (setf (gethash (%hex (sc-channel-id sc)) (node-channels node)) sc)))))
     (hash-table-count (node-channels node))))
 
+;;; Node state beside the channels: how far the watcher has scanned, the
+;;; invoices we issued, and the payments we originated.  Without it a restart
+;;; scanned only the tip (a close during downtime went unseen), forgot which
+;;; invoices it had issued (any HTLC paying a known preimage was fulfilled at any
+;;; amount), and reported every payment in flight as :unknown.
+
+(defun %hexify (x)
+  (cond ((and (vectorp x) (not (stringp x))) (list :hex (%hex x)))
+        ((consp x) (cons (%hexify (car x)) (%hexify (cdr x))))
+        (t x)))
+
+(defun %unhexify (x)
+  (cond ((and (consp x) (eq (car x) :hex) (consp (cdr x)) (stringp (cadr x)) (null (cddr x))) (%unhex (cadr x)))
+        ((consp x) (cons (%unhexify (car x)) (%unhexify (cdr x))))
+        (t x)))
+
+(defun %payment->plist (p)
+  (list :payment-hash (pay-payment-hash p) :amount-msat (pay-amount-msat p) :status (pay-status p)
+        :preimage (pay-preimage p) :failure (pay-failure p) :bolt11 (pay-bolt11 p) :height (pay-height p)
+        :attempt (pay-attempt p) :shared-secrets (pay-shared-secrets p)
+        :channel-id (and (pay-sc p) (sc-channel-id (pay-sc p))) :htlc-id (pay-htlc-id p)))
+
+(defun save-state (node)
+  (bt:with-lock-held ((node-save-lock node))
+    (let ((path (merge-pathnames "state.sexp" (node-dir node)))
+          (tmp (merge-pathnames "state.sexp.tmp" (node-dir node)))
+          (invoices '()) (payments '()))
+      (maphash (lambda (k v) (push (cons k v) invoices)) (node-invoices node))
+      (maphash (lambda (k p) (declare (ignore k)) (push (%payment->plist p) payments)) (node-payments node))
+      (ensure-directories-exist path)
+      (with-open-file (s tmp :direction :output :if-exists :supersede)
+        (let ((*print-pretty* nil) (*print-readably* nil))
+          (prin1 (%hexify (list :scanned-height (node-scanned-height node)
+                                :invoices invoices :payments payments
+                                :obligations (node-obligations node)))
+                 s))
+        (%fsync-stream s))
+      (rename-file tmp path)
+      (%fsync-dir (node-dir node))
+      path)))
+
+(defun load-state (node)
+  (let ((path (merge-pathnames "state.sexp" (node-dir node))))
+    (when (probe-file path)
+      (let ((st (%unhexify (with-open-file (s path) (let ((*read-eval* nil)) (read s nil))))))
+        (setf (node-scanned-height node) (getf st :scanned-height)
+              (node-obligations node) (getf st :obligations))
+        (loop for (k . v) in (getf st :invoices) do (setf (gethash k (node-invoices node)) v))
+        (dolist (pl (getf st :payments))
+          (let* ((sc (and (getf pl :channel-id) (gethash (%hex (getf pl :channel-id)) (node-channels node))))
+                 (p (make-payment :payment-hash (getf pl :payment-hash) :amount-msat (getf pl :amount-msat)
+                                  :status (getf pl :status) :preimage (getf pl :preimage) :failure (getf pl :failure)
+                                  :bolt11 (getf pl :bolt11) :height (getf pl :height) :attempt (getf pl :attempt)
+                                  :shared-secrets (getf pl :shared-secrets) :sc sc :htlc-id (getf pl :htlc-id))))
+            (setf (gethash (%hex (pay-payment-hash p)) (node-payments node)) p)
+            (when (and sc (eq (pay-status p) :pending))
+              (setf (gethash (cons (%hex (sc-channel-id sc)) (pay-htlc-id p)) (node-origin-htlcs node)) p))))
+        st))))
+
 ;;; ----------------------------------------------------------------------------
 ;;; The node
 ;;; ----------------------------------------------------------------------------
@@ -298,6 +357,10 @@
   ;; The chain view (Phase 8): a chain backend, the height it last reported,
   ;; and how far the watcher has scanned for spends of our funding outputs.
   chain (height nil) (scanned-height nil) watcher-thread
+  ;; Things we owe the chain and have not yet seen confirmed: penalties and
+  ;; sweeps, each retried and fee-bumped every block until its outputs are
+  ;; spent.  Persisted in state.sexp.  A plist per channel id hex.
+  (obligations '())
   (feerate 1000)                     ; sat/kvB, refreshed by the watcher each block
   ;; Invoices we issued: payment-hash hex -> (preimage bolt11 amount-msat status).
   ;; The preimage is what makes a payment ours to claim; the record is what
@@ -795,6 +858,25 @@
         (loop for form = (read s nil) while form
               collect (%unhex (string form)))))))
 
+(defun final-hop-refusal (node payment-hash htlc-msat hop-payload)
+  "BOLT #4 final-node checks against the invoice we issued for PAYMENT-HASH.
+   NIL to accept, or a string saying why not.  The onion's own amount is the
+   sender's claim; what the invoice asked for is ours, so the HTLC must meet
+   the invoice and carry its payment secret.  No MPP: the whole amount arrives
+   in this one HTLC.  A hash with no invoice (a bare preimage) is not checked."
+  (let ((rec (gethash (%hex payment-hash) (node-invoices node))))
+    (when rec
+      (let ((want (getf rec :amount-msat)) (secret (getf rec :payment-secret)))
+        (cond
+          ((and secret (not (and (on:hp-payment-secret hop-payload)
+                                 (equalp (c:octets (on:hp-payment-secret hop-payload)) (c:octets secret)))))
+           "payment secret missing or wrong")
+          ((and (on:hp-total-msat hop-payload) (> (on:hp-total-msat hop-payload) htlc-msat))
+           "multi-part payments are not accepted")
+          ((and want (< htlc-msat want)) (format nil "underpaid: ~d msat for a ~d msat invoice" htlc-msat want))
+          ((and want (> htlc-msat (* 2 want))) (format nil "overpaid: ~d msat for a ~d msat invoice" htlc-msat want))
+          (t nil))))))
+
 (defun preimage-for (node payment-hash)
   (find-if (lambda (pre) (equalp (c:octets (c:sha256 pre)) (c:octets payment-hash)))
            (known-preimages node)))
@@ -883,8 +965,15 @@
                      (fail-upstream node peer sc h ss fw:+invalid-onion-payload+))
                     ;; ---- final hop: it is for us ---------------------------------
                     ((null next)
-                     (let ((pre (preimage-for node (lv:hr-payment-hash h))))
+                     (let ((pre (preimage-for node (lv:hr-payment-hash h)))
+                           (refusal (final-hop-refusal node (lv:hr-payment-hash h) (lv:hr-amount-msat h) hp)))
                        (cond
+                         (refusal
+                          (nlog node "  HTLC ~d for us refused: ~a" (lv:hr-id h) refusal)
+                          (fail-upstream node peer sc h ss fw:+incorrect-or-unknown-payment-details+
+                                         :extra (let ((wr (w:make-writer)))
+                                                  (w:w-u64 wr (lv:hr-amount-msat h)) (w:w-u32 wr 0)
+                                                  (w:writer-bytes wr))))
                          ((< (lv:hr-amount-msat h) (on:hp-amount-msat hp))
                           (fail-upstream node peer sc h ss fw:+final-incorrect-htlc-amount+
                                          :extra (let ((wr (w:make-writer))) (w:w-u64 wr (lv:hr-amount-msat h)) (w:writer-bytes wr))))
@@ -1179,9 +1268,21 @@
 
 (defun attempt-payment (node bolt11 &key current-height result-path amount-msat exclude attempt)
   (let* ((invoice (inv:decode-invoice bolt11))
-         (amount (or (inv:inv-amount-msat invoice) amount-msat
-                     (error 'node-error :detail "invoice has no amount and none was given")))
+         (asked (inv:inv-amount-msat invoice))
+         ;; Pay exactly what the caller said.  An invoice for a different amount
+         ;; is refused, never silently preferred: a caller that locked X must not
+         ;; find X+anything paid from this node's liquidity.
+         (amount (cond ((and asked amount-msat (/= asked amount-msat))
+                        (error 'node-error :detail (format nil "invoice is for ~d msat, asked to pay ~d" asked amount-msat)))
+                       ((or amount-msat asked))
+                       (t (error 'node-error :detail "invoice has no amount and none was given"))))
          (hash (inv:inv-payment-hash invoice)))
+    ;; One payment per hash.  A second :pay for a hash already in flight or
+    ;; complete would pay twice; retries come only from resolve-origin.
+    (when (eql attempt 1)
+      (let ((prior (gethash (%hex hash) (node-payments node))))
+        (when (and prior (member (pay-status prior) '(:pending :complete)))
+          (error 'node-error :detail (format nil "payment ~a is already ~(~a~)" (subseq (%hex hash) 0 16) (pay-status prior))))))
     (unless (eq (inv:inv-network invoice) (w:net-name w:*network*))
       (error 'node-error :detail (format nil "invoice is for ~a, we are on ~a"
                                          (inv:inv-network invoice) (w:net-name w:*network*))))
@@ -1224,15 +1325,21 @@
                                           :exclude exclude :attempt attempt)))
               (setf (gethash (%hex hash) (node-payments node)) payment
                     (gethash (cons (%hex (sc-channel-id out-sc)) id) (node-origin-htlcs node)) payment)
+              (save-state node)
               (p:send-message out-peer msg nil)
-              (nlog node "paying ~d msat to ~a (attempt ~d): ~{~a~^ -> ~}, fee ~d msat, HTLC ~d~@[, excluding ~{~a~^ ~}~]"
-                    amount (subseq (%hex (inv:inv-payee invoice)) 0 16) attempt
-                    (mapcar (lambda (h) (gs:scid-string (rt:hop-scid h))) hops)
-                    (rt:total-fee-msat hops amount) id
-                    (mapcar #'gs:scid-string exclude))
-              (write-result payment)
-              (maybe-commit node out-peer out-sc)
-              (save-channels node)
+              ;; Once the HTLC is offered the payment IS pending, whatever
+              ;; happens below: an error here must not read as a refusal.
+              (handler-case
+                  (progn
+                    (nlog node "paying ~d msat to ~a (attempt ~d): ~{~a~^ -> ~}, fee ~d msat, HTLC ~d~@[, excluding ~{~a~^ ~}~]"
+                          amount (subseq (%hex (inv:inv-payee invoice)) 0 16) attempt
+                          (mapcar (lambda (h) (gs:scid-string (rt:hop-scid h))) hops)
+                          (rt:total-fee-msat hops amount) id
+                          (mapcar #'gs:scid-string exclude))
+                    (write-result payment)
+                    (maybe-commit node out-peer out-sc)
+                    (save-channels node))
+                (error (e) (nlog node "  after offering HTLC ~d: ~a (payment stays pending)" id e)))
               payment)))))))
 
 (defun resolve-origin (node sc id kind &key preimage reason malformed-code)
@@ -1286,7 +1393,8 @@
                (pay-failure payment) (list :hop 0 :code :bad-onion :failure-code malformed-code))
          (nlog node "  PAYMENT FAILED: first hop could not read our onion (#x~x)" malformed-code)))
       (unless (and (eq kind :fail) (eq (pay-status payment) :pending))
-        (write-result payment)))))
+        (write-result payment))
+      (save-state node))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Commands
@@ -1881,17 +1989,27 @@
       (setf (gethash (%hex hash) (node-invoices node))
             ;; :received-msat is present from the start: SETF GETF on a key a
             ;; plist lacks extends the local variable, not the stored record.
-            (list :preimage preimage :bolt11 bolt11 :amount-msat amount-msat :status :unpaid :received-msat nil))
+            (list :preimage preimage :bolt11 bolt11 :amount-msat amount-msat :status :unpaid :received-msat nil
+                  :payment-secret secret))
       ;; The preimage file stays the durable record: it is what a restart reads.
       (with-open-file (s (merge-pathnames "preimages.sexp" (node-dir node))
                          :direction :output :if-exists :append :if-does-not-exist :create)
         (format s "~s~%" (%hex preimage))))
+    (save-state node)
     (nlog node "invoice minted: ~d msat, hash ~a" amount-msat (subseq (%hex hash) 0 16))
     (values bolt11 hash)))
 
 (defun invoice-paid (node payment-hash amount-msat)
-  (let ((rec (gethash (%hex payment-hash) (node-invoices node))))
-    (when rec (setf (getf rec :status) :paid (getf rec :received-msat) amount-msat))))
+  "Record what actually arrived.  FINAL-HOP-REFUSAL already held the HTLC to the
+   invoice, so :paid means at least the invoiced amount was received."
+  (let ((key (%hex payment-hash)))
+    (bt:with-lock-held ((node-save-lock node))
+      (let ((rec (gethash key (node-invoices node))))
+        (when rec
+          (setf (gethash key (node-invoices node))
+                (list* :status :paid :received-msat (+ (or (getf rec :received-msat) 0) amount-msat)
+                       (loop for (k v) on rec by #'cddr unless (member k '(:status :received-msat)) append (list k v)))))))
+    (save-state node)))
 
 
 ;;; ----------------------------------------------------------------------------
@@ -2164,6 +2282,7 @@
     (nlog node "loaded ~d channel~:p from ~a" n (node-dir node)))
   (load-tower-store node)
   (load-utxos node)
+  (load-state node)
   (setf (node-listener-closer node)
         (tr:expose (lambda (stream peer-plist)
                      (declare (ignore peer-plist))

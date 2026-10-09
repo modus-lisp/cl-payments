@@ -24,6 +24,7 @@
   (run-invoice-tests)
   (run-route-tests)
   (run-onchain-tests)
+  (run-rail-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-commitment-anchors-tests)
