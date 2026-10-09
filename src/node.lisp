@@ -1762,42 +1762,159 @@
 (defun our-sweep-script (node sc) (our-shutdown-script node sc))
 
 (defun answer-spend (node sc tx height)
-  "The funding output of SC was spent by TX at HEIGHT.  Decide and act."
+  "The funding output of SC was spent by TX at HEIGHT.  Classify it, and record
+   what we now owe the chain.  The answer itself is an obligation (DRIVE-
+   OBLIGATIONS): built, broadcast, rebuilt at a higher fee and rebroadcast every
+   block until the chain shows its outputs spent.  Writing the classification is
+   not writing 'done' — a penalty that fails once is tried again next block."
   (let ((lc (sc-live sc)))
     (multiple-value-bind (kind n) (oc:classify-spend lc tx)
       (setf (sc-close-kind sc) kind (sc-close-txid sc) (btx:tx-txid tx) (sc-close-height sc) height
             (sc-close-tx sc) tx)
       (nlog node "funding of ~a spent at height ~d by ~a: ~(~a~)~@[ (commitment ~d)~]"
             (subseq (%hex (sc-channel-id sc)) 0 16) height (subseq (bw:hash->hex (btx:tx-txid tx)) 0 16) kind n)
-      (handler-case
-          (ecase kind
-            (:mutual-close (setf (lv:live-closed-p lc) t))
-            (:their-commitment
-             (let ((sweep (oc:sweep-to-remote lc tx (our-sweep-script node sc) :feerate (node-feerate node))))
-               (chn:chain-broadcast (node-chain node) sweep)
-               (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
-               (nlog node "  swept our to_remote: ~a" (bw:hash->hex (btx:tx-txid sweep)))))
-            (:revoked
-             ;; They published a state they had revoked.  Everything in that
-             ;; commitment is ours to take, and the only deadline is their delay.
-             (let ((pen (oc:penalty lc tx n (our-sweep-script node sc) :feerate (node-feerate node))))
-               (chn:chain-broadcast (node-chain node) pen)
-               (setf (sc-sweep-txid sc) (btx:tx-txid pen))
-               (nlog node "  REVOKED COMMITMENT ~d PUBLISHED — penalty broadcast: ~a" n (bw:hash->hex (btx:tx-txid pen)))))
-            (:our-commitment
-             (cond
-               ((< n (lv:live-local-commit-index lc))
-                ;; An OLD commitment of ours on chain.  The peer holds its
-                ;; revocation secret and will take everything; there is nothing
-                ;; here for us to sweep, and trying every block just fails.
-                (setf (sc-sweep-txid sc) :forfeit)
-                (nlog node "  a REVOKED commitment of ours (~d < ~d) — forfeit; expect the peer's penalty"
-                      n (lv:live-local-commit-index lc)))
-               (t (nlog node "  our own commitment; to_local sweepable after ~d blocks" (lv::live-local-to-self-delay lc)))))
-            (:unknown (nlog node "  UNRECOGNISED spend of our funding output — cannot answer it")))
-        (error (e) (nlog node "  answering the spend failed: ~a" e)))
-      (save-channels node))))
+      (case kind
+        (:mutual-close (setf (lv:live-closed-p lc) t))
+        (:revoked
+         ;; They published a state they had revoked.  Everything in that
+         ;; commitment is ours to take, and the only deadline is their delay.
+         (add-obligation node sc :penalty n))
+        ((:their-commitment :unknown)
+         ;; Our to_remote is spendable whatever this commitment turns out to be
+         ;; (static remotekey takes no commitment number), so an unrecognised
+         ;; spend still gets swept — and the channel stays watched.
+         (when (eq kind :unknown)
+           (nlog node "  UNRECOGNISED spend of our funding output — sweeping what is unconditionally ours"))
+         (add-obligation node sc :to-remote n))
+        (:our-commitment
+         (cond
+           ((< n (lv:live-local-commit-index lc))
+            ;; An OLD commitment of ours on chain.  The peer holds its
+            ;; revocation secret and will take everything.
+            (setf (sc-sweep-txid sc) :forfeit)
+            (nlog node "  a REVOKED commitment of ours (~d < ~d) — forfeit; expect the peer's penalty"
+                  n (lv:live-local-commit-index lc)))
+           (t (nlog node "  our own commitment; to_local sweepable after ~d blocks" (lv::live-local-to-self-delay lc))))))
+      (handler-case (drive-obligations node :only sc)
+        (error (e) (nlog node "  answering the spend failed: ~a (will retry next block)" e)))
+      (save-channels node)
+      (save-state node))))
 
+;;; ----------------------------------------------------------------------------
+;;; Obligations: what we owe the chain until the chain says it is done.
+;;;
+;;; Each is (:cid hex :kind kind :n n :feerate last :txid last-broadcast :tries k).
+;;; Every block: if the outputs it claims are all spent, it is resolved (ours if
+;;; our transaction confirmed, lost otherwise).  If not, rebuild over the outputs
+;;; still unspent at max(today's feerate, 5/4 of the last), broadcast, and record
+;;; it.  Sequences signal BIP125, so each rebuild replaces the last.
+;;; ----------------------------------------------------------------------------
+
+(defun add-obligation (node sc kind n)
+  (let ((cid (%hex (sc-channel-id sc))))
+    (unless (find-if (lambda (o) (and (equal (getf o :cid) cid) (eq (getf o :kind) kind))) (node-obligations node))
+      (push (list :cid cid :kind kind :n n :feerate nil :txid nil :txids nil :tries 0) (node-obligations node)))))
+
+(defun %obligation-outputs (node sc ob)
+  "Indices of the close transaction's outputs this obligation claims."
+  (let* ((lc (sc-live sc)) (tx (sc-close-tx sc)))
+    (ecase (getf ob :kind)
+      (:penalty
+       (let ((n (getf ob :n)))
+         (remove nil (append (list (ignore-errors (oc:to-local-output lc tx :theirs t :n n))
+                                   (ignore-errors (oc:to-remote-output lc tx)))
+                             (mapcar #'first (oc:their-htlc-outputs lc tx n))))))
+      (:to-remote (let ((i (ignore-errors (oc:to-remote-output lc tx)))) (and i (list i))))
+      (:to-local (let ((i (ignore-errors (oc:to-local-output lc tx)))) (and i (list i)))))))
+
+(defun %obligation-build (node sc ob unspent feerate)
+  (let ((lc (sc-live sc)) (tx (sc-close-tx sc)) (dest (our-sweep-script node sc)))
+    (ecase (getf ob :kind)
+      (:penalty (oc:penalty lc tx (getf ob :n) dest :feerate feerate :only unspent))
+      (:to-remote (oc:sweep-to-remote lc tx dest :feerate feerate))
+      (:to-local (oc:sweep-to-local lc tx dest :feerate feerate)))))
+
+(defun drive-obligation (node sc ob)
+  "One block's work on one obligation.  Returns :resolved, :lost or :pending."
+  (let* ((chain (node-chain node)) (close (sc-close-txid sc))
+         (outs (%obligation-outputs node sc ob))
+         (unspent (remove-if-not (lambda (i) (chn:chain-txout-unspent-p chain close i)) outs)))
+    (cond
+      ((null outs)
+       (nlog node "  ~(~a~) on ~a: nothing to claim (below dust)" (getf ob :kind) (subseq (getf ob :cid) 0 16))
+       :resolved)
+      ((null unspent)
+       ;; Every output it claims is spent.  Ours if any version we broadcast
+       ;; (an RBF chain has several txids) is in a block; lost otherwise.
+       (let ((mine (or (find-if (lambda (txid) (chn:chain-tx-position chain txid)) (getf ob :txids))
+                       ;; A tower's penalty (or any spend) that paid us counts as ours.
+                       (%spend-paying-us node close))))
+         (if mine
+             (progn (nlog node "  ~(~a~) on ~a CONFIRMED: ~a" (getf ob :kind) (subseq (getf ob :cid) 0 16)
+                          (bw:hash->hex mine))
+                    (setf (sc-sweep-txid sc) mine)
+                    :resolved)
+             (progn (nlog node "  ~(~a~) on ~a: outputs spent by someone else — LOST" (getf ob :kind) (subseq (getf ob :cid) 0 16))
+                    :lost))))
+      (t
+       (let* ((last (getf ob :feerate))
+              (rate (max (node-feerate node) (if last (ceiling (* 5 last) 4) 0)))
+              (tx (%obligation-build node sc ob unspent rate)))
+         (setf (getf ob :feerate) rate (getf ob :tries) (1+ (or (getf ob :tries) 0)))
+         (chn:chain-broadcast chain tx)
+         (setf (getf ob :txid) (btx:tx-txid tx) (sc-sweep-txid sc) (btx:tx-txid tx)
+               (getf ob :txids) (adjoin (btx:tx-txid tx) (getf ob :txids) :test #'equalp))
+         (nlog node "  ~(~a~) on ~a broadcast (try ~d, ~d sat/kvB): ~a" (getf ob :kind) (subseq (getf ob :cid) 0 16)
+               (getf ob :tries) rate (bw:hash->hex (btx:tx-txid tx)))
+         :pending)))))
+
+(defun %spend-paying-us (node close-txid)
+  "The txid of a confirmed transaction that spends an output of CLOSE-TXID and
+   pays one of our scripts, or NIL.  Read off our recorded UTXOs."
+  (dolist (u (node-utxos node))
+    (multiple-value-bind (h idx) (chn:chain-tx-position (node-chain node) (oc:utxo-txid u))
+      (when h
+        (let ((tx (nth idx (chn:chain-block-txs (node-chain node) h))))
+          (when (and tx (some (lambda (in) (equalp (c:octets (btx:txin-prev-hash in)) (c:octets close-txid)))
+                              (btx:tx-inputs tx)))
+            (return (oc:utxo-txid u))))))))
+
+(defun drive-obligations (node &key only)
+  "Every block: work each obligation; drop the ones the chain has resolved.  An
+   error on one (a refused broadcast, a fee the output cannot pay) leaves it in
+   place for the next block — never a reason to stop."
+  (let ((keep '()))
+    (dolist (ob (node-obligations node))
+      (let ((sc (gethash (getf ob :cid) (node-channels node))))
+        (cond
+          ((eq (getf ob :kind) :tower) (push ob keep))   ; DRIVE-TOWER's
+          ((null sc) nil)
+          ((and only (not (eq sc only))) (push ob keep))
+          (t
+           (let ((r (handler-case (drive-obligation node sc ob)
+                      (error (e) (nlog node "  ~(~a~) on ~a: ~a — retrying next block"
+                                       (getf ob :kind) (subseq (getf ob :cid) 0 16) e)
+                        :pending))))
+             (when (eq r :pending) (push ob keep)))))))
+    (setf (node-obligations node) (nreverse keep))))
+
+(defun check-reorged-closes (node)
+  "A close the chain no longer has: put the channel back on watch.  Its funding
+   output is unspent again, and whatever spends it next must be answered."
+  (maphash (lambda (k sc) (declare (ignore k))
+             (when (and (sc-close-kind sc) (sc-close-txid sc) (sc-close-height sc)
+                        (> (sc-close-height sc) (- (or (node-height node) 0) 144))
+                        (null (chn:chain-tx-position (node-chain node) (sc-close-txid sc)))
+                        (chn:chain-txout-unspent-p (node-chain node) (sc-funding-txid sc) (sc-funding-index sc)))
+               (nlog node "close of ~a at ~d was REORGED OUT — watching its funding again"
+                     (subseq (%hex (sc-channel-id sc)) 0 16) (sc-close-height sc))
+               (let ((cid (%hex (sc-channel-id sc))) (h (sc-close-height sc)))
+                 (setf (node-obligations node) (remove cid (node-obligations node) :key (lambda (o) (getf o :cid)) :test #'equal))
+                 (setf (sc-close-kind sc) nil (sc-close-txid sc) nil (sc-close-height sc) nil (sc-close-tx sc) nil
+                       (sc-sweep-txid sc) nil (sc-claimed sc) nil (sc-second-stage sc) nil)
+                 (when (lv:live-closed-p (sc-live sc)) (setf (lv:live-closed-p (sc-live sc)) nil))
+                 (setf (node-scanned-height node) (min (or (node-scanned-height node) h) (1- h))))))
+           (node-channels node)))
 
 (defun %broadcast-claim (node sc label tx idx)
   (chn:chain-broadcast (node-chain node) tx)
@@ -1867,27 +1984,11 @@
   (find txid (chn:chain-block-txs (node-chain node) height) :key #'btx:tx-txid :test #'equalp))
 
 (defun check-delayed-sweeps (node)
-  "Our own force-closes whose CSV delay has now elapsed."
+  "Our own force-closes whose CSV delay has now elapsed: owe the to_local sweep."
   (maphash (lambda (k sc) (declare (ignore k))
              (when (and (eq (sc-close-kind sc) :our-commitment) (null (sc-sweep-txid sc))
                         (>= (node-height node) (+ (sc-close-height sc) (lv::live-local-to-self-delay (sc-live sc)))))
-               (handler-case
-                   (let* ((ours (lv:local-commitment-tx (sc-live sc)))
-                          (sweep (oc:sweep-to-local (sc-live sc) ours (our-sweep-script node sc) :feerate (node-feerate node))))
-                     (chn:chain-broadcast (node-chain node) sweep)
-                     (setf (sc-sweep-txid sc) (btx:tx-txid sweep))
-                     (save-channels node)
-                     (nlog node "delay elapsed on ~a — swept our to_local: ~a"
-                           (subseq (%hex (sc-channel-id sc)) 0 16) (bw:hash->hex (btx:tx-txid sweep))))
-                 (error (e)
-                   ;; A sweep the network refuses is usually a sweep of an
-                   ;; output that is already gone.  Check, and if so stop.
-                   (if (chn:chain-txout-unspent-p (node-chain node) (sc-close-txid sc)
-                                                  (or (ignore-errors (oc:to-local-output (sc-live sc) (sc-close-tx sc))) 0))
-                       (nlog node "to_local sweep failed: ~a" e)
-                       (progn (setf (sc-sweep-txid sc) :taken) (save-channels node)
-                              (nlog node "to_local of ~a is already spent — nothing to sweep"
-                                    (subseq (%hex (sc-channel-id sc)) 0 16))))))))
+               (add-obligation node sc :to-local nil)))
            (node-channels node)))
 
 (defun scan-block (node height)
@@ -1903,14 +2004,31 @@
               (bt:with-recursive-lock-held ((node-htlc-lock node))
                 (answer-spend node (third hit) tx height)))))))))
 
+(defun watch-start (node h)
+  "The first height to scan.  After a restart, from where we left off (persisted);
+   on first ever start with channels, from the earliest funding block; else the tip."
+  (let ((scanned (node-scanned-height node)))
+    (cond
+      (scanned (min h (1+ scanned)))
+      (t (let ((earliest nil))
+           (maphash (lambda (k sc) (declare (ignore k))
+                      (when (and (sc-scid sc) (null (sc-close-kind sc)))
+                        (let ((b (gs:scid-block (sc-scid sc))))
+                          (setf earliest (if earliest (min earliest b) b)))))
+                    (node-channels node))
+           (or earliest h))))))
+
 (defun watch-once (node)
-  "One pass: new height?  Then fundings, new blocks, and delayed sweeps."
+  "One pass: new height?  Then fundings, every block since the last scan,
+   reorged closes, delayed sweeps, obligations, HTLCs — and persist the scan."
   (let ((h (chn:chain-height (node-chain node))))
     (unless (eql h (node-height node))
       (setf (node-height node) h)
       (setf (node-feerate node) (handler-case (chn:chain-feerate (node-chain node)) (error () (node-feerate node))))
       (check-fundings node)
-      (loop for height from (1+ (or (node-scanned-height node) (1- h))) to h
+      (handler-case (check-reorged-closes node)
+        (error (e) (nlog node "reorg check: ~a" e)))
+      (loop for height from (watch-start node h) to h
             do (scan-block node height)
                (handler-case (dolist (tx (chn:chain-block-txs (node-chain node) height)) (note-our-outputs node tx))
                  (error (e) (nlog node "utxo scan: ~a" e)))
@@ -1918,11 +2036,15 @@
                  (error (e) (nlog node "tower scan: ~a" e))))
       (setf (node-scanned-height node) h)
       (check-delayed-sweeps node)
+      (bt:with-recursive-lock-held ((node-htlc-lock node)) (drive-obligations node))
+      (handler-case (drive-tower node) (error (e) (nlog node "tower: ~a" e)))
       (maphash (lambda (k sc) (declare (ignore k))
                  (when (member (sc-close-kind sc) '(:their-commitment :our-commitment))
                    (handler-case (bt:with-recursive-lock-held ((node-htlc-lock node)) (resolve-htlcs node sc))
                      (error (e) (nlog node "htlc resolution on ~a: ~a" (subseq (%hex (sc-channel-id sc)) 0 16) e)))))
-               (node-channels node)))
+               (node-channels node))
+      (save-channels node)
+      (save-state node))
     h))
 
 (defun start-watcher (node &key (interval 3))
@@ -2092,24 +2214,49 @@
             do (setf (gethash (first form) (node-tower-store node)) (second form))))))
 
 (defun tower-check-block (node height)
-  "As a tower: does any transaction in this block match a hint we hold?"
+  "As a tower: does any transaction in this block match a hint we hold?  A match
+   becomes a tower obligation; the blob is deleted only when its penalty has
+   confirmed (DRIVE-TOWER), never because one broadcast was refused."
   (when (plusp (hash-table-count (node-tower-store node)))
     (dolist (tx (chn:chain-block-txs (node-chain node) height))
       (let* ((txid (btx:tx-txid tx))
              (hint (%hex (subseq (c:octets txid) 0 16)))
              (blob (gethash hint (node-tower-store node))))
-        (when blob
+        (when (and blob (not (find hint (node-obligations node) :key (lambda (o) (getf o :hint)) :test #'equal)))
           (let ((pen (tower-open txid blob)))
             (cond
               (pen
-               (handler-case
-                   (progn (chn:chain-broadcast (node-chain node) pen)
-                          (nlog node "TOWER: ~a appeared at height ~d — penalty broadcast: ~a"
-                                (subseq (bw:hash->hex txid) 0 16) height (bw:hash->hex (btx:tx-txid pen))))
-                 (error (e) (nlog node "TOWER: penalty for ~a rejected: ~a" (subseq (bw:hash->hex txid) 0 16) e))))
-              (t (nlog node "TOWER: hint matched ~a but the blob did not open" (subseq (bw:hash->hex txid) 0 16))))
-            (remhash hint (node-tower-store node))
-            (save-tower-store node)))))))
+               (nlog node "TOWER: ~a appeared at height ~d — penalty ~a owed"
+                     (subseq (bw:hash->hex txid) 0 16) height (bw:hash->hex (btx:tx-txid pen)))
+               (push (list :kind :tower :hint hint :tx (%hex (btx:serialize-tx pen)) :tries 0) (node-obligations node)))
+              (t (nlog node "TOWER: hint matched ~a but the blob did not open — keeping it" (subseq (bw:hash->hex txid) 0 16))))))))))
+
+(defun drive-tower (node)
+  "Rebroadcast each owed tower penalty until it confirms or its inputs are taken.
+   The blob is pre-signed by the client at its fee, so the tower cannot bump it;
+   it can keep it in front of the network."
+  (let ((keep '()) (changed nil))
+    (dolist (ob (node-obligations node))
+      (if (not (eq (getf ob :kind) :tower))
+          (push ob keep)
+          (let* ((pen (btx:parse-tx (bw:make-reader (%unhex (getf ob :tx)))))
+                 (chain (node-chain node)))
+            (cond
+              ((chn:chain-tx-position chain (btx:tx-txid pen))
+               (nlog node "TOWER: penalty ~a confirmed" (bw:hash->hex (btx:tx-txid pen)))
+               (remhash (getf ob :hint) (node-tower-store node)) (setf changed t))
+              ((notany (lambda (in) (chn:chain-txout-unspent-p chain (btx:txin-prev-hash in) (btx:txin-prev-index in)))
+                       (btx:tx-inputs pen))
+               (nlog node "TOWER: penalty ~a's inputs were taken by someone else" (bw:hash->hex (btx:tx-txid pen)))
+               (remhash (getf ob :hint) (node-tower-store node)) (setf changed t))
+              (t
+               (setf (getf ob :tries) (1+ (or (getf ob :tries) 0)))
+               (handler-case (progn (chn:chain-broadcast chain pen)
+                                    (nlog node "TOWER: penalty broadcast (try ~d): ~a" (getf ob :tries) (bw:hash->hex (btx:tx-txid pen))))
+                 (error (e) (nlog node "TOWER: penalty broadcast refused (try ~d): ~a — retrying" (getf ob :tries) e)))
+               (push ob keep))))))
+    (setf (node-obligations node) (nreverse keep))
+    (when changed (save-tower-store node))))
 
 
 ;;; ----------------------------------------------------------------------------

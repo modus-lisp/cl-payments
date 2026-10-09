@@ -418,7 +418,7 @@
                  (tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx 1)) dest-script value fee-sat))
                  (sig (%sign tx 0 script value (lv::live-payment-priv lc))))
             (%with-witnesses tx (list (list sig script))))
-          (let* ((tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx #xffffffff)) dest-script value fee-sat))
+          (let* ((tx (%sweep-tx (list (list (btx:tx-txid their-tx) idx +rbf-sequence+)) dest-script value fee-sat))
                  (sig (%sign tx 0 (%p2wpkh-script-code pub) value (lv::live-payment-priv lc))))
             (%with-witnesses tx (list (list sig (c:octets pub)))))))))
 
@@ -437,7 +437,11 @@
       ;; <sig> <> <script>: the empty element takes the OP_ELSE branch.
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
 
-(defun penalty (lc their-revoked-tx n dest-script &key feerate (fee-sat nil))
+(defconstant +rbf-sequence+ #xfffffffd
+  "BIP125 opt-in: a penalty or sweep that sits unconfirmed must be replaceable
+   at a higher fee.  #xffffffff is final and could never be bumped.")
+
+(defun penalty (lc their-revoked-tx n dest-script &key feerate (fee-sat nil) only)
   "They published commitment N, which they revoked.  Take their to_local with
    the revocation key — and our own to_remote while we are at it, in one
    transaction.  The revocation private key exists only because they handed us
@@ -446,11 +450,18 @@
   (let ((secret (or (lv:revoked-secret-for lc n) (fail "commitment ~d is not revoked" n))))
     (multiple-value-bind (lidx lvalue lscript) (to-local-output lc their-revoked-tx :theirs t :n n)
       (multiple-value-bind (ridx rvalue) (to-remote-output lc their-revoked-tx)
-        (let* ((htlcs (their-htlc-outputs lc their-revoked-tx n))
+        ;; ONLY, when given, is the list of output indices still unspent: an
+        ;; output the cheater already took cannot be in the transaction, and
+        ;; insisting on it would make the whole penalty invalid.
+        (when only
+          (unless (member lidx only) (setf lidx nil lvalue nil))
+          (unless (member ridx only) (setf ridx nil rvalue nil)))
+        (let* ((htlcs (remove-if (lambda (h) (and only (not (member (first h) only))))
+                                 (their-htlc-outputs lc their-revoked-tx n)))
                (rev-pub (k:derive-revocation-pubkey (lv:pub (lv::live-revocation-priv lc)) (lv:remote-point-for lc n)))
-               (inputs (append (and lidx (list (list (btx:tx-txid their-revoked-tx) lidx #xffffffff)))
-                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx (if (lv:live-anchors-p lc) 1 #xffffffff))))
-                               (loop for (idx) in htlcs collect (list (btx:tx-txid their-revoked-tx) idx #xffffffff))))
+               (inputs (append (and lidx (list (list (btx:tx-txid their-revoked-tx) lidx +rbf-sequence+)))
+                               (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx (if (lv:live-anchors-p lc) 1 +rbf-sequence+))))
+                               (loop for (idx) in htlcs collect (list (btx:tx-txid their-revoked-tx) idx +rbf-sequence+))))
                (total (+ (or lvalue 0) (or rvalue 0) (reduce #'+ htlcs :key #'second)))
                (rev-priv (k:derive-revocation-privkey (lv::live-revocation-priv lc) (secp:bytes-to-int secret)))
                (pay-pub (lv:pub (lv::live-payment-priv lc)))

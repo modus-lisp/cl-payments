@@ -25,6 +25,7 @@
   (run-route-tests)
   (run-onchain-tests)
   (run-rail-tests)
+  (run-watcher-tests)
   (run-keys-tests)
   (run-commitment-tests)
   (run-commitment-anchors-tests)

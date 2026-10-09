@@ -216,7 +216,7 @@
              ;; ---- B publishes a REVOKED commitment; the TOWER punishes it first --
              ;; B's previous commitment is a state B revoked when it accepted the
              ;; next one.  Broadcasting it is theft; A must take everything.
-             (let* ((cheat (lv:previous-commitment-tx (live-of b))))
+             (let* ((cheat (lv:previous-commitment-tx (live-of b))) (tower-held 0))
                (ok "B holds a signed previous (revoked) commitment" (and cheat t))
                ;; A reports each revocation from its handler thread; the blob for
                ;; THIS commitment is the newest, so wait for it specifically
@@ -239,8 +239,9 @@
                          (spends-p from-tower 0 (btx:txout-script (nth lidx (btx:tx-outputs cheat))) lvalue))
                      (ok "and pays A, not the tower"
                          (equalp (btx:txout-script (first (btx:tx-outputs from-tower))) (n::our-sweep-script a (only-channel a))))))
-                 (ok "the tower forgot that one blob once used, and kept the rest"
-                     (= (hash-table-count (n:node-tower-store tower)) (1- held-before)))))
+                 (ok "the tower keeps the blob until its penalty confirms"
+                     (= (hash-table-count (n:node-tower-store tower)) held-before))
+                 (setf tower-held held-before)))
                (n:watch-once a) (n:watch-once b)
                (ok "A classified the spend as :revoked" (eq :revoked (n::sc-close-kind (only-channel a))))
                (ok "B knows it published its own commitment" (eq :our-commitment (n::sc-close-kind (only-channel b))))
@@ -255,6 +256,12 @@
                  ;; B, having cheated, waits out its own delay and tries to sweep —
                  ;; but the penalty has already spent the output.
                  (chn:mock-mine chain 1)
+                 (n:watch-once tower)
+                 (ok "the tower forgets the blob once its penalty is in a block, keeping the rest"
+                     (= (hash-table-count (n:node-tower-store tower)) (1- tower-held)))
+                 (n:watch-once a)
+                 (ok "A's penalty obligation is resolved once the chain shows its outputs spent"
+                     (null (n::node-obligations a)))
                  (chn:mock-mine chain 200)
                  (n:watch-once b)
                  (ok "B's delayed sweep finds its to_local already gone"
