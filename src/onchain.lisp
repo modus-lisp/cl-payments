@@ -47,6 +47,11 @@
   (:report (lambda (c s) (format s "onchain: ~a" (onchain-error-detail c)))))
 (defun fail (fmt &rest args) (error 'onchain-error :detail (apply #'format nil fmt args)))
 
+(defconstant +rbf-sequence+ #xfffffffd
+  "BIP125 opt-in: a penalty or sweep that sits unconfirmed must be replaceable
+   at a higher fee.  #xffffffff is final and could never be bumped.")
+
+
 ;;; ----------------------------------------------------------------------------
 ;;; Classification
 ;;; ----------------------------------------------------------------------------
@@ -221,7 +226,7 @@
                  (when pre
                    ;; <sig> <preimage>: size 32 takes the hash branch, CHECKSIG
                    ;; against remote_htlcpubkey — which, in their commitment, is us.
-                   (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 #xffffffff)))
+                   (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 +rbf-sequence+)))
                                           dest-script value fee-sat))
                           (sig (%sign tx2 0 script value our-priv)))
                      (push (%with-witnesses tx2 (list (list sig (c:octets pre) script))) out)))))
@@ -229,7 +234,7 @@
                (when (and height (>= height (lv:hr-cltv-expiry rec)))
                  ;; <sig> <>: an empty element is not 32 bytes, so the OP_ELSE
                  ;; branch: CLTV against the expiry, then CHECKSIG against us.
-                 (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 #xfffffffe)))
+                 (let* ((tx2 (%sweep-tx (list (list (btx:tx-txid tx) idx (if (lv:live-anchors-p lc) 1 +rbf-sequence+)))
                                         dest-script value fee-sat))
                         (tx2 (btx:parse-tx (bw:make-reader (btx:serialize-tx
                                             (btx:make-tx :version 2 :inputs (btx:tx-inputs tx2) :outputs (btx:tx-outputs tx2)
@@ -436,10 +441,6 @@
            (sig (%sign tx 0 script value priv)))
       ;; <sig> <> <script>: the empty element takes the OP_ELSE branch.
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
-
-(defconstant +rbf-sequence+ #xfffffffd
-  "BIP125 opt-in: a penalty or sweep that sits unconfirmed must be replaceable
-   at a higher fee.  #xffffffff is final and could never be bumped.")
 
 (defun penalty (lc their-revoked-tx n dest-script &key feerate (fee-sat nil) only)
   "They published commitment N, which they revoked.  Take their to_local with

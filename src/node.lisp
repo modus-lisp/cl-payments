@@ -1888,6 +1888,11 @@
       (let ((sc (gethash (getf ob :cid) (node-channels node))))
         (cond
           ((eq (getf ob :kind) :tower) (push ob keep))   ; DRIVE-TOWER's
+          ((eq (getf ob :kind) :raw)
+           (when (and (or (null only) (equal (getf ob :cid) (%hex (sc-channel-id only))))
+                      (not (handler-case (drive-raw node ob) (error () t))))
+             (setf ob nil))
+           (when ob (push ob keep)))
           ((null sc) nil)
           ((and only (not (eq sc only))) (push ob keep))
           (t
@@ -1916,34 +1921,82 @@
                  (setf (node-scanned-height node) (min (or (node-scanned-height node) h) (1- h))))))
            (node-channels node)))
 
-(defun %broadcast-claim (node sc label tx idx)
-  (chn:chain-broadcast (node-chain node) tx)
-  (push (cons idx (btx:tx-txid tx)) (sc-claimed sc))
-  (nlog node "  ~a for HTLC output ~d: ~a" label idx (bw:hash->hex (btx:tx-txid tx))))
+(defun %claim-attempts (sc key)
+  (count key (sc-claimed sc) :key #'car :test #'equalp))
+
+(defun %bumped-rate (node attempts)
+  "Today's feerate, raised 25% for every earlier broadcast of the same claim."
+  (ceiling (* (node-feerate node) (expt 5/4 attempts))))
+
+(defun %try-claim (node sc label tx key)
+  "Broadcast one claim and log the attempt under KEY, whether or not the network
+   took it: the attempt count is what bumps the next one's fee."
+  (push (cons key (btx:tx-txid tx)) (sc-claimed sc))
+  (handler-case
+      (progn (chn:chain-broadcast (node-chain node) tx)
+             (nlog node "  ~a for ~a (try ~d): ~a" label key (%claim-attempts sc key) (bw:hash->hex (btx:tx-txid tx))))
+    (error (e) (nlog node "  ~a for ~a refused (try ~d): ~a — retrying next block" label key (%claim-attempts sc key) e))))
+
+(defun %owe-raw (node sc outpoint tx label)
+  "A claim that cannot be rebuilt at another fee (a pre-signed second stage):
+   owe it as-is, rebroadcast every block until OUTPOINT is spent."
+  (push (list :kind :raw :cid (%hex (sc-channel-id sc)) :label label
+              :out-txid (car outpoint) :out-index (cdr outpoint)
+              :tx (%hex (btx:serialize-tx tx)) :tries 0)
+        (node-obligations node)))
+
+(defun %raw-owed-p (node outpoint)
+  (find-if (lambda (o) (and (eq (getf o :kind) :raw)
+                            (equalp (c:octets (getf o :out-txid)) (c:octets (car outpoint)))
+                            (eql (getf o :out-index) (cdr outpoint))))
+           (node-obligations node)))
+
+(defun drive-raw (node ob)
+  "One block's work on a :raw obligation.  T to keep it."
+  (let* ((chain (node-chain node))
+         (tx (btx:parse-tx (bw:make-reader (%unhex (getf ob :tx))))))
+    (cond
+      ((not (chn:chain-txout-unspent-p chain (getf ob :out-txid) (getf ob :out-index)))
+       (nlog node "  ~a ~:[lost: its input was spent by someone else~;CONFIRMED: ~:*~a~]" (getf ob :label)
+             (and (chn:chain-tx-position chain (btx:tx-txid tx)) (bw:hash->hex (btx:tx-txid tx))))
+       nil)
+      (t
+       (setf (getf ob :tries) (1+ (or (getf ob :tries) 0)))
+       (handler-case (progn (chn:chain-broadcast chain tx)
+                            (nlog node "  ~a broadcast (try ~d): ~a" (getf ob :label) (getf ob :tries) (bw:hash->hex (btx:tx-txid tx))))
+         (error (e) (nlog node "  ~a refused (try ~d): ~a — retrying next block" (getf ob :label) (getf ob :tries) e)))
+       t))))
 
 (defun resolve-htlcs (node sc)
-  "Every block, for a channel resolved on chain: claim what can be claimed
-   now.  Deadlines cut both ways — a received HTLC must be claimed before its
-   expiry lets the peer take it back, an offered one only after — so this runs
-   until nothing is left, and each output is answered once."
+  "Every block, for a channel resolved on chain: claim what can be claimed now.
+   An HTLC output is settled only when the chain shows it SPENT — by our claim
+   or anyone's.  Until then each claim is rebroadcast every block: a direct claim
+   or second-stage sweep rebuilt at a fee 25% higher per earlier try; a pre-signed
+   second stage owed as-is (DRIVE-RAW).  Deadlines cut both ways, so nothing here
+   is single-shot."
   (let* ((lc (sc-live sc)) (tx (sc-close-tx sc)) (height (node-height node))
+         (chain (node-chain node))
          (dest (our-sweep-script node sc))
          (preimages (known-preimages node))
-         (done (lambda (idx) (assoc idx (sc-claimed sc)))))
+         (spent (lambda (txid idx) (not (chn:chain-txout-unspent-p chain txid idx)))))
     (when (and lc tx)
       (case (sc-close-kind sc)
         (:their-commitment
          (let ((n (lv:commitment-number-of lc tx)))
-           (dolist (claim (oc:claim-htlcs-from-their-commitment lc tx n dest preimages :height height :feerate (node-feerate node)))
-             (let ((idx (btx:txin-prev-index (first (btx:tx-inputs claim)))))
-               (unless (funcall done idx)
-                 (%broadcast-claim node sc "direct claim" claim idx))))))
+           (dolist (o (oc:their-htlc-outputs lc tx n))
+             (let ((idx (first o)))
+               (unless (funcall spent (btx:tx-txid tx) idx)
+                 (let* ((rate (%bumped-rate node (%claim-attempts sc idx)))
+                        (claim (find idx (oc:claim-htlcs-from-their-commitment lc tx n dest preimages :height height :feerate rate)
+                                     :key (lambda (c) (btx:txin-prev-index (first (btx:tx-inputs c)))))))
+                   (when claim (%try-claim node sc "direct claim" claim idx))))))))
         (:our-commitment
          ;; Second stage first: the pre-signed HTLC-success / HTLC-timeout.
          (dolist (entry (oc:our-htlc-second-stage lc dest preimages :height height))
            (destructuring-bind (kind rec htx) entry
-             (let ((idx (btx:txin-prev-index (first (btx:tx-inputs htx)))))
-               (unless (funcall done idx)
+             (let* ((idx (btx:txin-prev-index (first (btx:tx-inputs htx))))
+                    (outpoint (cons (btx:tx-txid tx) idx)))
+               (unless (or (funcall spent (btx:tx-txid tx) idx) (%raw-owed-p node outpoint))
                  (let ((final htx))
                    ;; Zero-fee on anchor channels: it needs an input of ours.
                    (when (lv:live-anchors-p lc)
@@ -1960,24 +2013,27 @@
                            (progn (nlog node "  HTLC-~(~a~) for output ~d needs an input for its fee and we have none" kind idx)
                                   (setf final nil)))))
                    (when final
-                     (%broadcast-claim node sc (format nil "HTLC-~(~a~)" kind) final idx)
-                     (push (cons (btx:tx-txid final) nil) (sc-second-stage sc))))))))
+                     (let ((label (format nil "HTLC-~(~a~) for output ~d" kind idx)))
+                       (%owe-raw node sc outpoint final label)
+                       (push (cons idx (btx:tx-txid final)) (sc-claimed sc))
+                       (unless (assoc (btx:tx-txid final) (sc-second-stage sc) :test #'equalp)
+                         (push (cons (btx:tx-txid final) nil) (sc-second-stage sc)))
+                       (drive-raw node (%raw-owed-p node outpoint)))))))))
          ;; Then the delayed outputs of any second stage that has confirmed.
          (dolist (entry (sc-second-stage sc))
            (destructuring-bind (htxid . confirmed-at) entry
              (unless confirmed-at
-               (let ((h (chn:chain-tx-position (node-chain node) htxid)))
+               (let ((h (chn:chain-tx-position chain htxid)))
                  (when h (setf (cdr entry) h))))
              (when (and (cdr entry)
                         (>= height (+ (cdr entry) (lv::live-local-to-self-delay lc)))
-                        (not (assoc (list :stage htxid) (sc-claimed sc) :test #'equalp)))
-               (let* ((htx (%find-tx node htxid (cdr entry))))
+                        (not (funcall spent htxid 0)))
+               (let* ((key (list :stage htxid))
+                      (htx (%find-tx node htxid (cdr entry))))
                  (when htx
-                   (let ((sweep (oc:sweep-second-stage lc htx dest :feerate (node-feerate node))))
-                     (chn:chain-broadcast (node-chain node) sweep)
-                     (push (cons (list :stage htxid) (btx:tx-txid sweep)) (sc-claimed sc))
-                     (nlog node "  swept second-stage ~a: ~a" (subseq (bw:hash->hex htxid) 0 16)
-                           (bw:hash->hex (btx:tx-txid sweep)))))))))))
+                   (%try-claim node sc "second-stage sweep"
+                               (oc:sweep-second-stage lc htx dest :feerate (%bumped-rate node (%claim-attempts sc key)))
+                               key))))))))
       (save-channels node))))
 
 (defun %find-tx (node txid height)
