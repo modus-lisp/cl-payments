@@ -21,7 +21,7 @@
                     (#:secp #:secp256k1-fast))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:check-no-signal
            #:with-gate #:run-all #:*failures* #:*checks*
-           #:hx #:report))
+           #:hx #:sk #:report))
 
 (in-package #:cl-payments.test)
 
@@ -35,6 +35,20 @@
     (when (and (> (length clean) 1) (string= "0x" (subseq clean 0 2)))
       (setf clean (subseq clean 2)))
     (c:hex->bytes clean)))
+
+(defvar *sk-cache* (make-hash-table :test 'equalp))
+
+(defun sk (x)
+  "TEST ONLY: a published test-vector key or seed — an integer, a hex string or a
+   byte vector — as a FIXED 32-byte buffer, the only form a private key may take
+   now (secp256k1-fast refuses integers and heap vectors).  Memoised on the value,
+   so a vector used inside a loop does not drain the pool: test keys are public."
+  (let ((b (etypecase x
+             (integer (secp:int-to-bytes32 x))
+             (string (hx x))
+             (vector (c:octets x)))))
+    (or (gethash b *sk-cache*)
+        (setf (gethash (copy-seq b) *sk-cache*) (gossamer:pooled-copy b)))))
 
 (defun %fail (label detail)
   (push (format nil "~a / ~a: ~a" *gate* label detail) *failures*)

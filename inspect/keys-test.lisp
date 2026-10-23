@@ -31,11 +31,11 @@
   (with-gate ("BOLT #3 — key derivation (Appendix E)")
     (let ((bp (hx *e-basepoint*))
           (pcp (hx *e-per-commitment-point*))
-          (bs (secp256k1-fast:bytes-to-int (hx *e-base-secret*))))
+          (bs (sk *e-base-secret*)))
       (check-bytes "localpubkey" (k:derive-pubkey bp pcp)
                    (hx "0235f2dbfaa89b57ec7b055afe29849ef7ddfeb1cefdb9ebdc43f5494984db29e5"))
       (check-bytes "localprivkey"
-                   (secp256k1-fast:int-to-bytes32 (k:derive-privkey bs pcp))
+                   (k:derive-privkey bs pcp)
                    (hx "cbced912d3b21bf196a766651e436aff192362621ce317704ea2f75d87e7be0f"))
       (check-bytes "revocationpubkey" (k:derive-revocation-pubkey bp pcp)
                    (hx "02916e326636d19c33f13e8c0c3a03dd157f332f3e99c317c141dd865eb01f8ff0")))))
@@ -43,9 +43,9 @@
 (defun test-generate-from-seed ()
   ;; BOLT #3, "Appendix D: Per-commitment Secret Requirements".
   (with-gate ("BOLT #3 — per-commitment secret generation (Appendix D)")
-    (let ((zeros (hx (make-string 64 :initial-element #\0)))
-          (ffs   (hx (make-string 64 :initial-element #\f)))
-          (ones  (hx "0101010101010101010101010101010101010101010101010101010101010101")))
+    (let ((zeros (sk (make-string 64 :initial-element #\0)))
+          (ffs   (sk (make-string 64 :initial-element #\f)))
+          (ones  (sk "0101010101010101010101010101010101010101010101010101010101010101")))
       (check-bytes "seed 0x00…, I = 2^48-1"
                    (k:generate-from-seed zeros 281474976710655)
                    (hx "02a40c85b6f28da08dfdbe0926c53fab2de6d28c10301f8f7c4073d5e42e3148"))
@@ -72,9 +72,9 @@
   "The vectors only pin PUBLIC values.  These check that the private halves
    actually correspond — which is what makes the keys spendable at all."
   (with-gate ("BOLT #3 — private keys match their public counterparts")
-    (let* ((base-secret (secp256k1-fast:bytes-to-int (hx *e-base-secret*)))
+    (let* ((base-secret (sk *e-base-secret*))
            (basepoint (c:compressed-pubkey (c:pubkey-of base-secret)))
-           (pcs (secp256k1-fast:bytes-to-int (hx *e-per-commitment-secret*)))
+           (pcs (sk *e-per-commitment-secret*))
            (pcp (c:compressed-pubkey (c:pubkey-of pcs))))
       ;; Ordinary blinding: derive both halves and check they are a keypair.
       (check-bytes "derive-privkey inverts derive-pubkey"
@@ -97,7 +97,7 @@
                           (k:derive-revocation-pubkey basepoint pcp))))
       ;; Different commitments must not share keys — that is the point of
       ;; per-commitment derivation.
-      (let ((seed (hx (make-string 64 :initial-element #\3))))
+      (let ((seed (sk (make-string 64 :initial-element #\3))))
         (check "successive commitments derive different keys"
                (not (equalp (k:derive-pubkey basepoint (k:per-commitment-point seed 5))
                             (k:derive-pubkey basepoint (k:per-commitment-point seed 6)))))))))
@@ -139,26 +139,26 @@
   (with-gate ("BOLT #3 — revoked-secret storage")
     ;; A channel that has advanced a million times must still be able to punish
     ;; any of the million states it revoked, without storing a million secrets.
-    (let ((seed (hx (make-string 64 :initial-element #\a)))
+    (let ((seed (sk (make-string 64 :initial-element #\a)))
           (chain (k:make-shachain)))
       (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ 20)
-            do (k:shachain-insert chain i (k:generate-from-seed seed i)))
+            do (k:shachain-insert chain i (k:export-per-commitment-secret seed i)))
       (check "every inserted secret is retrievable"
              (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ 20)
                    always (equalp (c:octets (k:shachain-lookup chain i))
-                                  (c:octets (k:generate-from-seed seed i)))))
+                                  (c:octets (k:export-per-commitment-secret seed i)))))
       (check "storage stays small (≤ 49 entries) regardless of how many arrived"
              (<= (count-if-not #'null (k::shachain-known chain)) 49)))
     ;; A counterparty whose secrets contradict each other is broken or lying;
     ;; either way the channel must not keep advancing on their word.
-    (let ((seed-a (hx (make-string 64 :initial-element #\a)))
-          (seed-b (hx (make-string 64 :initial-element #\b)))
+    (let ((seed-a (sk (make-string 64 :initial-element #\a)))
+          (seed-b (sk (make-string 64 :initial-element #\b)))
           (chain (k:make-shachain)))
       (k:shachain-insert chain k:+max-commitment-index+
-                         (k:generate-from-seed seed-a k:+max-commitment-index+))
+                         (k:export-per-commitment-secret seed-a k:+max-commitment-index+))
       (check-signals "a contradictory revoked secret is rejected" k:key-error
         (k:shachain-insert chain (1- k:+max-commitment-index+)
-                           (k:generate-from-seed seed-b (1- k:+max-commitment-index+)))))))
+                           (k:export-per-commitment-secret seed-b (1- k:+max-commitment-index+)))))))
 
 (defun test-commitment-key-set ()
   "DERIVE-COMMITMENT-KEYS assembles every key that appears in one commitment.
@@ -166,17 +166,17 @@
    function that actually calls them was not, which is the gap most likely to
    put a correct key in the wrong slot."
   (with-gate ("BOLT #3 — the full key set for a commitment")
-    (let* ((seed (hx (make-string 64 :initial-element #\7)))
+    (let* ((seed (sk (make-string 64 :initial-element #\7)))
            (pcp (k:per-commitment-point seed 42))
            ;; Six independent basepoints, so a transposed slot cannot pass by
            ;; coincidence — with shared basepoints, swapping two fields would be
            ;; invisible.
-           (payment      (c:compressed-pubkey (c:pubkey-of 11111)))
-           (delayed      (c:compressed-pubkey (c:pubkey-of 22222)))
-           (htlc         (c:compressed-pubkey (c:pubkey-of 33333)))
-           (revocation   (c:compressed-pubkey (c:pubkey-of 44444)))
-           (r-payment    (c:compressed-pubkey (c:pubkey-of 55555)))
-           (r-htlc       (c:compressed-pubkey (c:pubkey-of 66666)))
+           (payment      (c:compressed-pubkey (c:pubkey-of (sk 11111))))
+           (delayed      (c:compressed-pubkey (c:pubkey-of (sk 22222))))
+           (htlc         (c:compressed-pubkey (c:pubkey-of (sk 33333))))
+           (revocation   (c:compressed-pubkey (c:pubkey-of (sk 44444))))
+           (r-payment    (c:compressed-pubkey (c:pubkey-of (sk 55555))))
+           (r-htlc       (c:compressed-pubkey (c:pubkey-of (sk 66666))))
            (keys (k:derive-commitment-keys
                   :per-commitment-point pcp
                   :payment-basepoint payment
@@ -222,16 +222,16 @@
 (defun test-shachain-sequence ()
   "BOLT #3's storage test walks a real revocation sequence, not one insertion."
   (with-gate ("BOLT #3 — a full revocation sequence")
-    (let* ((seed (hx (make-string 64 :initial-element #\f)))
+    (let* ((seed (sk (make-string 64 :initial-element #\f)))
            (chain (k:make-shachain))
            (n 64))
       ;; Secrets arrive in DECREASING index order, as they do on a live channel.
       (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
-            do (k:shachain-insert chain i (k:generate-from-seed seed i)))
+            do (k:shachain-insert chain i (k:export-per-commitment-secret seed i)))
       (check "every secret in the sequence is reproducible"
              (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
                    always (equalp (c:octets (k:shachain-lookup chain i))
-                                  (c:octets (k:generate-from-seed seed i)))))
+                                  (c:octets (k:export-per-commitment-secret seed i)))))
       ;; A state that has NOT been revoked must not be derivable — if it were,
       ;; we could punish a commitment the counterparty is still entitled to use.
       (check "an index that has not been revoked yet returns NIL"
@@ -245,23 +245,23 @@
    position — a GAP in the occupied buckets otherwise mislocates secrets and we
    silently lose the ability to punish the states they cover."
   (with-gate ("BOLT #3 — shachain persistence round-trip")
-    (let* ((seed (hx (make-string 64 :initial-element #\f)))
+    (let* ((seed (sk (make-string 64 :initial-element #\f)))
            (chain (k:make-shachain))
            (n 64))
       (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
-            do (k:shachain-insert chain i (k:generate-from-seed seed i)))
+            do (k:shachain-insert chain i (k:export-per-commitment-secret seed i)))
       (let ((reloaded (k:plist->shachain (k:shachain->plist chain))))
         (check "every revoked secret survives ->plist->shachain unchanged"
                (loop for i from k:+max-commitment-index+ downto (- k:+max-commitment-index+ n)
                      always (equalp (c:octets (k:shachain-lookup reloaded i))
-                                    (c:octets (k:generate-from-seed seed i))))))
+                                    (c:octets (k:export-per-commitment-secret seed i))))))
       ;; The regression: occupied buckets {0,3} with a GAP at {1,2}.  A
       ;; position-based reload drops the tz=3 secret into bucket 1; a correct
       ;; inverse recomputes the bucket from the index and puts it at 3.
       (let* ((idx-a k:+max-commitment-index+)             ; ...1111 -> bucket 0
              (idx-b (- k:+max-commitment-index+ 7))       ; ...1000 -> bucket 3
-             (sec-a (k:generate-from-seed seed idx-a))
-             (sec-b (k:generate-from-seed seed idx-b))
+             (sec-a (k:export-per-commitment-secret seed idx-a))
+             (sec-b (k:export-per-commitment-secret seed idx-b))
              (plist (list (list :index idx-a :secret (c:bytes->hex (c:octets sec-a)))
                           (list :index idx-b :secret (c:bytes->hex (c:octets sec-b)))))
              (reloaded (k:plist->shachain plist)))

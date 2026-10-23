@@ -298,7 +298,7 @@
     ;; If our internal policy and our advertised channel_update drift, senders
     ;; compute fees from the advertised numbers and we reject on the internal
     ;; ones — a channel that fails every payment for no visible reason.
-    (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes "forward-test/policy"))))
+    (let* ((k (sk (c:sha256 (c:ascii->bytes "forward-test/policy"))))
            (body (gs:channel-update-body
                   :chain-hash (w:chain-hash) :scid (gs:make-scid 1 1 1)
                   :timestamp 1756000000
@@ -327,7 +327,7 @@
 
     ;; A disabled channel must survive the round trip, or we would keep
     ;; forwarding over a channel we told the network not to use.
-    (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes "forward-test/disabled"))))
+    (let* ((k (sk (c:sha256 (c:ascii->bytes "forward-test/disabled"))))
            (body (gs:channel-update-body
                   :chain-hash (w:chain-hash) :scid (gs:make-scid 1 1 1)
                   :timestamp 1756000000 :channel-flags 2

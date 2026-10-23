@@ -65,7 +65,7 @@
    #:remote-htlcs-at #:their-commitment-tx #:built-local #:b-tx #:b-htlc-outputs #:b-revocation-pubkey #:b-delayed-pubkey
    #:b-to-self-delay #:b-feerate
    #:fully-committed-received-htlcs #:can-send-commit-p
-   #:reestablish-message
+   #:reestablish-message #:live-wipe
    ;; closing
    #:send-shutdown #:receive-shutdown #:receive-closing-signed #:propose-close
    #:build-closing-tx
@@ -108,7 +108,9 @@
   channel-id funding-txid funding-index capacity-sat
   opener                              ; :local or :remote — who pays the fee
   (anchors-p nil)                     ; option_anchors: the Appendix F format
-  ;; our secrets: funding scalar, the four basepoint scalars, and the shachain seed
+  ;; our secrets: funding scalar, the four basepoint scalars, and the shachain seed.
+  ;; Each a FIXED 32-byte buffer from the pool, copied in by MAKE-LIVE /
+  ;; PLIST->LIVE and owned by this channel (FIXED:OWN; LIVE-WIPE frees them now).
   funding-priv revocation-priv payment-priv delayed-priv htlc-priv seed
   ;; their public parameters
   remote-funding-pubkey remote-revocation-basepoint remote-payment-basepoint
@@ -164,12 +166,15 @@
                        local-to-self-delay remote-to-self-delay
                        feerate-per-kw local-msat remote-msat
                        remote-first-point)
-  "A channel at commitment 0, as it stands the moment the funding is signed."
-  (%make-live :channel-id channel-id :funding-txid funding-txid
+  "A channel at commitment 0, as it stands the moment the funding is signed.
+   The six secrets are fixed 32-byte buffers; the channel keeps its own pooled
+   COPIES (the caller still owns, and frees, what it passed)."
+  (%own-secrets
+   (%make-live :channel-id channel-id :funding-txid funding-txid
               :funding-index funding-index :capacity-sat capacity-sat :opener opener :anchors-p anchors-p
-              :funding-priv funding-priv :revocation-priv revocation-priv
-              :payment-priv payment-priv :delayed-priv delayed-priv
-              :htlc-priv htlc-priv :seed seed
+              :funding-priv (c:copy-key funding-priv) :revocation-priv (c:copy-key revocation-priv)
+              :payment-priv (c:copy-key payment-priv) :delayed-priv (c:copy-key delayed-priv)
+              :htlc-priv (c:copy-key htlc-priv) :seed (c:copy-key seed)
               :remote-funding-pubkey remote-funding-pubkey
               :remote-revocation-basepoint remote-revocation-basepoint
               :remote-payment-basepoint remote-payment-basepoint
@@ -182,11 +187,31 @@
                                       :feerate-per-kw feerate-per-kw)
               :remote-spec (%make-spec :to-local-msat local-msat :to-remote-msat remote-msat
                                        :feerate-per-kw feerate-per-kw)
-              :remote-current-point remote-first-point))
+              :remote-current-point remote-first-point)))
+
+(defun %own-secrets (lc)
+  "Tie LC's six secret buffers to LC: a channel that is dropped returns them."
+  (gossamer:own lc (live-funding-priv lc) (live-revocation-priv lc) (live-payment-priv lc)
+             (live-delayed-priv lc) (live-htlc-priv lc) (live-seed lc)))
+
+(defun live-wipe (lc)
+  "Wipe LC's secrets and return them to the pool now.  The channel can sign
+   nothing afterwards."
+  (gossamer:disown lc)
+  (mapc #'gossamer:free (list (live-funding-priv lc) (live-revocation-priv lc) (live-payment-priv lc)
+                           (live-delayed-priv lc) (live-htlc-priv lc) (live-seed lc)))
+  (setf (live-funding-priv lc) nil (live-revocation-priv lc) nil (live-payment-priv lc) nil
+        (live-delayed-priv lc) nil (live-htlc-priv lc) nil (live-seed lc) nil)
+  lc)
 
 (defun pub (scalar) (c:compressed-pubkey (c:pubkey-of scalar)))
 (defun local-point (lc n) (k:per-commitment-point (live-seed lc) (- k:+max-commitment-index+ n)))
-(defun local-secret (lc n) (k:per-commitment-secret (live-seed lc) (- k:+max-commitment-index+ n)))
+
+(defmacro %with-derived ((var basepoint-secret point) &body body)
+  "Bind VAR to the per-commitment private key for BASEPOINT-SECRET at POINT, in a
+   pooled fixed buffer freed when BODY exits."
+  `(let ((,var (k:derive-privkey ,basepoint-secret ,point)))
+     (unwind-protect (progn ,@body) (gossamer:free ,var))))
 
 (defun live-local-balance-msat (lc) (spec-to-local-msat (live-local-spec lc)))
 (defun live-remote-balance-msat (lc) (spec-to-remote-msat (live-local-spec lc)))
@@ -494,11 +519,11 @@
          (sig (m:sign-commitment (b-tx built) (live-funding-priv lc) our-funding-pub
                                  (live-remote-funding-pubkey lc) (live-capacity-sat lc)))
          ;; Our HTLC key for THEIR commitment is derived with THEIR point.
-         (htlc-priv (k:derive-privkey (live-htlc-priv lc) (live-remote-next-point lc)))
-         (htlc-sigs (loop for (idx rec script) in (b-htlc-outputs built)
-                          collect (m:sign-htlc-tx (%htlc-tx built nil idx rec) htlc-priv
-                                                  script (floor (hr-amount-msat rec) 1000)
-                                                  :sighash (peer-htlc-sighash lc)))))
+         (htlc-sigs (%with-derived (htlc-priv (live-htlc-priv lc) (live-remote-next-point lc))
+                      (loop for (idx rec script) in (b-htlc-outputs built)
+                            collect (m:sign-htlc-tx (%htlc-tx built nil idx rec) htlc-priv
+                                                    script (floor (hr-amount-msat rec) 1000)
+                                                    :sighash (peer-htlc-sighash lc))))))
     (push (cons (1+ (live-remote-commit-index lc)) (copy-list (spec-htlcs spec))) (live-remote-history lc))
     (setf (live-remote-next-commit lc) (cons (1+ (live-remote-commit-index lc)) spec)
           (live-local-signed lc) (append (live-local-signed lc) (live-local-proposed lc))
@@ -567,7 +592,10 @@
           (live-local-acked lc) '())
     (u:encode-revoke-and-ack
      (u:make-revoke-and-ack :channel-id (live-channel-id lc)
-                            :per-commitment-secret (secp:int-to-bytes32 (local-secret lc (1- n)))
+                            ;; EXPORT, deliberately: revoking commitment n-1 IS handing
+                            ;; the peer its secret.  No other index ever leaves.
+                            :per-commitment-secret (k:export-per-commitment-secret
+                                                    (live-seed lc) (- k:+max-commitment-index+ (1- n)))
                             :next-per-commitment-point (local-point lc (1+ n))))))
 
 (defun local-commitment-tx (lc)
@@ -649,7 +677,7 @@
         ((= n (1+ (live-remote-commit-index lc))) (live-remote-next-point lc))
         ((< n (live-remote-commit-index lc))
          (let ((secret (revoked-secret-for lc n)))
-           (and secret (c:compressed-pubkey (c:pubkey-of (secp:bytes-to-int secret))))))
+           (and secret (k:secret-point secret))))
         (t nil)))
 
 (defun revoked-secret-for (lc n)
@@ -667,8 +695,7 @@
   (let* ((raa (u:parse-revoke-and-ack msg))
          (secret (u:raa-per-commitment-secret raa))
          (expected (live-remote-current-point lc)))
-    (unless (equalp (c:octets (c:compressed-pubkey (c:pubkey-of (secp:bytes-to-int secret))))
-                    (c:octets expected))
+    (unless (equalp (c:octets (k:secret-point secret)) (c:octets expected))
       (fail "revoked secret does not match their commitment ~d point" (live-remote-commit-index lc)))
     (k:shachain-insert (live-revocations lc)
                        (- k:+max-commitment-index+ (live-remote-commit-index lc)) secret)
@@ -865,9 +892,13 @@
   (list :channel-id (hx (live-channel-id lc)) :funding-txid (hx (live-funding-txid lc))
         :funding-index (live-funding-index lc) :capacity-sat (live-capacity-sat lc)
         :opener (live-opener lc) :anchors-p (live-anchors-p lc)
-        :funding-priv (live-funding-priv lc) :revocation-priv (live-revocation-priv lc)
-        :payment-priv (live-payment-priv lc) :delayed-priv (live-delayed-priv lc)
-        :htlc-priv (live-htlc-priv lc) :seed (hx (live-seed lc))
+        ;; EXPORT: the state file holds the keys as hex (see PLIST->LIVE).
+        :funding-priv (c:export-privkey (live-funding-priv lc))
+        :revocation-priv (c:export-privkey (live-revocation-priv lc))
+        :payment-priv (c:export-privkey (live-payment-priv lc))
+        :delayed-priv (c:export-privkey (live-delayed-priv lc))
+        :htlc-priv (c:export-privkey (live-htlc-priv lc))
+        :seed (c:export-privkey (live-seed lc))
         :remote-funding-pubkey (hx (live-remote-funding-pubkey lc))
         :remote-revocation-basepoint (hx (live-remote-revocation-basepoint lc))
         :remote-payment-basepoint (hx (live-remote-payment-basepoint lc))
@@ -897,13 +928,25 @@
         :remote-spec-history (loop for (n . sp) in (live-remote-spec-history lc)
                                    collect (cons n (spec->plist sp)))))
 
+(defun %import-seed (x)
+  "IMPORT the shachain seed (hex, as every version has written it) into a pooled
+   fixed buffer, wiping the decoded copy.  Not a scalar, so no range check."
+  (let ((b (uh x)))
+    (unwind-protect (gossamer:pooled-copy b) (fill b 0))))
+
 (defun plist->live (p)
   (flet ((g (k) (getf p k)))
+   (%own-secrets
     (%make-live :channel-id (uh (g :channel-id)) :funding-txid (uh (g :funding-txid))
                 :funding-index (g :funding-index) :capacity-sat (g :capacity-sat) :opener (g :opener) :anchors-p (g :anchors-p)
-                :funding-priv (g :funding-priv) :revocation-priv (g :revocation-priv)
-                :payment-priv (g :payment-priv) :delayed-priv (g :delayed-priv)
-                :htlc-priv (g :htlc-priv) :seed (uh (g :seed))
+                ;; IMPORT: hex now; integers in state files written before keys
+                ;; lived in fixed memory are still read (C:IMPORT-PRIVKEY).
+                :funding-priv (c:import-privkey (g :funding-priv))
+                :revocation-priv (c:import-privkey (g :revocation-priv))
+                :payment-priv (c:import-privkey (g :payment-priv))
+                :delayed-priv (c:import-privkey (g :delayed-priv))
+                :htlc-priv (c:import-privkey (g :htlc-priv))
+                :seed (%import-seed (g :seed))
                 :remote-funding-pubkey (uh (g :remote-funding-pubkey))
                 :remote-revocation-basepoint (uh (g :remote-revocation-basepoint))
                 :remote-payment-basepoint (uh (g :remote-payment-basepoint))
@@ -930,4 +973,4 @@
                 :remote-history (loop for (n . htlcs) in (g :remote-history)
                                       collect (cons n (mapcar #'plist->htlc htlcs)))
                 :remote-spec-history (loop for (n . sp) in (g :remote-spec-history)
-                                           collect (cons n (plist->spec sp))))))
+                                           collect (cons n (plist->spec sp)))))))

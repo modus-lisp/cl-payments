@@ -18,7 +18,7 @@
           collect (let* ((a (position #\Tab line)) (b (position #\Tab line :start (1+ a))))
                     (list (subseq line 0 a) (subseq line (1+ a) b) (subseq line (1+ b)))))))
 
-(defparameter *bolt11-priv* (secp:bytes-to-int (hx "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734")))
+(defparameter *bolt11-priv* (sk "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734"))
 (defparameter *bolt11-payee* (hx "03e7156ae33b0a208d0744199163177e909e80176e55d97a2f221ede0f934dd9ad"))
 
 (defun run-invoice-tests ()
@@ -121,7 +121,7 @@
     ;; passes or fails by luck.  Sixteen keys make luck unlikely enough.
     (with-gate ("invoice: signatures recover to the signer for many keys")
       (loop for i from 1 to 16
-            do (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "invoice-test/many/~d" i)))))
+            do (let* ((k (sk (c:sha256 (c:ascii->bytes (format nil "invoice-test/many/~d" i)))))
                       (inv (inv:sign-invoice
                             (inv::make-invoice-for :network :signet :amount-msat (* i 1000)
                                                    :payment-hash (c:sha256 (c:ascii->bytes (format nil "h~d" i)))
@@ -133,7 +133,7 @@
                         (equalp (inv:inv-payee back) (c:compressed-pubkey (c:pubkey-of k)))))))
 
     (with-gate ("invoice: we produce invoices we can decode, signed by our key")
-      (let* ((k (secp:bytes-to-int (c:sha256 (c:ascii->bytes "invoice-test/key"))))
+      (let* ((k (sk (c:sha256 (c:ascii->bytes "invoice-test/key"))))
              (pre (c:sha256 (c:ascii->bytes "invoice-test/preimage")))
              (inv (inv:sign-invoice
                    (inv::make-invoice-for :network :signet :amount-msat 50000000

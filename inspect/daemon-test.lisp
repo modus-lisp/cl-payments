@@ -67,7 +67,10 @@
     (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore)
     (ensure-directories-exist dir)
     (with-open-file (s (merge-pathnames "node.key" dir) :direction :output)
-      (write-string (c:bytes->hex (secp:int-to-bytes32 (c:generate-key))) s))
+      ;; A fresh identity, EXPORTED once to node.key (the node imports it back
+      ;; into fixed memory); our copy goes straight back to the pool.
+      (let ((k (c:generate-key)))
+        (unwind-protect (write-string (c:privkey-hex k) s) (c:free-key k))))
     (n:make-node :dir dir :port port :log nil)))
 
 (defun only-channel (node)

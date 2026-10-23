@@ -141,12 +141,12 @@
   (with-gate ("secp256k1 keys + BOLT #8 ECDH")
     ;; A known BOLT #8 keypair: ls.priv 0x1111... → ls.pub 0x034f355b...
     (let* ((priv (c:bytes->hex (hx "11")))
-           (k #x1111111111111111111111111111111111111111111111111111111111111111))
+           (k (sk #x1111111111111111111111111111111111111111111111111111111111111111)))
       (declare (ignore priv))
       (check-bytes "pubkey for 0x1111…"
                    (c:compressed-pubkey (c:pubkey-of k))
                    (hx "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa")))
-    (let ((k #x2121212121212121212121212121212121212121212121212121212121212121))
+    (let ((k (sk #x2121212121212121212121212121212121212121212121212121212121212121)))
       (check-bytes "pubkey for 0x2121…"
                    (c:compressed-pubkey (c:pubkey-of k))
                    (hx "028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7")))
@@ -162,11 +162,29 @@
       (c:parse-pubkey (hx "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa")))
     (check-signals "short key rejected" error (c:parse-pubkey (hx "0203")))
     ;; ECDH must commute: a·B == b·A.
-    (let* ((a #x1111111111111111111111111111111111111111111111111111111111111111)
-           (b #x2121212121212121212121212121212121212121212121212121212121212121)
+    (let* ((a (sk #x1111111111111111111111111111111111111111111111111111111111111111))
+           (b (sk #x2121212121212121212121212121212121212121212121212121212121212121))
            (ab (c:ecdh (c:pubkey-of b) a))
            (ba (c:ecdh (c:pubkey-of a) b)))
-      (check-bytes "ECDH commutes" ab ba))))
+      (check-bytes "ECDH commutes" ab ba)
+      (check "the shared secret is in fixed memory" (and (gossamer:fixed-p ab) (gossamer:fixed-p ba)))
+      (c:free-key ab) (c:free-key ba))
+    ;; THE DISCIPLINE ITSELF: a private key is a fixed buffer or it is refused.
+    (check-signals "an integer private key is refused" error
+      (c:pubkey-of #x1111111111111111111111111111111111111111111111111111111111111111))
+    (check-signals "a heap-vector private key is refused" error
+      (c:pubkey-of (hx "1111111111111111111111111111111111111111111111111111111111111111")))
+    (check-signals "ECDH refuses a heap-vector private key" error
+      (c:ecdh (c:pubkey-of (sk #x21)) (hx "1111111111111111111111111111111111111111111111111111111111111111")))
+    (check "an integer is not a valid privkey, whatever its value" (not (c:valid-privkey-p 5)))
+    (multiple-value-bind (k pt) (c:generate-key)
+      (check "a generated key is fixed, valid, and matches its point"
+             (and (gossamer:fixed-p k) (c:valid-privkey-p k) (equal pt (c:pubkey-of k))))
+      (check-bytes "privkey hex export/import round-trips"
+                   (let ((back (c:privkey-from-hex (c:privkey-hex k))))
+                     (prog1 (copy-seq back) (c:free-key back)))
+                   (copy-seq k))
+      (c:free-key k))))
 
 (defun run-crypto-tests ()
   (test-sha256)

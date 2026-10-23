@@ -18,7 +18,7 @@
 
 (defun ge-key (n)
   "A deterministic private key, so a failure here is reproducible."
-  (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "gossip-encode-test/~d" n)))))
+  (sk (c:sha256 (c:ascii->bytes (format nil "gossip-encode-test/~d" n)))))
 
 (defun ge-pub (k) (c:compressed-pubkey (c:pubkey-of k)))
 
@@ -164,14 +164,17 @@
       ;; and index must give the same channel keys after a restart, or the
       ;; funding output's 2-of-2 becomes unspendable.
       (check "same index gives identical keys"
-               (and (= (n:ck-funding a) (n:ck-funding b))
-                    (= (n:ck-revocation a) (n:ck-revocation b))
+               (and (equalp (n:ck-funding a) (n:ck-funding b))
+                    (equalp (n:ck-revocation a) (n:ck-revocation b))
                     (equalp (n:ck-seed a) (n:ck-seed b))))
+      (check "every channel key is in fixed memory"
+             (every #'gossamer:fixed-p (list (n:ck-funding a) (n:ck-revocation a) (n:ck-payment a)
+                                          (n:ck-delayed a) (n:ck-htlc a) (n:ck-seed a))))
       ;; And different indices must NOT collide: reusing a funding key across two
       ;; channels means a revocation secret leaked on one applies to the other.
       (check "different indices give different keys"
-               (and (/= (n:ck-funding a) (n:ck-funding c2))
-                    (/= (n:ck-revocation a) (n:ck-revocation c2))
+               (and (not (equalp (n:ck-funding a) (n:ck-funding c2)))
+                    (not (equalp (n:ck-revocation a) (n:ck-revocation c2)))
                     (not (equalp (n:ck-seed a) (n:ck-seed c2)))))
       ;; Distinct ROLES within one channel must differ too — a funding key equal
       ;; to the revocation key would let a counterparty spend the funding output
@@ -179,9 +182,12 @@
       (check "roles within a channel are distinct"
                (= 5 (length (remove-duplicates
                              (list (n:ck-funding a) (n:ck-revocation a)
-                                   (n:ck-payment a) (n:ck-delayed a) (n:ck-htlc a))))))
+                                   (n:ck-payment a) (n:ck-delayed a) (n:ck-htlc a))
+                             :test #'equalp))))
       (check "a different node key gives different channel keys"
-               (/= (n:ck-funding a) (n:ck-funding (n:derive-channel-keys (ge-key 9) 0))))))
+               (n:with-channel-keys (d (ge-key 9) 0)
+                 (not (equalp (n:ck-funding a) (n:ck-funding d)))))
+      (mapc #'n:channel-keys-wipe (list a b c2))))
 
   ;; Two of the bugs this file exists to catch were the same mistake: handing a
   ;; PAYLOAD to something that wanted a full MESSAGE.  Core Lightning read the

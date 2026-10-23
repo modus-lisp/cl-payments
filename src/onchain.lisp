@@ -165,17 +165,23 @@
 ;;; and the second stage pays to a delayed output we sweep like to_local.
 ;;; ----------------------------------------------------------------------------
 
+(defmacro %with-key ((var form) &body body)
+  "Bind VAR to the pooled fixed key FORM returns, freed when BODY exits."
+  `(let ((,var ,form))
+     (unwind-protect (progn ,@body) (gossamer:free ,var))))
+
 (defun %htlc-keys (lc point ours)
-  "Keys for HTLC scripts in a commitment at POINT.  OURS says whose commitment.
-   Returns (values revocation-pubkey local-htlc-pubkey remote-htlc-pubkey our-htlc-priv)
-   where local/remote are the commitment OWNER's view."
+  "PUBLIC keys for HTLC scripts in a commitment at POINT.  OURS says whose
+   commitment.  Returns (values revocation-pubkey local-htlc-pubkey
+   remote-htlc-pubkey) where local/remote are the commitment OWNER's view.  Our
+   HTLC private key at POINT is derived separately, by whoever signs, and freed by
+   them (%WITH-KEY)."
   (let* ((rev-base (if ours (lv::live-remote-revocation-basepoint lc) (lv:pub (lv::live-revocation-priv lc))))
          (own-base (if ours (lv:pub (lv::live-htlc-priv lc)) (lv::live-remote-htlc-basepoint lc)))
          (other-base (if ours (lv::live-remote-htlc-basepoint lc) (lv:pub (lv::live-htlc-priv lc)))))
     (values (k:derive-revocation-pubkey rev-base point)
             (k:derive-pubkey own-base point)
-            (k:derive-pubkey other-base point)
-            (k:derive-privkey (lv::live-htlc-priv lc) point))))
+            (k:derive-pubkey other-base point))))
 
 (defun their-htlc-outputs (lc tx n)
   "Every HTLC output in THEIR commitment N that we can locate: a list of
@@ -215,8 +221,7 @@
    timeout claim for each we offered them whose expiry HEIGHT has passed."
   (let ((point (lv:remote-point-for lc n)) (out '()))
     (when point
-      (multiple-value-bind (rev their-htlc our-htlc our-priv) (%htlc-keys lc point nil)
-        (declare (ignore rev their-htlc our-htlc))
+      (%with-key (our-priv (k:derive-privkey (lv::live-htlc-priv lc) point))
         (dolist (o (their-htlc-outputs lc tx n))
           (destructuring-bind (idx value script rec) o
             (ecase (lv:hr-direction rec)
@@ -255,8 +260,7 @@
          (point (lv:local-point lc (lv:live-local-commit-index lc)))
          (their-sigs (lv:live-local-commit-htlc-sigs lc))
          (out '()))
-    (multiple-value-bind (rev our-htlc their-htlc our-priv) (%htlc-keys lc point t)
-      (declare (ignore rev our-htlc their-htlc))
+    (%with-key (our-priv (k:derive-privkey (lv::live-htlc-priv lc) point))
       (loop for (idx rec script) in (lv:b-htlc-outputs built)
             for their-sig in their-sigs
             do (let* ((amount (floor (lv:hr-amount-msat rec) 1000))
@@ -293,8 +297,8 @@
     (unless (equalp (btx:txout-script (first (btx:tx-outputs htlc-tx))) (m:p2wsh script))
       (fail "not one of our second-stage HTLC transactions"))
     (let* ((tx (%sweep-tx (list (list (btx:tx-txid htlc-tx) 0 delay)) dest-script value fee-sat))
-           (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
-           (sig (%sign tx 0 script value priv)))
+           (sig (%with-key (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
+                  (%sign tx 0 script value priv))))
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
 
 
@@ -310,7 +314,17 @@
 ;;; deposit: a P2WPKH we hold the key for.
 ;;; ----------------------------------------------------------------------------
 
-(defstruct utxo txid vout value privkey)
+(defstruct (utxo (:constructor %make-utxo))
+  txid vout value
+  privkey)          ; a FIXED 32-byte key this utxo owns (FIXED:OWN)
+
+(defun make-utxo (&key txid vout value privkey)
+  "A UTXO we can spend.  PRIVKEY is a fixed key; the UTXO keeps — and owns — its
+   own pooled copy (the caller still frees what it passed).  For the persisted
+   form, PRIVKEY may also be the hex string the state file holds (an IMPORT), or
+   an integer from a file written before keys lived in fixed memory."
+  (let ((k (if (or (stringp privkey) (integerp privkey)) (c:import-privkey privkey) (c:copy-key privkey))))
+    (gossamer:own (%make-utxo :txid txid :vout vout :value value :privkey k) k)))
 
 (defun %utxo-pub (u) (c:compressed-pubkey (c:pubkey-of (utxo-privkey u))))
 
@@ -321,9 +335,8 @@
   (let* ((fee (fee-for feerate :script-inputs 1 :p2wpkh-inputs 1 :outputs 2))
          (change (- (utxo-value utxo) fee)))
     (when (< change 330) (fail "utxo of ~d sat cannot pay a ~d sat fee" (utxo-value utxo) fee))
-    (let* ((point (lv:local-point lc (lv:live-local-commit-index lc)))
-           (our-priv (k:derive-privkey (lv::live-htlc-priv lc) point))
-           (tx (btx:parse-tx
+    (%with-key (our-priv (k:derive-privkey (lv::live-htlc-priv lc) (lv:local-point lc (lv:live-local-commit-index lc))))
+     (let* ((tx (btx:parse-tx
                 (bw:make-reader
                  (btx:serialize-tx
                   (btx:make-tx :version 2
@@ -339,7 +352,7 @@
            (fee-sig (%sign tx 1 (%p2wpkh-script-code (%utxo-pub utxo)) (utxo-value utxo) (utxo-privkey utxo))))
       (%with-witnesses tx (list (list (c:bytes) their-der-sig (m:sig->der our-sig)
                                       (if preimage-or-nil (c:octets preimage-or-nil) (c:bytes)) script)
-                                (list fee-sig (c:octets (%utxo-pub utxo))))))))
+                                (list fee-sig (c:octets (%utxo-pub utxo)))))))))
 
 (defun anchor-output (lc commitment-tx)
   "Our anchor in a published commitment — ours or theirs, it locks to OUR
@@ -437,8 +450,8 @@
     (unless idx (fail "our commitment has no to_local (below dust?)"))
     (let* ((tx (%sweep-tx (list (list (btx:tx-txid our-tx) idx delay)) dest-script value fee-sat))
            (point (lv:local-point lc (lv:live-local-commit-index lc)))
-           (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
-           (sig (%sign tx 0 script value priv)))
+           (sig (%with-key (priv (k:derive-privkey (lv::live-delayed-priv lc) point))
+                  (%sign tx 0 script value priv))))
       ;; <sig> <> <script>: the empty element takes the OP_ELSE branch.
       (%with-witnesses tx (list (list sig (c:bytes) script))))))
 
@@ -464,9 +477,17 @@
                                (and ridx (list (list (btx:tx-txid their-revoked-tx) ridx (if (lv:live-anchors-p lc) 1 +rbf-sequence+))))
                                (loop for (idx) in htlcs collect (list (btx:tx-txid their-revoked-tx) idx +rbf-sequence+))))
                (total (+ (or lvalue 0) (or rvalue 0) (reduce #'+ htlcs :key #'second)))
-               (rev-priv (k:derive-revocation-privkey (lv::live-revocation-priv lc) (secp:bytes-to-int secret)))
+               ;; The revealed secret is the peer's (public to us since they
+               ;; revoked); it goes into fixed scratch only because that is the
+               ;; one form the constant-time key arithmetic takes.  The
+               ;; revocation PRIVATE key is ours alone, pooled and freed below.
+               (rev-priv (gossamer:with-fixed-scratch ((pcs :octets 32))
+                           (replace pcs secret)
+                           (k:derive-revocation-privkey (lv::live-revocation-priv lc) pcs)))
                (pay-pub (lv:pub (lv::live-payment-priv lc)))
                (witnesses '()) (i 0))
+         (unwind-protect
+          (progn
           (unless inputs (fail "nothing to claim in commitment ~d" n))
           (let ((tx (%sweep-tx inputs dest-script total
                                (or fee-sat
@@ -491,4 +512,5 @@
             (loop for (idx value script) in htlcs
                   do (push (list (%sign tx i script value rev-priv) (c:octets rev-pub) script) witnesses)
                      (incf i))
-            (%with-witnesses tx (nreverse witnesses))))))))
+            (%with-witnesses tx (nreverse witnesses))))
+          (gossamer:free rev-priv)))))))

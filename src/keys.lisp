@@ -36,8 +36,8 @@
   (:export
    #:derive-pubkey #:derive-privkey
    #:derive-revocation-pubkey #:derive-revocation-privkey
-   #:per-commitment-point #:per-commitment-secret
-   #:generate-from-seed #:+max-commitment-index+
+   #:per-commitment-point #:per-commitment-secret #:export-per-commitment-secret
+   #:generate-from-seed #:+max-commitment-index+ #:secret-point
    #:shachain #:make-shachain #:shachain-insert #:shachain-lookup #:shachain->plist #:plist->shachain
    #:commitment-keys #:derive-commitment-keys
    #:ck-local #:ck-remote #:ck-delayed #:ck-revocation #:ck-local-htlc #:ck-remote-htlc
@@ -70,15 +70,39 @@
                  (c:sha256 (c:bytes per-commitment-point basepoint)))))
     (c:compressed-pubkey (%point+ bp (%point* tweak (secp:secp-generator))))))
 
-(defun derive-privkey (basepoint-secret per-commitment-point)
+(defun %tweak-into (out &rest parts)
+  "OUT <- SHA-256 of the concatenated PARTS (public byte vectors), streamed — the
+   per-commitment tweaks.  OUT is fixed because the tweak is about to be added to
+   a secret scalar, and secp256k1-fast will take it from nowhere else."
+  (natrium:with-sha256 (h)
+    (dolist (p parts) (natrium:sha256-update h (c:octets p)))
+    (natrium:sha256-final-into h out)))
+
+(defun %out-or-acquire (out)
+  (or out (gossamer:acquire :octets 32)))
+
+(defmacro %filling ((var out) &body body)
+  "Bind VAR to OUT or a fresh pooled buffer; if BODY signals and the buffer was
+   ours, return it to the pool before the error propagates."
+  (let ((given (gensym "GIVEN")))
+    `(let* ((,given ,out) (,var (%out-or-acquire ,given)))
+       (handler-bind ((error (lambda (e) (declare (ignore e)) (unless ,given (gossamer:free ,var)))))
+         ,@body)
+       ,var)))
+
+(defun derive-privkey (basepoint-secret per-commitment-point &optional out)
   "privkey = basepoint_secret + SHA256(per_commitment_point ‖ basepoint)
 
    The basepoint in the hash is the PUBLIC one, so both sides hash the same
-   bytes — the holder of the secret just also knows the scalar."
-  (let* ((basepoint (c:compressed-pubkey (c:pubkey-of basepoint-secret)))
-         (tweak (secp:bytes-to-int
-                 (c:sha256 (c:bytes per-commitment-point basepoint)))))
-    (mod (+ basepoint-secret tweak) (%n))))
+   bytes — the holder of the secret just also knows the scalar.
+
+   BASEPOINT-SECRET is a fixed 32-byte key; the result goes into OUT (fixed) or,
+   when OUT is NIL, a fresh POOLED buffer the caller frees."
+  (let ((basepoint (c:compressed-pubkey (c:pubkey-of basepoint-secret))))
+    (%filling (k out)
+      (gossamer:with-fixed-scratch ((tweak :octets 32))
+        (%tweak-into tweak per-commitment-point basepoint)
+        (secp:seckey-tweak-add-into basepoint-secret tweak k)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Revocation
@@ -100,16 +124,20 @@
               (c:sha256 (c:bytes per-commitment-point revocation-basepoint)))))
     (c:compressed-pubkey (%point+ (%point* h1 rb) (%point* h2 pcp)))))
 
-(defun derive-revocation-privkey (revocation-basepoint-secret per-commitment-secret)
+(defun derive-revocation-privkey (revocation-basepoint-secret per-commitment-secret &optional out)
   "The scalar for DERIVE-REVOCATION-PUBKEY — computable only with both secrets,
-   which is the whole design."
-  (let* ((rb (c:compressed-pubkey (c:pubkey-of revocation-basepoint-secret)))
-         (pcp (c:compressed-pubkey (c:pubkey-of per-commitment-secret)))
-         (h1 (secp:bytes-to-int (c:sha256 (c:bytes rb pcp))))
-         (h2 (secp:bytes-to-int (c:sha256 (c:bytes pcp rb)))))
-    (mod (+ (* revocation-basepoint-secret h1)
-            (* per-commitment-secret h2))
-         (%n))))
+   which is the whole design.  Both are fixed 32-byte keys, and so is the result
+   (OUT, or a fresh pooled buffer the caller frees): two constant-time
+   multiplications by the public hashes and a sum, all in fixed scratch."
+  (let ((rb (c:compressed-pubkey (c:pubkey-of revocation-basepoint-secret)))
+        (pcp (c:compressed-pubkey (c:pubkey-of per-commitment-secret))))
+    (%filling (k out)
+      (gossamer:with-fixed-scratch ((h1 :octets 32) (h2 :octets 32) (t1 :octets 32) (t2 :octets 32))
+        (%tweak-into h1 rb pcp)
+        (%tweak-into h2 pcp rb)
+        (secp:seckey-tweak-mul-into revocation-basepoint-secret h1 t1)
+        (secp:seckey-tweak-mul-into per-commitment-secret h2 t2)
+        (secp:seckey-add-into t1 t2 k)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Per-commitment secrets
@@ -126,21 +154,49 @@
   "Commitment numbers start here and count DOWN, so the first commitment's
    secret is the hardest to derive from and later ones fall out of it.")
 
-(defun generate-from-seed (seed index)
-  "BOLT #3 generate_from_seed: the per-commitment secret for INDEX."
-  (let ((p (copy-seq (c:octets seed))))
+(defun generate-from-seed (seed index &optional out)
+  "BOLT #3 generate_from_seed: the per-commitment secret for INDEX.
+
+   SEED is OUR shachain seed, a fixed 32-byte buffer: whoever holds it can produce
+   every per-commitment secret of the channel, including the current one, and an
+   unrevoked secret in the peer's hands lets them sweep us.  So the walk happens
+   in place in OUT (fixed; a fresh POOLED buffer the caller frees when NIL), each
+   step re-hashed by natrium straight back into it."
+  (gossamer:check-fixed seed "shachain seed")
+  (%filling (p out)
+    (replace p seed)
     (loop for b from 47 downto 0
           when (logbitp b index)
             do (setf (aref p (floor b 8))
                      (logxor (aref p (floor b 8)) (ash 1 (mod b 8))))
-               (setf p (c:sha256 p)))
-    p))
+               (natrium:sha256-into p p))))
 
 (defun per-commitment-secret (seed index)
-  (secp:bytes-to-int (generate-from-seed seed index)))
+  "Our per-commitment secret for INDEX, in a fresh POOLED fixed buffer the caller
+   frees.  (It becomes public only by EXPORT-PER-COMMITMENT-SECRET.)"
+  (generate-from-seed seed index))
+
+(defun export-per-commitment-secret (seed index)
+  "EXPORT: the per-commitment secret for INDEX as ordinary heap bytes — for
+   revoke_and_ack, where handing it to the peer is the whole point.  Call this only
+   for an index that is being revoked; for any other it is leaking a live key."
+  (gossamer:with-fixed-scratch ((s :octets 32))
+    (generate-from-seed seed index s)
+    (copy-seq s)))
 
 (defun per-commitment-point (seed index)
-  (c:compressed-pubkey (c:pubkey-of (per-commitment-secret seed index))))
+  (gossamer:with-fixed-scratch ((s :octets 32))
+    (generate-from-seed seed index s)
+    (c:compressed-pubkey (c:pubkey-of s))))
+
+(defun secret-point (secret-bytes)
+  "The compressed point of a 32-byte secret that is ALREADY public to us — a
+   per-commitment secret the peer revealed in revoke_and_ack.  It is carried into
+   fixed scratch only because that is the one form secp256k1-fast multiplies by G
+   (in constant time); nothing here keeps it."
+  (gossamer:with-fixed-scratch ((s :octets 32))
+    (replace s secret-bytes)
+    (c:compressed-pubkey (c:pubkey-of s))))
 
 ;;; --- shachain: storing revoked secrets in O(log n) --------------------------
 ;;;

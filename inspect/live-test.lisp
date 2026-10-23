@@ -17,15 +17,15 @@
 
 (in-package #:cl-payments.test)
 
-(defun lt-key (label) (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "live-test/~a" label)))))
+(defun lt-key (label) (sk (c:sha256 (c:ascii->bytes (format nil "live-test/~a" label)))))
 (defun lt-pub (k) (c:compressed-pubkey (c:pubkey-of k)))
 
 (defun make-live-pair (&key anchors)
   "A opened the channel with 1_000_000 sat, pushing 200_000 to B."
   (let* ((fund-txid (c:sha256 (c:ascii->bytes "live-test/funding")))
          (cap 1000000) (a-msat 800000000) (b-msat 200000000)
-         (a-seed (c:sha256 (c:ascii->bytes "live-test/a-seed")))
-         (b-seed (c:sha256 (c:ascii->bytes "live-test/b-seed")))
+         (a-seed (sk (c:sha256 (c:ascii->bytes "live-test/a-seed"))))
+         (b-seed (sk (c:sha256 (c:ascii->bytes "live-test/b-seed"))))
          (a (list :funding (lt-key "a/f") :revocation (lt-key "a/r") :payment (lt-key "a/p")
                   :delayed (lt-key "a/d") :htlc (lt-key "a/h")))
          (b (list :funding (lt-key "b/f") :revocation (lt-key "b/r") :payment (lt-key "b/p")

@@ -8,7 +8,7 @@
 (in-package #:cl-payments.test)
 
 (defun rail-node (dir key)
-  (n:make-node :dir dir :port 0 :privkey key :log nil))
+  (n:make-node :dir dir :port 0 :privkey (sk key) :log nil))
 
 (defun rail-dir (name)
   (let ((d (uiop:ensure-directory-pathname

@@ -30,13 +30,13 @@
   (:export
    ;; handshake state (exposed so the BOLT #8 vectors can drive it directly)
    #:handshake #:make-initiator-handshake #:make-responder-handshake
-   #:handshake-ck #:handshake-h #:handshake-temp-k #:handshake-remote-static
+   #:handshake-ck #:handshake-h #:handshake-temp-k #:handshake-remote-static #:handshake-wipe
    #:act-one-write #:act-one-read #:act-two-write #:act-two-read
    #:act-three-write #:act-three-read
    ;; the encrypted transport
    #:noise #:noise-p #:noise-remote-node-id #:noise-stream #:noise-closer
    #:noise-sk #:noise-rk #:noise-sn #:noise-rn
-   #:noise-send #:noise-recv #:noise-close #:noise-clear-timeout
+   #:noise-send #:noise-recv #:noise-close #:noise-clear-timeout #:noise-wipe
    ;; driving it over a stream
    #:handshake-as-initiator #:handshake-as-responder
    #:connect-peer #:accept-peer
@@ -85,59 +85,102 @@
 ;;; different `h` and the next tag fails to verify.
 ;;; ----------------------------------------------------------------------------
 
+;;; WHAT IS SECRET HERE, AND WHERE IT LIVES.  Our static and ephemeral private keys,
+;;; the chaining key and the temporary AEAD key are all fixed 32-byte buffers: every
+;;; DH runs through secp256k1-fast's constant-time ECDH into fixed scratch and every
+;;; ratchet through natrium's HKDF into these buffers in place, so none of them is
+;;; ever a Lisp integer or a heap copy.  `h` is a transcript hash — public — and
+;;; stays an ordinary vector.  The handshake OWNS its ephemeral key, chaining key
+;;; and temp key (FIXED:OWN), and HANDSHAKE-WIPE returns them; the static key
+;;; belongs to the caller (the node's identity) and is only borrowed.
+
 (defstruct handshake
-  ck                  ; chaining key (32 bytes)
-  h                   ; handshake hash (32 bytes)
-  temp-k              ; the act's temporary AEAD key (32 bytes)
-  s-priv              ; our static private key (integer)
+  ck                  ; chaining key (fixed 32 bytes, owned)
+  h                   ; handshake hash (32 bytes, public)
+  temp-k              ; the act's temporary AEAD key (fixed 32 bytes, owned)
+  s-priv              ; our static private key (fixed 32 bytes, BORROWED)
   s-pub               ; our static public key (33 bytes)
-  e-priv              ; our ephemeral private key (integer)
+  e-priv              ; our ephemeral private key (fixed 32 bytes, owned)
   e-pub               ; our ephemeral public key (33 bytes)
   re                  ; their ephemeral public key (33 bytes)
   remote-static       ; their static public key (33 bytes)
   initiator-p)
 
+(defun %new-handshake (&rest args)
+  "A handshake that owns fresh pooled buffers for its chaining key and temp key."
+  (let* ((ck (gossamer:acquire :octets 32)) (tk (gossamer:acquire :octets 32))
+         (hs (apply #'make-handshake :ck ck :temp-k tk args)))
+    (gossamer:own hs ck tk)))
+
+(defun handshake-wipe (hs)
+  "Return the handshake's own secrets (ephemeral key, chaining key, temp key) to
+   the pool.  The handshake is unusable afterwards.  Idempotent."
+  (gossamer:disown hs)
+  (gossamer:free (handshake-ck hs)) (gossamer:free (handshake-temp-k hs)) (gossamer:free (handshake-e-priv hs))
+  (setf (handshake-ck hs) nil (handshake-temp-k hs) nil (handshake-e-priv hs) nil)
+  hs)
+
 (defun %mix-hash (hs data)
   (setf (handshake-h hs) (c:sha256 (c:bytes (handshake-h hs) data))))
 
 (defun %mix-key (hs input-key-material)
-  "Ratchet the chaining key with a new shared secret, yielding this act's AEAD key."
-  (multiple-value-bind (ck temp-k) (c:hkdf-2 (handshake-ck hs) input-key-material)
-    (setf (handshake-ck hs) ck
-          (handshake-temp-k hs) temp-k)))
+  "Ratchet the chaining key with a new shared secret, yielding this act's AEAD key
+   — both in place, in fixed memory."
+  (c:hkdf-2-into (handshake-ck hs) input-key-material (handshake-ck hs) (handshake-temp-k hs)))
+
+(defun %mix-dh (hs point privkey)
+  "%MIX-KEY with the BOLT #8 ECDH of PRIVKEY and POINT, computed constant-time into
+   fixed scratch: the shared secret never exists anywhere else."
+  (gossamer:with-fixed-scratch ((ss :octets 32))
+    (c:ecdh-into point privkey ss)
+    (%mix-key hs ss)))
 
 (defun %initialize (hs responder-static-pubkey)
   "Both sides seed `h` and `ck` from the protocol name, then fold in the prologue
    and the RESPONDER's static key — the initiator because it knows it in advance,
    the responder because it is its own."
   (let ((h (c:sha256 (c:ascii->bytes +protocol-name+))))
-    (setf (handshake-ck hs) h
-          (handshake-h hs) h)
+    (replace (handshake-ck hs) h)
+    (setf (handshake-h hs) h)
     (%mix-hash hs (c:ascii->bytes +prologue+))
     (%mix-hash hs responder-static-pubkey)
     hs))
 
+(defun %adopt-ephemeral (hs ephemeral)
+  "Give HS its own pooled copy of a caller-supplied ephemeral key (the BOLT #8
+   vectors pin `e`), so the handshake always owns — and wipes — its ephemeral."
+  (when ephemeral
+    (let ((e (c:copy-key ephemeral)))
+      (setf (handshake-e-priv hs) e)
+      (gossamer:disown hs)
+      (gossamer:own hs (handshake-ck hs) (handshake-temp-k hs) e)))
+  hs)
+
 (defun make-initiator-handshake (local-privkey remote-node-id &key ephemeral)
   "REMOTE-NODE-ID is the responder's 33-byte compressed static public key.
-   EPHEMERAL, when supplied, is the private key to use for `e` — production code
-   leaves it NIL so a fresh key is generated; the BOLT #8 vectors supply it."
-  (let ((hs (make-handshake :s-priv local-privkey
+   LOCAL-PRIVKEY is our fixed static key (borrowed, not copied).  EPHEMERAL, when
+   supplied, is a fixed key to use for `e` (copied) — production code leaves it
+   NIL so a fresh key is generated; the BOLT #8 vectors supply it."
+  (let ((hs (%new-handshake :s-priv local-privkey
                             :s-pub (c:compressed-pubkey (c:pubkey-of local-privkey))
                             :remote-static remote-node-id
-                            :e-priv ephemeral
                             :initiator-p t)))
+    (%adopt-ephemeral hs ephemeral)
     (%initialize hs remote-node-id)))
 
 (defun make-responder-handshake (local-privkey &key ephemeral)
   (let* ((s-pub (c:compressed-pubkey (c:pubkey-of local-privkey)))
-         (hs (make-handshake :s-priv local-privkey :s-pub s-pub
-                             :e-priv ephemeral
+         (hs (%new-handshake :s-priv local-privkey :s-pub s-pub
                              :initiator-p nil)))
+    (%adopt-ephemeral hs ephemeral)
     (%initialize hs s-pub)))
 
 (defun %ensure-ephemeral (hs)
   (unless (handshake-e-priv hs)
-    (setf (handshake-e-priv hs) (c:generate-key)))
+    (let ((e (c:generate-key)))
+      (setf (handshake-e-priv hs) e)
+      (gossamer:disown hs)
+      (gossamer:own hs (handshake-ck hs) (handshake-temp-k hs) e)))
   (setf (handshake-e-pub hs)
         (c:compressed-pubkey (c:pubkey-of (handshake-e-priv hs))))
   hs)
@@ -158,8 +201,7 @@
   "e, es — send our ephemeral key and prove we know the responder's static key."
   (%ensure-ephemeral hs)
   (%mix-hash hs (handshake-e-pub hs))
-  (%mix-key hs (c:ecdh (c:parse-pubkey (handshake-remote-static hs))
-                       (handshake-e-priv hs)))
+  (%mix-dh hs (c:parse-pubkey (handshake-remote-static hs)) (handshake-e-priv hs))
   (let ((tag (c:encrypt-with-ad (handshake-temp-k hs) 0 (handshake-h hs) #())))
     (%mix-hash hs tag)
     (c:bytes #(0) (handshake-e-pub hs) tag)))
@@ -178,7 +220,7 @@
                                        :detail "act one ephemeral key is not a curve point")))))
       (setf (handshake-re hs) re)
       (%mix-hash hs re)
-      (%mix-key hs (c:ecdh re-point (handshake-s-priv hs)))
+      (%mix-dh hs re-point (handshake-s-priv hs))
       (%decrypt (handshake-temp-k hs) 0 (handshake-h hs) tag "act one")
       (%mix-hash hs tag)
       hs)))
@@ -189,7 +231,7 @@
   "e, ee — the responder's ephemeral key and the ephemeral-ephemeral secret."
   (%ensure-ephemeral hs)
   (%mix-hash hs (handshake-e-pub hs))
-  (%mix-key hs (c:ecdh (c:parse-pubkey (handshake-re hs)) (handshake-e-priv hs)))
+  (%mix-dh hs (c:parse-pubkey (handshake-re hs)) (handshake-e-priv hs))
   (let ((tag (c:encrypt-with-ad (handshake-temp-k hs) 0 (handshake-h hs) #())))
     (%mix-hash hs tag)
     (c:bytes #(0) (handshake-e-pub hs) tag)))
@@ -206,7 +248,7 @@
                                       :detail "act two ephemeral key is not a curve point")))))
     (setf (handshake-re hs) re)
     (%mix-hash hs re)
-    (%mix-key hs (c:ecdh re-point (handshake-e-priv hs)))
+    (%mix-dh hs re-point (handshake-e-priv hs))
     (%decrypt (handshake-temp-k hs) 0 (handshake-h hs) tag "act two")
     (%mix-hash hs tag)
     hs))
@@ -219,12 +261,11 @@
   (let ((c (c:encrypt-with-ad (handshake-temp-k hs) 1 (handshake-h hs)
                               (handshake-s-pub hs))))
     (%mix-hash hs c)
-    (%mix-key hs (c:ecdh (c:parse-pubkey (handshake-re hs)) (handshake-s-priv hs)))
+    (%mix-dh hs (c:parse-pubkey (handshake-re hs)) (handshake-s-priv hs))
     (let ((tag (c:encrypt-with-ad (handshake-temp-k hs) 0 (handshake-h hs) #())))
       (values (c:bytes #(0) c tag)
               ;; Initiator sends with the FIRST half, receives with the second.
-              (multiple-value-bind (sk rk) (c:hkdf-2 (handshake-ck hs) #())
-                (%make-session hs sk rk))))))
+              (%split-session hs :initiator)))))
 
 (defun act-three-read (hs msg)
   (unless (= (length msg) +act-three-size+)
@@ -240,11 +281,10 @@
                         (error () (error 'handshake-error
                                          :detail "act three static key is not a curve point")))))
         (setf (handshake-remote-static hs) rs)
-        (%mix-key hs (c:ecdh rs-point (handshake-e-priv hs)))
+        (%mix-dh hs rs-point (handshake-e-priv hs))
         (%decrypt (handshake-temp-k hs) 0 (handshake-h hs) tag "act three")
         ;; Responder's keys are the mirror image of the initiator's.
-        (multiple-value-bind (rk sk) (c:hkdf-2 (handshake-ck hs) #())
-          (values (%make-session hs sk rk) hs))))))
+        (values (%split-session hs :responder) hs)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; The encrypted transport
@@ -260,6 +300,9 @@
   stream
   closer                    ; thunk that tears the connection down
   remote-node-id            ; their 33-byte static pubkey
+  ;; The four keys are fixed 32-byte buffers the session OWNS (FIXED:OWN): a
+  ;; dropped session returns them to the pool, NOISE-WIPE does so at once.  Each
+  ;; direction's chaining key is its own buffer — they ratchet independently.
   sk sn s-ck                ; sending key / nonce / chaining key
   rk rn r-ck                ; receiving key / nonce / chaining key
   ;; TWO locks, not one.  The directions are fully independent — separate keys,
@@ -270,20 +313,40 @@
   (send-lock (bordeaux-threads:make-lock "noise-send"))
   (recv-lock (bordeaux-threads:make-lock "noise-recv")))
 
-(defun %make-session (hs sk rk)
-  (%make-noise :remote-node-id (handshake-remote-static hs)
-               :sk sk :sn 0 :s-ck (handshake-ck hs)
-               :rk rk :rn 0 :r-ck (handshake-ck hs)))
+(defun %split-session (hs role)
+  "BOLT #8 Split(): HKDF(ck, \"\") -> two keys.  The initiator sends with the FIRST
+   half and receives with the second; the responder is the mirror image.  The
+   session owns fresh pooled copies of everything; the handshake's own secrets
+   (ephemeral key, chaining key, temp key) are returned to the pool here — the
+   handshake is spent."
+  (let ((k1 (gossamer:acquire :octets 32)) (k2 (gossamer:acquire :octets 32))
+        (s-ck (c:copy-key (handshake-ck hs))) (r-ck (c:copy-key (handshake-ck hs))))
+    (c:hkdf-2-into (handshake-ck hs) c:+empty+ k1 k2)
+    (multiple-value-bind (sk rk) (if (eq role :initiator) (values k1 k2) (values k2 k1))
+      (let ((n (%make-noise :remote-node-id (handshake-remote-static hs)
+                            :sk sk :sn 0 :s-ck s-ck
+                            :rk rk :rn 0 :r-ck r-ck)))
+        (gossamer:own n sk rk s-ck r-ck)
+        (handshake-wipe hs)
+        n))))
+
+(defun noise-wipe (n)
+  "Return the session's keys to the pool now rather than when it is collected.
+   Only for a session no thread will touch again."
+  (gossamer:disown n)
+  (gossamer:free (noise-sk n)) (gossamer:free (noise-rk n))
+  (gossamer:free (noise-s-ck n)) (gossamer:free (noise-r-ck n))
+  (setf (noise-sk n) nil (noise-rk n) nil (noise-s-ck n) nil (noise-r-ck n) nil)
+  n)
 
 (defmacro %maybe-rotate (ck-place key-place nonce-place)
   "BOLT #8 key rotation: at nonce 1000, ratchet this direction's chaining key and
    derive a fresh AEAD key, resetting the counter.  The two directions rotate
    independently, so this is a macro over whichever triple of places applies."
   `(when (= ,nonce-place +key-rotation-interval+)
-     (multiple-value-bind (new-ck new-k) (c:hkdf-2 ,ck-place ,key-place)
-       (setf ,ck-place new-ck
-             ,key-place new-k
-             ,nonce-place 0))))
+     ;; In place, in fixed memory: HKDF reads ck and k fully before writing.
+     (c:hkdf-2-into ,ck-place ,key-place ,ck-place ,key-place)
+     (setf ,nonce-place 0)))
 
 (defun %frame (n payload)
   "Encrypt PAYLOAD into an on-the-wire frame — an 18-byte encrypted length header
@@ -373,26 +436,32 @@
   "Run acts one through three as the dialer.  Returns a NOISE session."
   (c:with-ec-scratch
    (let ((hs (make-initiator-handshake local-privkey remote-node-id)))
-    (write-sequence (act-one-write hs) stream)
-    (force-output stream)
-    (act-two-read hs (%read-exactly stream +act-two-size+))
-    (multiple-value-bind (msg session) (act-three-write hs)
-      (write-sequence msg stream)
-      (force-output stream)
-      (setf (noise-stream session) stream)
-      session))))
+    (unwind-protect
+         (progn
+           (write-sequence (act-one-write hs) stream)
+           (force-output stream)
+           (act-two-read hs (%read-exactly stream +act-two-size+))
+           (multiple-value-bind (msg session) (act-three-write hs)
+             (write-sequence msg stream)
+             (force-output stream)
+             (setf (noise-stream session) stream)
+             session))
+      (handshake-wipe hs)))))
 
 (defun handshake-as-responder (stream local-privkey)
   "Run acts one through three as the listener.  Returns a NOISE session whose
    REMOTE-NODE-ID is the identity the initiator revealed in act three."
   (c:with-ec-scratch
    (let ((hs (make-responder-handshake local-privkey)))
-    (act-one-read hs (%read-exactly stream +act-one-size+))
-    (write-sequence (act-two-write hs) stream)
-    (force-output stream)
-    (let ((session (act-three-read hs (%read-exactly stream +act-three-size+))))
-      (setf (noise-stream session) stream)
-      session))))
+    (unwind-protect
+         (progn
+           (act-one-read hs (%read-exactly stream +act-one-size+))
+           (write-sequence (act-two-write hs) stream)
+           (force-output stream)
+           (let ((session (act-three-read hs (%read-exactly stream +act-three-size+))))
+             (setf (noise-stream session) stream)
+             session))
+      (handshake-wipe hs)))))
 
 (defun connect-peer (host port remote-node-id local-privkey
                      &key (transport :direct) (timeout 10))

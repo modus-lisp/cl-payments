@@ -34,14 +34,15 @@
   (:use #:cl)
   (:local-nicknames (#:c #:cl-payments.crypto) (#:w #:cl-payments.wire)
                     (#:gs #:cl-payments.gossip) (#:secp #:secp256k1-fast)
+                    (#:ecdh #:secp256k1-fast.ecdh)
                     (#:ic #:ironclad))
   (:nicknames #:ln-onion)
   (:export
    #:+packet-size+ #:+payload-area+ #:+hmac-size+
    #:onion-error
    ;; keys
-   #:generate-key #:cipher-stream #:shared-secret #:blinding-factor
-   #:ephemeral-keys-and-secrets
+   #:generate-key #:generate-key-into #:cipher-stream #:shared-secret #:blinding-factor
+   #:ephemeral-keys-and-secrets #:free-secrets
    ;; hop payloads
    #:hop-payload #:make-hop-payload #:encode-hop-payload #:parse-hop-payload
    #:hp-amount-msat #:hp-cltv-expiry #:hp-scid #:hp-payment-secret #:hp-total-msat
@@ -67,12 +68,24 @@
 ;;; Keys
 ;;; ----------------------------------------------------------------------------
 
-(defun generate-key (type secret)
+(defun generate-key-into (type secret out)
   "HMAC-SHA256 keyed by the ASCII key TYPE — \"rho\", \"mu\", \"um\", \"pad\",
-   \"ammag\" — over the shared secret.  The type is NOT NUL-terminated: three
-   bytes for rho, not four.  A trailing zero yields a different key at every hop
-   and a packet nobody can read."
-  (c:hmac-sha256 (c:ascii->bytes type) (c:octets secret)))
+   \"ammag\" — over the shared secret, into OUT (fixed: these are the per-hop
+   symmetric keys).  The type is NOT NUL-terminated: three bytes for rho, not
+   four.  A trailing zero yields a different key at every hop and a packet nobody
+   can read."
+  (natrium:hmac-sha256-into (c:ascii->bytes type) (c:octets secret) out))
+
+(defun generate-key (type secret)
+  "GENERATE-KEY-INTO a fresh heap vector — for the spec vectors, which compare the
+   derived keys themselves.  The onion code below derives into fixed scratch."
+  (generate-key-into type secret (make-array 32 :element-type '(unsigned-byte 8))))
+
+(defmacro %with-key ((var type secret) &body body)
+  "Bind VAR to the TYPE key for SECRET in fixed scratch for BODY's extent."
+  `(gossamer:with-fixed-scratch ((,var :octets 32))
+     (generate-key-into ,type ,secret ,var)
+     ,@body))
 
 (defun cipher-stream (key length)
   "LENGTH bytes of ChaCha20 keystream under KEY with a 96-bit zero nonce.  The
@@ -83,6 +96,15 @@
     (ic:encrypt-in-place cipher buf)
     buf))
 
+(defun %stream (type secret length)
+  "The keystream of SECRET's TYPE key, the key itself held only in fixed scratch."
+  (%with-key (k type secret) (cipher-stream k length)))
+
+(defun %hmac (type secret &rest parts)
+  "HMAC under SECRET's TYPE key (fixed scratch) over PARTS — a public tag."
+  (%with-key (k type secret)
+    (natrium:hmac-sha256-into k (mapcar #'c:octets parts) (make-array 32 :element-type '(unsigned-byte 8)))))
+
 (defun xor! (a b &key (start 0))
   "A[start+i] ^= B[i], in place."
   (loop for i from 0 below (length b)
@@ -90,24 +112,46 @@
   a)
 
 (defun shared-secret (privkey pubkey)
-  "SHA256 of the compressed ECDH point — the same convention BOLT #8 uses."
+  "SHA256 of the compressed ECDH point — the same convention BOLT #8 uses.
+   PRIVKEY is a fixed key and the multiplication is constant-time; the result is a
+   fresh POOLED fixed buffer the caller frees (FREE-SECRETS or C:FREE-KEY)."
   (c:ecdh (c:parse-pubkey pubkey) privkey))
 
+(defun free-secrets (secrets)
+  "Return a list of pooled shared secrets to the pool."
+  (mapc #'gossamer:free secrets)
+  nil)
+
+(defun %blinding-into (ephemeral-pubkey shared-secret out)
+  (natrium:with-sha256 (h)
+    (natrium:sha256-update h (c:octets ephemeral-pubkey))
+    (natrium:sha256-update h (c:octets shared-secret))
+    (natrium:sha256-final-into h out)))
+
 (defun blinding-factor (ephemeral-pubkey shared-secret)
-  (c:sha256 (c:bytes (c:octets ephemeral-pubkey) (c:octets shared-secret))))
+  (%blinding-into ephemeral-pubkey shared-secret (make-array 32 :element-type '(unsigned-byte 8))))
 
 (defun ephemeral-keys-and-secrets (session-key pubkeys)
   "Walk the route once, producing each hop's ephemeral public key and shared
    secret.  The ephemeral SCALAR is blinded at each hop by multiplying with the
    blinding factor; a hop blinds the POINT by the same factor and arrives at the
-   same next key without ever holding the scalar."
-  (let ((e session-key) (epks '()) (secrets '()))
-    (dolist (pk pubkeys)
-      (let* ((epk (c:compressed-pubkey (c:pubkey-of e)))
-             (ss (shared-secret e pk))
-             (bf (secp:bytes-to-int (blinding-factor epk ss))))
-        (push epk epks) (push ss secrets)
-        (setf e (mod (* e bf) +curve-order+))))
+   same next key without ever holding the scalar.
+
+   SESSION-KEY is a fixed key.  The running ephemeral scalar lives in one pooled
+   buffer and is blinded in place (constant-time multiply mod n), the blinding
+   factor in fixed scratch.  The secrets come back as POOLED fixed buffers the
+   caller frees (FREE-SECRETS); the ephemeral public keys are ordinary bytes."
+  (let ((e (c:copy-key session-key)) (epks '()) (secrets '()))
+    (handler-bind ((error (lambda (c) (declare (ignore c)) (free-secrets secrets))))
+      (unwind-protect
+           (gossamer:with-fixed-scratch ((bf :octets 32))
+             (dolist (pk pubkeys)
+               (let* ((epk (c:compressed-pubkey (c:pubkey-of e)))
+                      (ss (shared-secret e pk)))
+                 (push epk epks) (push ss secrets)
+                 (%blinding-into epk ss bf)
+                 (secp:seckey-tweak-mul-into e bf e))))
+        (gossamer:free e)))
     (values (nreverse epks) (nreverse secrets))))
 
 ;;; ----------------------------------------------------------------------------
@@ -178,8 +222,7 @@
   (let ((filler (c:zeros 0)))
     (loop for ss in secrets for payload in payloads
           do (let* ((grown (c:bytes filler (c:zeros (+ (length payload) +hmac-size+))))
-                    (stream (cipher-stream (generate-key "rho" ss)
-                                           (+ +payload-area+ (length payload) +hmac-size+)))
+                    (stream (%stream "rho" ss (+ +payload-area+ (length payload) +hmac-size+)))
                     (tail (subseq stream (- (length stream) (length grown)))))
                (setf filler (xor! grown tail))))
     filler))
@@ -188,15 +231,17 @@
   "Build the packet for a route.  PAYLOADS are length-prefixed TLV blobs, one
    per hop, in route order; the last is the final recipient's.  Returns
    (values packet shared-secrets) — the secrets are what the sender needs later
-   to read a returned error."
+   to read a returned error.  SESSION-KEY is a fixed key (the caller's); the
+   secrets are POOLED fixed buffers the caller now owns (FREE-SECRETS)."
   (unless (= (length pubkeys) (length payloads)) (fail "one payload per hop"))
   (when (> (reduce #'+ payloads :key (lambda (p) (+ (length p) +hmac-size+))) +payload-area+)
     (fail "payloads do not fit in ~d bytes" +payload-area+))
   (multiple-value-bind (epks secrets) (ephemeral-keys-and-secrets session-key pubkeys)
+   (handler-bind ((error (lambda (c) (declare (ignore c)) (free-secrets secrets))))
     (let* ((filler (generate-filler (butlast secrets) (butlast payloads)))
            ;; The initial payload area is random-looking bytes from the pad key
            ;; so the unused tail carries no structure.
-           (area (cipher-stream (generate-key "pad" (secp:int-to-bytes32 session-key)) +payload-area+))
+           (area (%stream "pad" session-key +payload-area+))
            (hmac (c:zeros +hmac-size+))
            (ad (c:octets associated-data)))
       ;; Reverse order: the last hop's layer goes on first.
@@ -204,14 +249,14 @@
             do (let* ((payload (nth i payloads)) (ss (nth i secrets))
                       (shift (+ (length payload) +hmac-size+))
                       (next (c:bytes payload hmac (subseq area 0 (- +payload-area+ shift)))))
-                 (xor! next (cipher-stream (generate-key "rho" ss) +payload-area+))
+                 (xor! next (%stream "rho" ss +payload-area+))
                  ;; Only the last hop's layer takes the filler: it is what every
                  ;; EARLIER hop will have left behind by the time this layer is read.
                  (when (= i (1- (length pubkeys)))
                    (replace next filler :start1 (- +payload-area+ (length filler))))
                  (setf area next
-                       hmac (c:hmac-sha256 (generate-key "mu" ss) (c:bytes area ad)))))
-      (values (c:bytes (vector 0) (c:octets (first epks)) area hmac) secrets))))
+                       hmac (%hmac "mu" ss area ad))))
+      (values (c:bytes (vector 0) (c:octets (first epks)) area hmac) secrets)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Peeling
@@ -222,6 +267,10 @@
    where NEXT-PACKET is NIL if we are the final hop.  PAYLOAD-BYTES is the TLV
    stream without its length prefix.
 
+   PRIVKEY is our fixed node key; the ECDH is constant-time.  SHARED-SECRET comes
+   back as a POOLED fixed buffer the caller owns (and frees); on any failure here
+   it has already been returned to the pool.
+
    The HMAC is checked BEFORE anything is decrypted or parsed.  A packet that
    fails it tells us nothing we should act on, including how long it claims to
    be."
@@ -231,29 +280,36 @@
          (area (subseq packet 34 (+ 34 +payload-area+)))
          (hmac (subseq packet (+ 34 +payload-area+)))
          (ss (handler-case (shared-secret privkey epk)
-               (error () (fail "ephemeral key is not a valid point"))))
-         (expected (c:hmac-sha256 (generate-key "mu" ss) (c:bytes area (c:octets associated-data)))))
-    (unless (c:ct-equal expected hmac) (fail "bad HMAC"))
-    ;; Pad with 1300 zeros, then XOR with 2600 bytes of stream: this decrypts
-    ;; our layer AND encrypts the zero tail into the filler the next hop expects.
-    (let* ((unwrapped (xor! (c:bytes area (c:zeros +payload-area+))
-                            (cipher-stream (generate-key "rho" ss) (* 2 +payload-area+))))
-           (r (w:make-reader unwrapped))
-           (len (handler-case (w:r-bigsize r) (error () (fail "malformed payload length")))))
-      (when (< len 2) (fail "payload length ~d is too short" len))
-      (when (> (+ (w:reader-pos r) len +hmac-size+) (length unwrapped))
-        (fail "payload length ~d overruns the packet" len))
-      (let* ((payload (w:r-bytes r len))
-             (next-hmac (w:r-bytes r +hmac-size+))
-             (consumed (w:reader-pos r)))
-        (if (every #'zerop next-hmac)
-            (values payload nil ss)
-            (let* ((bf (secp:bytes-to-int (blinding-factor epk ss)))
-                   (next-epk (c:compressed-pubkey (secp:secp-mul-point bf (c:parse-pubkey epk))))
-                   (next-area (subseq unwrapped consumed (+ consumed +payload-area+))))
-              (values payload
-                      (c:bytes (vector 0) next-epk next-area next-hmac)
-                      ss)))))))
+               (error () (fail "ephemeral key is not a valid point")))))
+    (handler-bind ((error (lambda (c) (declare (ignore c)) (gossamer:free ss))))
+      (let ((expected (%hmac "mu" ss area associated-data)))
+        (unless (c:ct-equal expected hmac) (fail "bad HMAC"))
+        ;; Pad with 1300 zeros, then XOR with 2600 bytes of stream: this decrypts
+        ;; our layer AND encrypts the zero tail into the filler the next hop expects.
+        (let* ((unwrapped (xor! (c:bytes area (c:zeros +payload-area+))
+                                (%stream "rho" ss (* 2 +payload-area+))))
+               (r (w:make-reader unwrapped))
+               (len (handler-case (w:r-bigsize r) (error () (fail "malformed payload length")))))
+          (when (< len 2) (fail "payload length ~d is too short" len))
+          (when (> (+ (w:reader-pos r) len +hmac-size+) (length unwrapped))
+            (fail "payload length ~d overruns the packet" len))
+          (let* ((payload (w:r-bytes r len))
+                 (next-hmac (w:r-bytes r +hmac-size+))
+                 (consumed (w:reader-pos r)))
+            (if (every #'zerop next-hmac)
+                (values payload nil ss)
+                ;; Blind the ephemeral POINT for the next hop.  The factor is
+                ;; derived from the shared secret, so it is multiplied in constant
+                ;; time from fixed scratch: secp256k1-fast's ECDH ladder computes
+                ;; exactly bf * epk, and its compressed encoding is the next key.
+                (let ((next-epk (gossamer:with-fixed-scratch ((bf :octets 32) (pt :octets 33))
+                                  (%blinding-into epk ss bf)
+                                  (ecdh:ecdh-compressed-into bf (c:parse-pubkey epk) pt)
+                                  (copy-seq pt)))
+                      (next-area (subseq unwrapped consumed (+ consumed +payload-area+))))
+                  (values payload
+                          (c:bytes (vector 0) next-epk next-area next-hmac)
+                          ss)))))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Errors
@@ -292,13 +348,13 @@
     (w:w-u16 wr (length msg)) (w:w-bytes wr msg)
     (w:w-u16 wr pad-len) (w:w-bytes wr (c:zeros pad-len))
     (let* ((body (w:writer-bytes wr))
-           (hmac (c:hmac-sha256 (generate-key "um" shared-secret) body)))
+           (hmac (%hmac "um" shared-secret body)))
       (wrap-failure-packet shared-secret (c:bytes hmac body)))))
 
 (defun wrap-failure-packet (shared-secret packet)
   "One more layer, applied by the erring node and by each hop it passes."
   (let ((p (copy-seq (c:octets packet))))
-    (xor! p (cipher-stream (generate-key "ammag" shared-secret) (length p)))))
+    (xor! p (%stream "ammag" shared-secret (length p)))))
 
 (defun decrypt-failure-packet (shared-secrets packet)
   "At the origin: unwrap one hop at a time, in route order, until the HMAC
@@ -310,7 +366,7 @@
           do (setf p (wrap-failure-packet ss p))
              (let* ((hmac (subseq p 0 +hmac-size+))
                     (body (subseq p +hmac-size+)))
-               (when (c:ct-equal hmac (c:hmac-sha256 (generate-key "um" ss) body))
+               (when (c:ct-equal hmac (%hmac "um" ss body))
                  (let* ((r (w:make-reader body))
                         (len (w:r-u16 r)))
                    (when (> len (length body)) (return nil))

@@ -125,7 +125,7 @@ clp_id() {
   sbcl --noinform --disable-debugger --non-interactive \
        --eval '(require :asdf)' \
        --eval "(handler-bind ((warning (function muffle-warning))) (asdf:load-system \"cl-payments\"))" \
-       --eval "(princ (cl-payments.crypto:bytes->hex (cl-payments.crypto:compressed-pubkey (cl-payments.crypto:pubkey-of (secp256k1-fast:bytes-to-int (cl-payments.crypto:hex->bytes \"$key\"))))))" \
+       --eval "(princ (cl-payments.crypto:bytes->hex (cl-payments.crypto:compressed-pubkey (cl-payments.crypto:pubkey-of (cl-payments.crypto:privkey-from-hex \"$key\")))))" \
        2>/dev/null | tail -1 | tee "$dir/node.id"
 }
 

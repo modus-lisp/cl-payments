@@ -50,7 +50,7 @@
    #:sc-key-index #:sc-scid #:sc-remote-funding-pubkey
    #:sc-local-msat #:sc-remote-msat
    #:sc-local-commitment-number #:sc-remote-commitment-number
-   #:channel-keys #:derive-channel-keys #:ck-pub
+   #:channel-keys #:derive-channel-keys #:ck-pub #:channel-keys-wipe #:with-channel-keys
    #:ck-index #:ck-funding #:ck-revocation #:ck-payment #:ck-delayed #:ck-htlc #:ck-seed
    #:node-error #:pay-invoice #:node-router #:run-command-loop
    #:open-channel-to #:funding-confirmed #:close-channel #:node-privkey #:node-payments
@@ -116,37 +116,76 @@
 ;;; available yet.  This is why real implementations keep a monotonic counter.
 ;;; ----------------------------------------------------------------------------
 
+;;; Every key here is a FIXED 32-byte buffer from the pool.  A CHANNEL-KEYS owns
+;;; its six (FIXED:OWN, so a dropped one returns them); CHANNEL-KEYS-WIPE returns
+;;; them at once, and WITH-CHANNEL-KEYS is the form for the many callers that only
+;;; want a public key or one signature.  The node key goes in as the HKDF IKM from
+;;; fixed memory, and each output is written by natrium straight into its buffer.
+
 (defstruct (channel-keys (:conc-name ck-))
   index funding revocation payment delayed htlc seed)
 
-(defun %derive-scalar (privkey index role)
-  "One private key, as an integer, from the node key and a labelled index.
+(defparameter +channel-keys-salt+ (c:ascii->bytes "cl-payments channel keys"))
+
+(defun %derive-scalar-into (privkey index role out)
+  "One private key from the node key and a labelled index, into OUT (fixed).
    Rejects the astronomically-unlikely out-of-range result rather than silently
    producing an invalid key."
-  (let* ((salt (c:ascii->bytes "cl-payments channel keys"))
-         (okm (c:hkdf salt (secp:int-to-bytes32 privkey)
-                      :info (c:ascii->bytes (format nil "~a/~d" role index))
-                      :length 32)))
-    (let ((n (secp:bytes-to-int okm)))
-      (unless (c:valid-privkey-p n)
-        (error 'node-error :detail (format nil "derived invalid key for ~a/~d" role index)))
-      n)))
+  (natrium:hkdf-into :sha256 +channel-keys-salt+ (gossamer:check-fixed privkey "node key")
+                     (c:ascii->bytes (format nil "~a/~d" role index)) out)
+  (unless (secp:seckey-valid-p out)
+    (error 'node-error :detail (format nil "derived invalid key for ~a/~d" role index)))
+  out)
+
+(defun %derive-scalar (privkey index role)
+  "%DERIVE-SCALAR-INTO a fresh POOLED buffer; the caller frees it."
+  (let ((k (gossamer:acquire :octets 32)))
+    (handler-bind ((error (lambda (e) (declare (ignore e)) (gossamer:free k))))
+      (%derive-scalar-into privkey index role k))))
+
+(defmacro %with-scalar ((var privkey index role) &body body)
+  "Bind VAR to a derived key in fixed scratch for BODY's extent."
+  `(gossamer:with-fixed-scratch ((,var :octets 32))
+     (%derive-scalar-into ,privkey ,index ,role ,var)
+     ,@body))
 
 (defun derive-channel-keys (privkey index)
   "The full key family for channel INDEX.  Same node key and index always give
-   the same channel keys, on any machine, after any crash."
-  (make-channel-keys
-   :index index
-   :funding    (%derive-scalar privkey index "funding")
-   :revocation (%derive-scalar privkey index "revocation")
-   :payment    (%derive-scalar privkey index "payment")
-   :delayed    (%derive-scalar privkey index "delayed")
-   :htlc       (%derive-scalar privkey index "htlc")
-   ;; The shachain seed is bytes, not a scalar — it is hashed, never multiplied.
-   :seed (c:hkdf (c:ascii->bytes "cl-payments channel keys")
-                 (secp:int-to-bytes32 privkey)
-                 :info (c:ascii->bytes (format nil "seed/~d" index))
-                 :length 32)))
+   the same channel keys, on any machine, after any crash.  The result owns six
+   pooled fixed buffers: CHANNEL-KEYS-WIPE (or WITH-CHANNEL-KEYS) returns them."
+  (let ((bufs '()))
+    (handler-bind ((error (lambda (e) (declare (ignore e)) (mapc #'gossamer:free bufs))))
+      (flet ((scalar (role) (let ((k (gossamer:acquire :octets 32))) (push k bufs)
+                              (%derive-scalar-into privkey index role k))))
+        (let ((ck (make-channel-keys
+                   :index index
+                   :funding    (scalar "funding")
+                   :revocation (scalar "revocation")
+                   :payment    (scalar "payment")
+                   :delayed    (scalar "delayed")
+                   :htlc       (scalar "htlc")
+                   ;; The shachain seed is bytes, not a scalar — it is hashed, never
+                   ;; multiplied — but it is every per-commitment secret we will ever
+                   ;; have, so it lives in fixed memory like the rest.
+                   :seed (let ((sd (gossamer:acquire :octets 32)))
+                           (push sd bufs)
+                           (natrium:hkdf-into :sha256 +channel-keys-salt+ (gossamer:check-fixed privkey "node key")
+                                              (c:ascii->bytes (format nil "seed/~d" index)) sd)))))
+          (apply #'gossamer:own ck bufs))))))
+
+(defun channel-keys-wipe (ck)
+  "Return CK's six keys to the pool now.  Idempotent."
+  (gossamer:disown ck)
+  (mapc #'gossamer:free (list (ck-funding ck) (ck-revocation ck) (ck-payment ck)
+                           (ck-delayed ck) (ck-htlc ck) (ck-seed ck)))
+  (setf (ck-funding ck) nil (ck-revocation ck) nil (ck-payment ck) nil
+        (ck-delayed ck) nil (ck-htlc ck) nil (ck-seed ck) nil)
+  ck)
+
+(defmacro with-channel-keys ((var privkey index) &body body)
+  "Bind VAR to DERIVE-CHANNEL-KEYS for BODY's extent, wiped on every exit."
+  `(let ((,var (derive-channel-keys ,privkey ,index)))
+     (unwind-protect (progn ,@body) (channel-keys-wipe ,var))))
 
 (defun ck-pub (scalar) (c:compressed-pubkey (c:pubkey-of scalar)))
 
@@ -312,10 +351,16 @@
         (loop for (k . v) in (getf st :invoices) do (setf (gethash k (node-invoices node)) v))
         (dolist (pl (getf st :payments))
           (let* ((sc (and (getf pl :channel-id) (gethash (%hex (getf pl :channel-id)) (node-channels node))))
-                 (p (make-payment :payment-hash (getf pl :payment-hash) :amount-msat (getf pl :amount-msat)
-                                  :status (getf pl :status) :preimage (getf pl :preimage) :failure (getf pl :failure)
-                                  :bolt11 (getf pl :bolt11) :height (getf pl :height) :attempt (getf pl :attempt)
-                                  :shared-secrets (getf pl :shared-secrets) :sc sc :htlc-id (getf pl :htlc-id))))
+                 ;; the onion shared secrets come back into fixed memory, owned by the
+                 ;; payment as when it was made; the decoded heap copies are wiped
+                 (secrets (mapcar (lambda (h) (prog1 (gossamer:pooled-copy h) (fill h 0)))
+                                  (getf pl :shared-secrets)))
+                 (p (apply #'gossamer:own
+                           (make-payment :payment-hash (getf pl :payment-hash) :amount-msat (getf pl :amount-msat)
+                                         :status (getf pl :status) :preimage (getf pl :preimage) :failure (getf pl :failure)
+                                         :bolt11 (getf pl :bolt11) :height (getf pl :height) :attempt (getf pl :attempt)
+                                         :shared-secrets secrets :sc sc :htlc-id (getf pl :htlc-id))
+                           secrets)))
             (setf (gethash (%hex (pay-payment-hash p)) (node-payments node)) p)
             (when (and sc (eq (pay-status p) :pending))
               (setf (gethash (cons (%hex (sc-channel-id sc)) (pay-htlc-id p)) (node-origin-htlcs node)) p))))
@@ -326,7 +371,7 @@
 ;;; ----------------------------------------------------------------------------
 
 (defstruct (node (:constructor %make-node))
-  privkey                          ; our static identity (integer)
+  privkey                          ; our static identity (fixed 32 bytes, owned)
   id                               ; 33-byte compressed pubkey
   dir                              ; where state lives
   port
@@ -388,19 +433,22 @@
 (defun make-node (&key dir port privkey (log *standard-output*))
   "Create a node.  PRIVKEY defaults to the persistent key in DIR/node.key — a
    node that generates a fresh identity cannot reconnect to any channel it ever
-   opened, because a channel is a 2-of-2 with a specific counterparty."
+   opened, because a channel is a 2-of-2 with a specific counterparty.
+
+   The identity key lives in fixed memory, owned by the node: a supplied PRIVKEY
+   (a fixed key) is copied, the file's hex is IMPORTED (decoded copy wiped)."
   (let* ((dir (uiop:ensure-directory-pathname dir))
-         (key (or privkey
+         (key (if privkey
+                  (c:copy-key privkey)
                   (let ((f (merge-pathnames "node.key" dir)))
                     (unless (probe-file f)
                       (error 'node-error
                              :detail (format nil "no node key at ~a" f)))
-                    (secp:bytes-to-int
-                     (c:hex->bytes (string-trim '(#\Newline #\Space)
-                                                (uiop:read-file-string f))))))))
-    (%make-node :privkey key
-                :id (c:compressed-pubkey (c:pubkey-of key))
-                :dir dir :port port :log-stream log)))
+                    (c:privkey-from-hex (uiop:read-file-string f))))))
+    (gossamer:own (%make-node :privkey key
+                           :id (c:compressed-pubkey (c:pubkey-of key))
+                           :dir dir :port port :log-stream log)
+               key)))
 
 (defun nlog (node fmt &rest args)
   (when (node-log-stream node)
@@ -453,10 +501,18 @@
                      (if sc (sc-remote-commitment-number sc) 0)
                      :your-last-per-commitment-secret (c:zeros 32)
                      :my-current-per-commitment-point
-                     (k:per-commitment-point
-                      (c:sha256 (c:bytes (secp:int-to-bytes32 (node-privkey node)) cid))
-                      (- k:+max-commitment-index+
-                         (if sc (sc-local-commitment-number sc) 0))))))))
+                     ;; A stand-in seed for a channel we have no record of,
+                     ;; derived from the node key — so it is hashed in fixed
+                     ;; scratch, never concatenated onto the heap.
+                     (gossamer:with-fixed-scratch ((seed :octets 32))
+                       (natrium:with-sha256 (h)
+                         (natrium:sha256-update h (node-privkey node))
+                         (natrium:sha256-update h (c:octets cid))
+                         (natrium:sha256-final-into h seed))
+                       (k:per-commitment-point
+                        seed
+                        (- k:+max-commitment-index+
+                           (if sc (sc-local-commitment-number sc) 0)))))))))
           (ignore-errors (p:send-message peer ours nil)))))))
 
 (defconstant +msg-announcement-signatures+ 259)
@@ -479,8 +535,8 @@
   (let ((remote-funding (sc-remote-funding-pubkey sc))
         (scid (sc-scid sc)))
     (when (and remote-funding scid)
-      (let ((local-funding (ck-pub (ck-funding (derive-channel-keys (node-privkey node)
-                                                                   (sc-key-index sc))))))
+      (let ((local-funding (%with-scalar (k (node-privkey node) (sc-key-index sc) "funding")
+                             (ck-pub k))))
         (multiple-value-bind (n1 n2 we-are-1) (gs:node-order (node-id node) (sc-peer-id sc))
           (values (gs:channel-announcement-body
                    :features 0
@@ -502,9 +558,9 @@
    is no way to know what we would charge."
   (multiple-value-bind (body we-are-1) (announcement-body-for node sc)
     (unless body (return-from broadcast-announcement nil))
-    (let* ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc)))
-           (our-node-sig (gs:sign-gossip (node-privkey node) body))
-           (our-btc-sig  (gs:sign-gossip (ck-funding keys) body))
+    (let* ((our-node-sig (gs:sign-gossip (node-privkey node) body))
+           (our-btc-sig  (%with-scalar (k (node-privkey node) (sc-key-index sc) "funding")
+                           (gs:sign-gossip k body)))
            (ann (gs:encode-channel-announcement
                  body
                  :node-sig-1    (if we-are-1 our-node-sig (sc-remote-node-sig sc))
@@ -587,13 +643,13 @@
                                                 (sc-remote-funding-pubkey sc))))
                 (nlog node "  their signatures do not verify — refusing to announce"))
                (t
-                (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+                (%with-scalar (funding (node-privkey node) (sc-key-index sc) "funding")
                   (p:send-message
                    peer +msg-announcement-signatures+
                    (encode-announcement-signatures
                     cid scid
                     (gs:sign-gossip (node-privkey node) body)
-                    (gs:sign-gossip (ck-funding keys) body))))
+                    (gs:sign-gossip funding body))))
                 (nlog node "  sent our announcement_signatures")
                 (broadcast-announcement node peer sc)))))))
     (error (e) (nlog node "bad announcement_signatures: ~a" e))))
@@ -812,7 +868,7 @@
         (nlog node "channel_ready for ~a" (subseq (%hex cid) 0 16))
         (if (null sc)
             (nlog node "  no record of that channel — not replying")
-            (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+            (with-channel-keys (keys (node-privkey node) (sc-key-index sc))
               ;; Their second per-commitment point is what we sign their FIRST
               ;; update into.  Only taken while nothing has happened yet: a peer
               ;; re-sending channel_ready after a reconnect must not rewind us.
@@ -947,6 +1003,11 @@
           (handler-case
               (multiple-value-bind (payload next ss)
                   (on:peel-onion (lv:hr-onion h) (node-privkey node) (lv:hr-payment-hash h))
+                ;; SS is a pooled fixed buffer.  It outlives this form only if a
+                ;; forward record takes it (and owns it); otherwise it goes back
+                ;; to the pool on the way out, whatever happens.
+               (let ((ss-kept nil))
+                (unwind-protect
                 ;; From here on we HAVE a shared secret, so every failure can be
                 ;; a proper encrypted reason — including a payload we cannot
                 ;; parse, which is invalid_onion_payload rather than BADONION:
@@ -1020,14 +1081,17 @@
                                                          (on:hp-cltv-expiry hp) next))
                                    (out-id (1- (lv:live-next-htlc-id out-lc))))
                               (setf (gethash (cons (%hex (sc-channel-id out-sc)) out-id) (node-forwards node))
-                                    (make-forward :in-sc sc :in-id (lv:hr-id h) :in-peer peer
-                                                  :shared-secret ss :out-sc out-sc :out-id out-id))
+                                    (gossamer:own (make-forward :in-sc sc :in-id (lv:hr-id h) :in-peer peer
+                                                             :shared-secret ss :out-sc out-sc :out-id out-id)
+                                               ss)
+                                    ss-kept t)
                               (p:send-message out-peer out-msg nil)
                               (nlog node "  HTLC ~d: forwarding ~d msat over ~a as HTLC ~d (fee ~d msat)"
                                     (lv:hr-id h) (on:hp-amount-msat hp) (gs:scid-string (sc-scid out-sc)) out-id
                                     (- (lv:hr-amount-msat h) (on:hp-amount-msat hp)))
                               (maybe-commit node out-peer out-sc)
-                              (save-channels node))))))))))
+                              (save-channels node)))))))))
+                  (unless ss-kept (gossamer:free ss)))))
             (on:onion-error (e)
               ;; We could not even open the onion: no shared secret, so no
               ;; encrypted reason.  BADONION, in the clear, with the onion's hash.
@@ -1068,6 +1132,10 @@
                            nil)
            (nlog node "  forwarded HTLC ~d: downstream reports malformed onion — failing upstream" out-id)))
         (remhash (cons (%hex (sc-channel-id (fwd-in-sc f))) (fwd-in-id f)) (node-in-flight node))
+        ;; The hop is resolved: its shared secret has nothing left to wrap.
+        (gossamer:disown f)
+        (gossamer:free (fwd-shared-secret f))
+        (setf (fwd-shared-secret f) nil)
         (maybe-commit node in-peer (fwd-in-sc f))))))
 
 (defmacro with-live-channel ((sc lc node payload what) &body body)
@@ -1154,7 +1222,7 @@
 (defun our-shutdown-script (node sc)
   "Where our side of a close goes: P2WPKH of a key derived for this channel.
    Recoverable from the node key alone, like every other channel key."
-  (m:p2wpkh (ck-pub (%derive-scalar (node-privkey node) (sc-key-index sc) "close"))))
+  (m:p2wpkh (%with-scalar (k (node-privkey node) (sc-key-index sc) "close") (ck-pub k))))
 
 (defun handle-shutdown (node peer payload)
   (with-live-channel (sc lc node payload "shutdown")
@@ -1312,17 +1380,25 @@
                                                          :payment-secret (inv:inv-payment-secret invoice)
                                                          :total-msat amount)))))
                (session-key (c:generate-key)))
+          ;; The session key is needed only to build the onion: back to the pool
+          ;; as soon as it is built.  The shared secrets it yields are owned by
+          ;; the PAYMENT (FIXED:OWN), which needs them to read a returned error.
           (multiple-value-bind (onion secrets)
-              (on:create-onion session-key (mapcar #'rt:hop-node hops) payloads hash)
+              (unwind-protect
+                   (on:create-onion session-key (mapcar #'rt:hop-node hops) payloads hash)
+                (c:free-key session-key))
             (let* ((lc (sc-live out-sc))
-                   (msg (lv:send-add lc (rt:hop-amount-msat first-hop) hash
-                                     (rt:hop-cltv-expiry first-hop) onion))
+                   (msg (handler-bind ((error (lambda (e) (declare (ignore e)) (on:free-secrets secrets))))
+                          (lv:send-add lc (rt:hop-amount-msat first-hop) hash
+                                       (rt:hop-cltv-expiry first-hop) onion)))
                    (id (1- (lv:live-next-htlc-id lc)))
-                   (payment (make-payment :payment-hash hash :amount-msat amount :decoded invoice
-                                          :hops hops :shared-secrets secrets
-                                          :sc out-sc :htlc-id id :result-path result-path
-                                          :bolt11 bolt11 :height current-height
-                                          :exclude exclude :attempt attempt)))
+                   (payment (apply #'gossamer:own
+                                   (make-payment :payment-hash hash :amount-msat amount :decoded invoice
+                                                 :hops hops :shared-secrets secrets
+                                                 :sc out-sc :htlc-id id :result-path result-path
+                                                 :bolt11 bolt11 :height current-height
+                                                 :exclude exclude :attempt attempt)
+                                   secrets)))
               (setf (gethash (%hex hash) (node-payments node)) payment
                     (gethash (cons (%hex (sc-channel-id out-sc)) id) (node-origin-htlcs node)) payment)
               (save-state node)
@@ -1681,7 +1757,7 @@
          (peer (and sc (gethash (%hex (sc-peer-id sc)) (node-peers node)))))
     (unless (and sc peer) (error 'node-error :detail "no such live channel with a connected peer"))
     (when scid (setf (sc-scid sc) scid))
-    (let ((keys (derive-channel-keys (node-privkey node) (sc-key-index sc))))
+    (with-channel-keys (keys (node-privkey node) (sc-key-index sc))
       (p:send-message
        peer
        (ch:encode-channel-ready
@@ -2319,15 +2395,18 @@
 ;;; Outputs of our own
 ;;; ----------------------------------------------------------------------------
 
-(defun deposit-privkey (node) (%derive-scalar (node-privkey node) 0 "deposit"))
-(defun deposit-script (node) (m:p2wpkh (ck-pub (deposit-privkey node))))
+(defun deposit-privkey (node)
+  "The deposit key, in a fresh POOLED fixed buffer the caller frees."
+  (%derive-scalar (node-privkey node) 0 "deposit"))
+(defun deposit-script (node) (m:p2wpkh (%with-scalar (k (node-privkey node) 0 "deposit") (ck-pub k))))
 
 (defun our-scripts (node)
   "Every scriptPubKey an output could pay us at: the deposit address and each
-   channel's sweep address, with the key for it."
-  (let ((out (list (cons (deposit-script node) (deposit-privkey node)))))
+   channel's sweep address, with HOW to derive the key for it — (index . role).
+   Only an output that actually pays us gets its key derived."
+  (let ((out (list (cons (deposit-script node) (cons 0 "deposit")))))
     (maphash (lambda (k sc) (declare (ignore k))
-               (push (cons (our-sweep-script node sc) (%derive-scalar (node-privkey node) (sc-key-index sc) "close")) out))
+               (push (cons (our-sweep-script node sc) (cons (sc-key-index sc) "close")) out))
              (node-channels node))
     out))
 
@@ -2344,7 +2423,8 @@
         (let ((*print-pretty* nil))
           (dolist (u (node-utxos node))
             (prin1 (list :txid (%hex (oc:utxo-txid u)) :vout (oc:utxo-vout u) :value (oc:utxo-value u)
-                         :privkey (oc:utxo-privkey u))
+                         ;; EXPORT: hex, as the channel state file does.
+                         :privkey (c:export-privkey (oc:utxo-privkey u)))
                    s)
             (terpri s)))
         (%fsync-stream s))
@@ -2372,7 +2452,9 @@
           do (let ((hit (assoc (btx:txout-script out) scripts :test #'equalp)))
                (when (and hit (not (find-if (lambda (u) (and (equalp (oc:utxo-txid u) (btx:tx-txid tx)) (= (oc:utxo-vout u) i)))
                                             (node-utxos node))))
-                 (push (oc:make-utxo :txid (btx:tx-txid tx) :vout i :value (btx:txout-value out) :privkey (cdr hit))
+                 (push (destructuring-bind (index . role) (cdr hit)
+                         (%with-scalar (key (node-privkey node) index role)
+                           (oc:make-utxo :txid (btx:tx-txid tx) :vout i :value (btx:txout-value out) :privkey key)))
                        (node-utxos node))
                  (setf changed t)
                  (nlog node "  received ~d sat at an address of ours (~a:~d)" (btx:txout-value out)

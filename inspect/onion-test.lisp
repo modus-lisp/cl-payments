@@ -29,7 +29,7 @@
 
 (defun run-onion-tests ()
   (let* ((json (uiop:read-file-string (onion-vectors-path)))
-         (session (secp:bytes-to-int (hx (json-field json "session_key"))))
+         (session (sk (json-field json "session_key")))
          (ad (hx (json-field json "associated_data")))
          (pubkeys (mapcar #'hx (json-all json "pubkey")))
          (payloads (mapcar #'hx (json-all json "payload")))
@@ -43,6 +43,7 @@
         (check "first ephemeral pubkey is sessionkey*G"
                (equalp (first epks) (c:compressed-pubkey (c:pubkey-of session))))
         (check "each shared secret is 32 bytes" (every (lambda (s) (= 32 (length s))) secrets))
+        (check "each shared secret is in fixed memory" (every #'gossamer:fixed-p secrets))
         (check "ephemeral keys are all distinct — blinding worked"
                (= 5 (length (remove-duplicates epks :test #'equalp))))
         ;; A hop derives the same secret from the OTHER side: ECDH(node_priv, epk).
@@ -72,7 +73,7 @@
     ;; not give.  So: build a route over keys WE choose, and check that each node
     ;; recovers exactly its payload, and nothing else.
     (with-gate ("onion: five nodes each peel exactly their own layer")
-      (let* ((privs (loop for i from 1 to 5 collect (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "onion-test/node~d" i))))))
+      (let* ((privs (loop for i from 1 to 5 collect (sk (c:sha256 (c:ascii->bytes (format nil "onion-test/node~d" i))))))
              (pubs (mapcar (lambda (k) (c:compressed-pubkey (c:pubkey-of k))) privs))
              (hps (list (on:make-hop-payload :amount-msat 4000 :cltv-expiry 140 :scid (gs:make-scid 1 1 1))
                         (on:make-hop-payload :amount-msat 3000 :cltv-expiry 130 :scid (gs:make-scid 2 2 2))

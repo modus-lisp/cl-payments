@@ -17,10 +17,10 @@
 (in-package #:cl-payments.test)
 
 ;; The spec's fixed keys, shared by the initiator and responder vectors.
-(defparameter *ls-priv-initiator* #x1111111111111111111111111111111111111111111111111111111111111111)
-(defparameter *ls-priv-responder* #x2121212121212121212121212121212121212121212121212121212121212121)
-(defparameter *e-priv-initiator*  #x1212121212121212121212121212121212121212121212121212121212121212)
-(defparameter *e-priv-responder*  #x2222222222222222222222222222222222222222222222222222222222222222)
+(defparameter *ls-priv-initiator* (sk #x1111111111111111111111111111111111111111111111111111111111111111))
+(defparameter *ls-priv-responder* (sk #x2121212121212121212121212121212121212121212121212121212121212121))
+(defparameter *e-priv-initiator* (sk #x1212121212121212121212121212121212121212121212121212121212121212))
+(defparameter *e-priv-responder* (sk #x2222222222222222222222222222222222222222222222222222222222222222))
 
 (defparameter *rs-pub*
   "028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7")
@@ -50,7 +50,14 @@
         ;; BOLT #8 bug — the handshake still "succeeds" and then every message
         ;; fails to decrypt.
         (check-bytes "final sk" (tp:noise-sk session) (hx *final-sk*))
-        (check-bytes "final rk" (tp:noise-rk session) (hx *final-rk*))))))
+        (check-bytes "final rk" (tp:noise-rk session) (hx *final-rk*))
+        (check "session keys and chaining keys are in fixed memory"
+               (every #'gossamer:fixed-p (list (tp:noise-sk session) (tp:noise-rk session)
+                                            (tp::noise-s-ck session) (tp::noise-r-ck session))))
+        (check "the spent handshake has returned its secrets"
+               (and (null (tp:handshake-ck hs)) (null (tp:handshake-temp-k hs))
+                    (null (tp::handshake-e-priv hs))))
+        (tp:noise-wipe session)))))
 
 (defun test-bolt8-responder ()
   (with-gate ("BOLT #8 — responder handshake")
@@ -92,9 +99,10 @@
   ;; Encrypt "hello" 1002 times and check the spec's sampled outputs.  Messages
   ;; 1000 and 1001 are the ones that exercise the key rotation.
   (with-gate ("BOLT #8 — message encryption + key rotation")
+    ;; Four DISTINCT fixed buffers: rotation ratchets each one in place.
     (let* ((session (tp::%make-noise
-                     :sk (hx *final-sk*) :sn 0 :s-ck (hx *final-ck*)
-                     :rk (hx *final-rk*) :rn 0 :r-ck (hx *final-ck*)
+                     :sk (gossamer:pooled-copy (hx *final-sk*)) :sn 0 :s-ck (gossamer:pooled-copy (hx *final-ck*))
+                     :rk (gossamer:pooled-copy (hx *final-rk*)) :rn 0 :r-ck (gossamer:pooled-copy (hx *final-ck*))
                      :stream nil))
            (expected '((0    . "cf2b30ddf0cf3f80e7c35a6e6730b59fe802473180f396d88a8fb0db8cbcf25d2f214cf9ea1d95")
                        (1    . "72887022101f0b6753e0c7de21657d35a4cb2a1f5cde2650528bbc8f837d0f0d7ad833b1a256a1")

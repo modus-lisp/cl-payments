@@ -96,7 +96,7 @@
                      (length (u:cs-htlc-signatures (u:parse-commitment-signed payload))) 0)))
     (let* ((secret (c:octets (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element 7)))
-           (point (c:compressed-pubkey (c:pubkey-of 12345)))
+           (point (c:compressed-pubkey (c:pubkey-of (sk 12345))))
            (msg (u:encode-revoke-and-ack
                  (u:make-revoke-and-ack :channel-id (%cid) :per-commitment-secret secret
                                         :next-per-commitment-point point))))
@@ -114,8 +114,9 @@
   (u:make-channel-state :channel-id (%cid)
                         :local-balance-msat 500000
                         :remote-balance-msat 500000
-                        :seed (c:octets (make-array 32 :element-type '(unsigned-byte 8)
-                                                       :initial-element 3))))
+                        ;; OUR shachain seed: fixed memory, like every secret we own.
+                        :seed (sk (make-array 32 :element-type '(unsigned-byte 8)
+                                                 :initial-element 3))))
 
 (defun test-htlc-accounting ()
   (with-gate ("BOLT #2 — HTLC balance accounting")
@@ -198,11 +199,11 @@
       (u:received-revocation
        st (u:make-revoke-and-ack
            :channel-id (%cid)
-           :per-commitment-secret (k:generate-from-seed
-                                   (c:octets (make-array 32 :element-type '(unsigned-byte 8)
-                                                            :initial-element 1))
+           :per-commitment-secret (k:export-per-commitment-secret
+                                   (sk (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element 1))
                                    k:+max-commitment-index+)
-           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of 999))))
+           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of (sk 999)))))
       (check "the revocation clears the interlock"
              (not (u:cst-awaiting-revocation-p st)))
       (check "and another commitment may now be sent"
@@ -216,21 +217,21 @@
              :channel-id (%cid)
              :per-commitment-secret (c:octets (make-array 32 :element-type '(unsigned-byte 8)
                                                              :initial-element 1))
-             :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of 999))))))
+             :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of (sk 999)))))))
     ;; Revoked secrets are retained so an old commitment of theirs stays
     ;; punishable.
     (let ((st (%fresh-channel))
-          (seed (c:octets (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))))
+          (seed (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))))
       (u:sent-commitment st)
       (u:received-revocation
        st (u:make-revoke-and-ack
            :channel-id (%cid)
-           :per-commitment-secret (k:generate-from-seed seed k:+max-commitment-index+)
-           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of 999))))
+           :per-commitment-secret (k:export-per-commitment-secret seed k:+max-commitment-index+)
+           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of (sk 999)))))
       (check "the revoked secret is retained for punishment"
              (equalp (c:octets (k:shachain-lookup (u:cst-revocations st)
                                                   k:+max-commitment-index+))
-                     (c:octets (k:generate-from-seed seed k:+max-commitment-index+))))
+                     (c:octets (k:export-per-commitment-secret seed k:+max-commitment-index+))))
       ;; Proposed HTLCs become irrevocably committed once the peer revokes.
       (check-equal "commitment numbers advanced" (u:cst-remote-commitment-number st) 1))))
 
@@ -248,11 +249,11 @@
       (u:received-revocation
        st (u:make-revoke-and-ack
            :channel-id (%cid)
-           :per-commitment-secret (k:generate-from-seed
-                                   (c:octets (make-array 32 :element-type '(unsigned-byte 8)
-                                                            :initial-element 2))
+           :per-commitment-secret (k:export-per-commitment-secret
+                                   (sk (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element 2))
                                    k:+max-commitment-index+)
-           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of 999))))
+           :next-per-commitment-point (c:compressed-pubkey (c:pubkey-of (sk 999)))))
       ;; Only once the peer has revoked its OLD state is the HTLC irrevocably
       ;; part of the channel — before that the peer could still publish a
       ;; commitment that does not contain it.

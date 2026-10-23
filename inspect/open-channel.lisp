@@ -78,13 +78,15 @@
 ;;; that knows half of a 2-of-2 holding real funds: the moment it exits, the
 ;;; channel is unannounceable by the daemon and — worse — unspendable.  The
 ;;; struct is kept so the flow below reads unchanged.
-(defstruct our-keys funding revocation payment delayed htlc seed index)
+;; CK keeps the CHANNEL-KEYS alive: it owns the six fixed buffers the other slots
+;; point at, and a dropped one returns them to the pool for someone else's key.
+(defstruct our-keys funding revocation payment delayed htlc seed index ck)
 
 (defun derived-keys (node-privkey index)
   (let ((ck (n:derive-channel-keys node-privkey index)))
     (make-our-keys :funding (n:ck-funding ck) :revocation (n:ck-revocation ck)
                    :payment (n:ck-payment ck) :delayed (n:ck-delayed ck)
-                   :htlc (n:ck-htlc ck) :seed (n:ck-seed ck) :index index)))
+                   :htlc (n:ck-htlc ck) :seed (n:ck-seed ck) :index index :ck ck)))
 
 (defun next-key-index (dir)
   "One past the highest index any recorded channel uses.  Reusing an index would
@@ -134,13 +136,11 @@
     ;; never reconnect to a channel it opened.
     (let* ((our-node-key
             (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
+              ;; IMPORTED into fixed memory (the decoded copy is wiped).
               (if dir
-                  (secp:bytes-to-int
-                   (c:hex->bytes
-                    (string-trim '(#\Newline #\Space)
-                                 (uiop:read-file-string
-                                  (merge-pathnames "node.key"
-                                                   (uiop:ensure-directory-pathname dir))))))
+                  (c:privkey-from-hex
+                   (uiop:read-file-string
+                    (merge-pathnames "node.key" (uiop:ensure-directory-pathname dir))))
                   (c:generate-key))))
            (key-index (let ((dir (uiop:getenv "CL_PAYMENTS_NODE")))
                         (if dir (next-key-index dir) 0)))

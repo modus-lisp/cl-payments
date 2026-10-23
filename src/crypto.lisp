@@ -20,7 +20,7 @@
   (:use #:cl)
   (:nicknames #:ln-crypto)
   (:local-nicknames (#:secp #:secp256k1-fast) (#:schnorr #:secp256k1-fast.schnorr)
-                    (#:ic #:ironclad))
+                    (#:ecdh #:secp256k1-fast.ecdh) (#:ic #:ironclad))
   (:export
    ;; byte helpers
    #:bytes #:octets #:ascii->bytes #:bytes->hex #:hex->bytes #:zeros #:ct-equal
@@ -31,7 +31,10 @@
    #:encrypt-with-ad #:decrypt-with-ad #:aead-auth-error
    ;; keys / ECDH
    #:compressed-pubkey #:parse-pubkey #:pubkey-of #:generate-key #:valid-privkey-p
-   #:ecdh #:with-ec-scratch))
+   #:ecdh #:ecdh-into #:with-ec-scratch
+   ;; secrets in fixed memory
+   #:+empty+ #:hkdf-2-into #:privkey-from-bytes #:privkey-from-hex #:privkey-hex
+   #:import-privkey #:export-privkey #:free-key #:copy-key))
 
 (in-package #:cl-payments.crypto)
 
@@ -89,9 +92,25 @@
     (subseq out 0 length)))
 
 (defun hkdf-2 (salt ikm)
-  "BOLT #8's HKDF: 64 bytes split into two 32-byte halves, returned as values."
+  "BOLT #8's HKDF: 64 bytes split into two 32-byte halves, returned as values.
+   Heap output: for PUBLIC inputs only (the RFC 5869 vectors).  Anything keyed
+   by a chaining key goes through HKDF-2-INTO."
   (let ((o (hkdf salt ikm)))
     (values (subseq o 0 32) (subseq o 32 64))))
+
+(defparameter +empty+ (make-array 0 :element-type '(unsigned-byte 8)))
+
+(defun hkdf-2-into (salt ikm out1 out2)
+  "BOLT #8's HKDF over SECRET material: HKDF-SHA256(SALT, IKM, info = \"\") -> 64
+   bytes, the first half into OUT1 and the second into OUT2 (both fixed 32-byte
+   buffers).  The PRK and the 64-byte OKM live only in fixed scratch, and OUT1 may
+   be SALT (the chaining key ratchets in place): the PRK is computed before
+   anything is written."
+  (gossamer:with-fixed-scratch ((okm :octets 64))
+    (natrium:hkdf-into :sha256 (octets salt) (octets ikm) +empty+ okm)
+    (replace out1 okm :end2 32)
+    (replace out2 okm :start2 32))
+  (values out1 out2))
 
 ;;; ----------------------------------------------------------------------------
 ;;; ChaCha20-Poly1305 AEAD (RFC 8439)
@@ -177,6 +196,15 @@
 ;;; secp256k1 keys and ECDH
 ;;;
 ;;; Points are secp256k1-fast's representation: a (x . y) cons of integers.
+;;;
+;;; PRIVATE KEYS ARE FIXED 32-BYTE BUFFERS, never integers and never ordinary heap
+;;; vectors (see the FIXED library): secp256k1-fast refuses anything else at every
+;;; entry point that takes one.  A key that is made here (GENERATE-KEY,
+;;; PRIVKEY-FROM-BYTES, ...) comes from the fixed pool and goes back with FREE-KEY;
+;;; an object that holds one ties it to itself with FIXED:OWN.  The only places a
+;;; key becomes heap bytes are the deliberate exports (PRIVKEY-HEX, for the state
+;;; file), and the only places heap bytes become a key are the imports, which wipe
+;;; the heap copy they were handed.
 ;;; ----------------------------------------------------------------------------
 
 (defun compressed-pubkey (point)
@@ -203,17 +231,72 @@
           (cons x (- secp:*secp256k1-p* (cdr even-pt)))))))
 
 (defun valid-privkey-p (k)
-  (and (integerp k) (< 0 k secp:*secp256k1-n*)))
+  "True iff K is a private key we can use: a FIXED 32-byte buffer holding a scalar
+   in [1, n).  An integer or a heap vector is not one, whatever its value."
+  (and (typep k '(simple-array (unsigned-byte 8) (32)))
+       (gossamer:fixed-p k)
+       (secp:seckey-valid-p k)))
 
 (defun pubkey-of (privkey)
-  "The point for a private-key integer."
+  "The point for PRIVKEY, a fixed 32-byte private key (constant-time k*G)."
   (secp:secp-pubkey privkey))
 
+(defun free-key (k)
+  "Wipe a pooled key buffer and return it to the pool.  NIL is ignored."
+  (gossamer:free k))
+
+(defun copy-key (k)
+  "A pooled fixed copy of key buffer K (the caller frees it)."
+  (gossamer:pooled-copy (gossamer:check-fixed k "private key")))
+
+(defun privkey-from-bytes (b &key (start 0) wipe)
+  "Bring 32 bytes of key material B[START,+32) into a pooled fixed buffer and
+   validate it.  When WIPE, B itself is zeroed afterwards — the form for a key that
+   arrived on the heap (a file, a test vector) and should not stay there.  Signals
+   on 0 or >= n, after freeing the buffer."
+  (let ((k (gossamer:pooled-copy b :start start :end (+ start 32))))
+    (when wipe (fill b 0 :start start :end (+ start 32)))
+    (unless (secp:seckey-valid-p k)
+      (gossamer:free k)
+      (error "invalid secp256k1 private key"))
+    k))
+
+(defun privkey-from-hex (hex)
+  "IMPORT: a hex-encoded private key (from the state file) into a pooled fixed
+   buffer.  The decoded heap copy is wiped before returning."
+  (let ((b (hex->bytes (string-trim '(#\Newline #\Space #\Return #\Tab) hex))))
+    (unwind-protect
+         (progn (unless (= (length b) 32) (error "private key must be 32 bytes, got ~d" (length b)))
+                (privkey-from-bytes b))
+      (fill b 0))))
+
+(defun privkey-hex (k)
+  "EXPORT: K as a hex string, for the state file.  This is the one place a private
+   key leaves fixed memory on purpose; the intermediate byte copy is wiped."
+  (let ((b (copy-seq (octets (gossamer:check-fixed k "private key")))))
+    (unwind-protect (bytes->hex b) (fill b 0))))
+
+(defun import-privkey (x)
+  "IMPORT a persisted key: a hex string (the current format), or — for state files
+   written before keys lived in fixed memory — an integer.  Returns a pooled fixed
+   buffer.  The integer form cannot be wiped (a bignum is immutable); it is read
+   only for compatibility, and the next save writes hex."
+  (etypecase x
+    (string (privkey-from-hex x))
+    (integer (let ((b (secp:int-to-bytes32 x)))
+               (unwind-protect (privkey-from-bytes b) (fill b 0))))))
+
+(defun export-privkey (k) (and k (privkey-hex k)))
+
 (defun generate-key ()
-  "A fresh private key as an integer in [1, n).  Returns (values privkey point)."
-  (loop for k = (secp:bytes-to-int (ic:random-data 32))
-        when (valid-privkey-p k)
-          return (values k (pubkey-of k))))
+  "A fresh private key, generated by natrium's CSPRNG straight into a pooled fixed
+   buffer (rejection-sampled until it is in [1, n)).  Returns (values privkey
+   point); FREE-KEY the key when done with it."
+  (let ((k (gossamer:acquire :octets 32)))
+    (handler-bind ((error (lambda (e) (declare (ignore e)) (gossamer:free k))))
+      (loop (natrium:random-bytes-into k)
+            (when (secp:seckey-valid-p k) (return))))
+    (values k (pubkey-of k))))
 
 (defmacro with-ec-scratch (&body body)
   "Bind secp256k1-fast's scalar-multiplication scratch space for this thread.
@@ -246,7 +329,19 @@
            `(,fs ,@body))
           (t `(progn ,@body)))))
 
+(defun ecdh-into (point privkey out &key (start 0))
+  "BOLT #8 ECDH: SHA-256 of the *compressed* shared point, written into OUT at
+   START (OUT fixed: it is a shared secret).  The hash is part of the definition —
+   the raw x-coordinate is not what Lightning mixes in.  PRIVKEY is a fixed key;
+   the multiplication is secp256k1-fast's constant-time ladder, and the shared
+   point exists only in fixed scratch."
+  (gossamer:with-fixed-scratch ((pt :octets 33))
+    (ecdh:ecdh-compressed-into privkey point pt)
+    (natrium:sha256-into pt out :start start))
+  out)
+
 (defun ecdh (point privkey)
-  "BOLT #8 ECDH: SHA-256 of the *compressed* shared point.  The hash is part of
-   the definition — the raw x-coordinate is not what Lightning mixes in."
-  (sha256 (compressed-pubkey (secp:secp-mul-point privkey point))))
+  "ECDH-INTO a fresh POOLED 32-byte buffer; the caller frees it (FREE-KEY)."
+  (let ((out (gossamer:acquire :octets 32)))
+    (handler-bind ((error (lambda (e) (declare (ignore e)) (gossamer:free out))))
+      (ecdh-into point privkey out))))

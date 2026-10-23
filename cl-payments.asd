@@ -14,8 +14,11 @@
   ;; built is spendable.  It brings a UTXO store and an HTTP server along with
   ;; it, which is more than this needs, but a second serializer would be a second
   ;; thing to be subtly wrong.
-  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-transport"
-               "cl-consensus")
+  ;; FIXED + NATRIUM: every private key and secret scalar we own lives in fixed
+  ;; memory (never a Lisp integer, never an ordinary heap vector) and is hashed
+  ;; with natrium's streaming SHA-256 / HMAC / HKDF into fixed outputs.
+  :depends-on ("natrium" "secp256k1-fast" "ironclad" "bordeaux-threads"
+               "cl-transport" "cl-consensus")
   :serial t
   :components
   ((:module "src"

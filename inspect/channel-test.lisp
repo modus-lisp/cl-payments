@@ -12,7 +12,7 @@
 
 (in-package #:cl-payments.test)
 
-(defun %point (n) (c:compressed-pubkey (c:pubkey-of n)))
+(defun %point (n) (c:compressed-pubkey (c:pubkey-of (sk n))))
 
 (defun sample-open-channel ()
   (ch:make-open-channel

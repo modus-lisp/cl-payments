@@ -374,7 +374,7 @@
                 :delayed-pubkey (hx *c-delayed-pubkey*)
                 :remote-pubkey (hx *c-remote-payment-basepoint*) :opener :local))
            (sig (m:sign-commitment tx
-                                   (secp256k1-fast:bytes-to-int (hx *c-local-funding-privkey*))
+                                   (sk *c-local-funding-privkey*)
                                    (hx *c-local-funding-pubkey*) (hx *c-remote-funding-pubkey*)
                                    10000000)))
       ;; Reproducing the spec's signature exercises BIP143 (with the funding
@@ -475,8 +475,7 @@
              ;; From local_htlc_basepoint_secret via the per-commitment point;
              ;; the spec lists the derived key directly.
              (k:derive-privkey
-              (secp256k1-fast:bytes-to-int
-               (hx "1111111111111111111111111111111111111111111111111111111111111111"))
+              (sk "1111111111111111111111111111111111111111111111111111111111111111")
               (hx "025f7117a78150fe2ef97db7cfc83bd57b2e2c0d0dd25eaf467a4a1c2a45ce1486")))
            (witness-script
              (m:received-htlc-script (hx *c-revocation-pubkey*) (hx *c-remote-htlc-pubkey*)

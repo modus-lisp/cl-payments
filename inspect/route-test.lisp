@@ -8,7 +8,7 @@
 
 (in-package #:cl-payments.test)
 
-(defun rt-node (n) (c:compressed-pubkey (c:pubkey-of (secp:bytes-to-int (c:sha256 (c:ascii->bytes (format nil "route/~a" n)))))))
+(defun rt-node (n) (c:compressed-pubkey (c:pubkey-of (sk (c:sha256 (c:ascii->bytes (format nil "route/~a" n)))))))
 
 (defun rt-edge (from to scid &rest policy-args)
   (rt:make-edge :from (rt-node from) :to (rt-node to) :scid (gs:make-scid scid 1 0)
