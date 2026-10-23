@@ -10,3 +10,6 @@
 [submodule "deps/pagetree"]
 	path = deps/pagetree
 	url = https://github.com/modus-lisp/pagetree.git
+[submodule "deps/natrium"]
+	path = deps/natrium
+	url = https://github.com/modus-lisp/natrium.git
