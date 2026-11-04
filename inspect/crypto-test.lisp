@@ -2,7 +2,7 @@
 ;;;;
 ;;;; Gate 1 — the primitives, against the RFCs that define them.
 ;;;;
-;;;; ironclad supplies ChaCha20 and Poly1305 separately but not the AEAD that
+;;;; natrium supplies ChaCha20 and Poly1305; src/crypto.lisp spells out the AEAD that
 ;;;; combines them, so src/crypto.lisp assembles RFC 8439 §2.8 by hand.  That
 ;;;; construction is easy to get subtly wrong (the one-time key comes from block
 ;;;; 0 while the payload starts at block 1; the MAC covers padded lengths), and a
@@ -59,15 +59,14 @@
                 #()
                 (c:ascii->bytes "Cryptographic Forum Research Group"))))
       ;; %POLY1305-TAG appends the RFC 8439 AEAD length trailer, so it is not the
-      ;; bare MAC of the message — compare against ironclad's raw MAC instead,
+      ;; bare MAC of the message — compare against natrium's raw MAC instead,
       ;; and check the bare primitive separately.
       (declare (ignorable tag)))
-    (let ((m (ironclad:make-mac
-              :poly1305
-              (hx "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"))))
-      (ironclad:update-mac m (c:ascii->bytes "Cryptographic Forum Research Group"))
-      (check-bytes "§2.5.2 tag" (ironclad:produce-mac m)
-                   (hx "a8061dc1305136c6c22b8baf0c0127a9")))))
+    (check-bytes "§2.5.2 tag"
+                 (natrium:poly1305-mac
+                  (hx "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+                  (c:ascii->bytes "Cryptographic Forum Research Group"))
+                 (hx "a8061dc1305136c6c22b8baf0c0127a9"))))
 
 (defun test-chacha20 ()
   ;; RFC 8439 §2.4.2 — the keystream itself, before any AEAD framing.

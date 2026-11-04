@@ -127,7 +127,7 @@
          (host (subseq uri (1+ at) colon))
          (port (parse-integer (subseq uri (1+ colon))))
          (funding-sat 200000)
-         (temp-id (c:octets (ironclad:random-data 32)))
+         (temp-id (c:octets (natrium:random-bytes 32)))
          (inbox (make-hash-table))
          (lock (bt:make-lock)) (cv (bt:make-condition-variable)))
     ;; A PERSISTENT node key, from CL_PAYMENTS_NODE's directory.  Generating one

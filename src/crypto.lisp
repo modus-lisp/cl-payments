@@ -6,11 +6,10 @@
 ;;;; to ratchet a chaining key, ChaCha20-Poly1305 (RFC 8439) as the AEAD, ECDH
 ;;;; over secp256k1, and a nonce discipline.  Curve arithmetic comes from
 ;;;; secp256k1-fast (the same crypto cl-consensus validates against Bitcoin Core);
-;;;; ChaCha20 and Poly1305 come from ironclad as *separate* primitives — ironclad
-;;;; ships the stream cipher and the MAC but no packaged ChaCha20-Poly1305 AEAD,
-;;;; so the RFC 8439 construction (one-time key from block 0, payload from block 1,
-;;;; padded MAC input) is assembled here and checked against the RFC's own vectors
-;;;; in inspect/crypto-test.lisp.
+;;;; ChaCha20, Poly1305, SHA-256, HMAC and HKDF come from natrium.  The RFC 8439
+;;;; construction (one-time key from block 0, payload from block 1, padded MAC
+;;;; input) is spelled out here so the BOLT #8 code reads against the RFC, and is
+;;;; checked against the RFC's own vectors in inspect/crypto-test.lisp.
 ;;;;
 ;;;; Nothing in this file knows about Lightning messages or sockets.
 ;;;;
@@ -20,7 +19,7 @@
   (:use #:cl)
   (:nicknames #:ln-crypto)
   (:local-nicknames (#:secp #:secp256k1-fast) (#:schnorr #:secp256k1-fast.schnorr)
-                    (#:ecdh #:secp256k1-fast.ecdh) (#:ic #:ironclad))
+                    (#:ecdh #:secp256k1-fast.ecdh))
   (:export
    ;; byte helpers
    #:bytes #:octets #:ascii->bytes #:bytes->hex #:hex->bytes #:zeros #:ct-equal
@@ -45,7 +44,7 @@
 (deftype u8v () '(vector (unsigned-byte 8)))
 
 (defun octets (x)
-  "Coerce X to a simple (unsigned-byte 8) vector — ironclad wants one."
+  "Coerce X to a simple (unsigned-byte 8) vector — natrium wants one."
   (coerce x '(simple-array (unsigned-byte 8) (*))))
 
 (defun bytes (&rest seqs)
@@ -57,8 +56,20 @@
 (defun ascii->bytes (s)
   (octets (map 'vector #'char-code s)))
 
-(defun bytes->hex (b) (string-downcase (ic:byte-array-to-hex-string (octets b))))
-(defun hex->bytes (s) (ic:hex-string-to-byte-array s))
+(defun bytes->hex (b)
+  "Lower-case hex of the byte sequence B."
+  (let ((out (make-string (* 2 (length b)))) (digits "0123456789abcdef"))
+    (dotimes (i (length b) out)
+      (let ((x (elt b i)))
+        (setf (char out (* 2 i)) (char digits (ash x -4))
+              (char out (1+ (* 2 i))) (char digits (logand x 15)))))))
+
+(defun hex->bytes (s)
+  "The byte vector a hex string spells.  Signals on odd length or a non-hex digit."
+  (when (oddp (length s)) (error "hex->bytes: odd-length hex string ~s" s))
+  (let ((out (zeros (floor (length s) 2))))
+    (dotimes (i (length out) out)
+      (setf (aref out i) (parse-integer s :start (* 2 i) :end (+ 2 (* 2 i)) :radix 16)))))
 
 (defun ct-equal (a b)
   "Constant-time byte-vector comparison — used for AEAD tags, where an early
@@ -73,12 +84,10 @@
 ;;; Hashing + HKDF (RFC 5869)
 ;;; ----------------------------------------------------------------------------
 
-(defun sha256 (b) (ic:digest-sequence :sha256 (octets b)))
+(defun sha256 (b) (natrium:sha256 (octets b)))
 
 (defun hmac-sha256 (key data)
-  (let ((h (ic:make-hmac (octets key) :sha256)))
-    (ic:update-hmac h (octets data))
-    (ic:hmac-digest h)))
+  (natrium:hmac-sha256 (octets key) (octets data)))
 
 (defun hkdf (salt ikm &key (info #()) (length 64))
   "RFC 5869 HKDF-SHA256: extract-then-expand.  BOLT #8 always calls this with a
@@ -115,11 +124,8 @@
 ;;; ----------------------------------------------------------------------------
 ;;; ChaCha20-Poly1305 AEAD (RFC 8439)
 ;;;
-;;; ironclad's :chacha with a 12-byte IV is RFC 8439 ChaCha20 starting at block
-;;; counter 0.  RFC 8439 wants the Poly1305 one-time key from block 0 and the
-;;; payload keystream from block 1 onward — so encrypting a buffer of 64 zero
-;;; bytes followed by the plaintext yields both from a single cipher instance:
-;;; bytes 0..31 are the one-time key, bytes 64.. are the ciphertext.
+;;; RFC 8439 takes the Poly1305 one-time key from keystream block 0 and the
+;;; payload keystream from block 1 onward.
 ;;; ----------------------------------------------------------------------------
 
 (define-condition aead-auth-error (error) ()
@@ -137,25 +143,16 @@
 (defun %chacha20 (key nonce payload)
   "Return (values one-time-poly1305-key, PAYLOAD xor'd with the block-1 keystream).
    XOR is its own inverse, so this serves both encryption and decryption."
-  (let* ((n (length payload))
-         (buf (zeros (+ 64 n)))
-         (c (ic:make-cipher :chacha :key (octets key)
-                                    :initialization-vector (octets nonce)
-                                    :mode :stream)))
-    (replace buf payload :start1 64)
-    (ic:encrypt-in-place c buf)
-    (values (subseq buf 0 32) (subseq buf 64))))
+  (let ((key (octets key)) (nonce (octets nonce)))
+    (values (natrium:poly1305-key-gen key nonce)
+            (natrium:chacha20 key nonce (octets payload) :counter 1))))
 
 (defun %poly1305-tag (otk ad ct)
   "RFC 8439 §2.8: MAC over AAD ‖ pad16 ‖ ciphertext ‖ pad16 ‖ len(AAD) ‖ len(CT)."
-  (let ((m (ic:make-mac :poly1305 (octets otk))))
-    (ic:update-mac m (octets ad))
-    (ic:update-mac m (zeros (%pad16 (length ad))))
-    (ic:update-mac m (octets ct))
-    (ic:update-mac m (zeros (%pad16 (length ct))))
-    (ic:update-mac m (%u64le (length ad)))
-    (ic:update-mac m (%u64le (length ct)))
-    (ic:produce-mac m)))
+  (natrium:poly1305-mac (octets otk)
+                        (bytes ad (zeros (%pad16 (length ad)))
+                               ct (zeros (%pad16 (length ct)))
+                               (%u64le (length ad)) (%u64le (length ct)))))
 
 (defun aead-encrypt (key nonce ad plaintext)
   "RFC 8439 AEAD_CHACHA20_POLY1305 — returns ciphertext ‖ 16-byte tag."

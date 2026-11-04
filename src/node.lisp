@@ -1631,7 +1631,7 @@
                    (error 'node-error :detail "peer is not connected")))
          (index (next-key-index node))
          (keys (derive-channel-keys (node-privkey node) index))
-         (temp-id (c:octets (ironclad:random-data 32))))
+         (temp-id (c:octets (natrium:random-bytes 32))))
     (bt:with-recursive-lock-held ((node-htlc-lock node))
       (setf (gethash (%hex temp-id) (node-pending node))
             (make-pending-open :temporary-channel-id temp-id :keys keys :role :opener
@@ -2227,9 +2227,9 @@
 
 (defun mint-invoice (node &key amount-msat description (expiry 3600))
   "Create and record an invoice.  Returns (values bolt11 payment-hash)."
-  (let* ((preimage (c:octets (ironclad:random-data 32)))
+  (let* ((preimage (c:octets (natrium:random-bytes 32)))
          (hash (c:sha256 preimage))
-         (secret (c:octets (ironclad:random-data 32)))
+         (secret (c:octets (natrium:random-bytes 32)))
          (inv (inv:sign-invoice
                (inv::make-invoice-for :network (w:net-name w:*network*) :amount-msat amount-msat
                                       :payment-hash hash :payment-secret secret

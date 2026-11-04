@@ -17,7 +17,7 @@
   ;; FIXED + NATRIUM: every private key and secret scalar we own lives in fixed
   ;; memory (never a Lisp integer, never an ordinary heap vector) and is hashed
   ;; with natrium's streaming SHA-256 / HMAC / HKDF into fixed outputs.
-  :depends-on ("natrium" "secp256k1-fast" "ironclad" "bordeaux-threads"
+  :depends-on ("natrium" "secp256k1-fast" "bordeaux-threads"
                "cl-transport" "cl-consensus")
   :serial t
   :components

@@ -34,8 +34,7 @@
   (:use #:cl)
   (:local-nicknames (#:c #:cl-payments.crypto) (#:w #:cl-payments.wire)
                     (#:gs #:cl-payments.gossip) (#:secp #:secp256k1-fast)
-                    (#:ecdh #:secp256k1-fast.ecdh)
-                    (#:ic #:ironclad))
+                    (#:ecdh #:secp256k1-fast.ecdh))
   (:nicknames #:ln-onion)
   (:export
    #:+packet-size+ #:+payload-area+ #:+hmac-size+
@@ -90,11 +89,7 @@
 (defun cipher-stream (key length)
   "LENGTH bytes of ChaCha20 keystream under KEY with a 96-bit zero nonce.  The
    fixed nonce is safe because no key is ever used twice."
-  (let ((buf (make-array length :element-type '(unsigned-byte 8) :initial-element 0))
-        (cipher (ic:make-cipher :chacha :key (c:octets key)
-                                        :initialization-vector (c:zeros 12) :mode :stream)))
-    (ic:encrypt-in-place cipher buf)
-    buf))
+  (natrium:chacha20 (c:octets key) (c:zeros 12) (c:zeros length) :counter 0))
 
 (defun %stream (type secret length)
   "The keystream of SECRET's TYPE key, the key itself held only in fixed scratch."

@@ -243,7 +243,7 @@
   expiry             ; cltv_expiry
   payment-hash)      ; 32 bytes
 
-(defun %ripemd160 (bytes) (ironclad:digest-sequence :ripemd-160 (c:octets bytes)))
+(defun %ripemd160 (bytes) (natrium:ripemd160 (c:octets bytes)))
 
 (defun offered-htlc-script (revocation-pubkey remote-htlc-pubkey local-htlc-pubkey
                             payment-hash &key anchors)
