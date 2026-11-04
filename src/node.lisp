@@ -1602,10 +1602,17 @@
                    ((= b 10) (return (sb-ext:octets-to-string buf :external-format :utf-8)))
                    (t (vector-push-extend b buf))))))
 
+(defun %expose (handler &key backend host port)
+  "TR:EXPOSE, or on modus the net layer's listener (src/modus-net.lisp): there
+   HANDLER runs on the owner thread, as the node pumps."
+  #+modus (declare (ignore backend))
+  #+modus (cl-payments.modus-net:expose handler :host host :port port)
+  #-modus (tr:expose handler :backend backend :host host :port port))
+
 (defun start-control-server (node port)
   (setf (node-control-port node) port
         (node-control-closer node)
-        (tr:expose (lambda (stream peer-plist)
+        (%expose (lambda (stream peer-plist)
                      (declare (ignore peer-plist))
                      ;; The listener hands us a byte stream (it is the same one
                      ;; the Noise transport uses), so lines are assembled by hand.
@@ -1618,7 +1625,10 @@
                                                     "(:status :error :message \"unreadable\")")))
                                     (write-sequence (sb-ext:string-to-octets (format nil "~a~%" reply) :external-format :utf-8) stream)
                                     (finish-output stream)))
-                       (error () nil)))
+                       (error () nil))
+                     ;; tr:expose closes the stream when this returns; modus's
+                     ;; listener leaves that to the handler (a peer outlives it).
+                     #+modus (ignore-errors (close stream)))
                    :backend :tcp :host "127.0.0.1" :port port))
   (nlog node "control socket on 127.0.0.1:~d" port))
 
@@ -2510,26 +2520,38 @@
     (remhash (%hex (p:peer-node-id peer)) (node-peers node))))
 
 (defun on-inbound (node stream closer)
-  "Handle one inbound connection, IN THIS THREAD for its whole life.
+  "Handle one inbound connection.
 
-   Returning here would let SBCL tear the socket down — see the file header.  So
-   this blocks in RUN-READ-LOOP until the peer goes away."
-  (handler-case
-      (let ((peer (p:accept stream (node-privkey node) :closer closer
-                            :features (node-features node)
-                            :chain-hashes (list (w:chain-hash))
-                            :log nil :read-loop nil)))
-        (install-handlers node peer)
-        (register-peer node peer)
-        (nlog node "inbound peer ~a (~d channel~:p with them)"
-              (subseq (%hex (p:peer-node-id peer)) 0 16)
-              (length (channels-with node (p:peer-node-id peer))))
-        (readvertise node peer)
-        (request-gossip node peer)
-        (unwind-protect (p:run-read-loop peer)
-          (unregister-peer node peer)
-          (nlog node "peer ~a disconnected" (subseq (%hex (p:peer-node-id peer)) 0 16))))
-    (error (e) (nlog node "inbound connection failed: ~a" e))))
+   On SBCL, IN THIS THREAD for its whole life: returning here would let SBCL tear
+   the socket down -- see the file header -- so this blocks in RUN-READ-LOOP
+   until the peer goes away.  On modus this thread is the whole node, so it
+   returns at once: the handshake runs as bytes arrive (P:ACCEPT-ASYNC) and the
+   peer is read events-first, cleaned up when it goes."
+  (flet ((ready (peer)
+           (install-handlers node peer)
+           (register-peer node peer)
+           (nlog node "inbound peer ~a (~d channel~:p with them)"
+                 (subseq (%hex (p:peer-node-id peer)) 0 16)
+                 (length (channels-with node (p:peer-node-id peer))))
+           (readvertise node peer)
+           (request-gossip node peer)
+           (flet ((gone ()
+                    (unregister-peer node peer)
+                    (nlog node "peer ~a disconnected" (subseq (%hex (p:peer-node-id peer)) 0 16))))
+             #+modus (p:start-read-loop peer :on-close #'gone)
+             #-modus (unwind-protect (p:run-read-loop peer) (gone)))))
+    #+modus
+    (p:accept-async stream (node-privkey node) #'ready
+                    :closer closer :features (node-features node)
+                    :chain-hashes (list (w:chain-hash)) :log nil
+                    :on-error (lambda (e) (nlog node "inbound connection failed: ~a" e)))
+    #-modus
+    (handler-case
+        (ready (p:accept stream (node-privkey node) :closer closer
+                         :features (node-features node)
+                         :chain-hashes (list (w:chain-hash))
+                         :log nil :read-loop nil))
+      (error (e) (nlog node "inbound connection failed: ~a" e)))))
 
 (defun connect-to (node uri &key (keep-alive t))
   "Dial a peer.  With KEEP-ALIVE the calling thread becomes the connection's
@@ -2549,6 +2571,12 @@
       (nlog node "connected to ~a" (subseq (%hex node-id) 0 16))
       (readvertise node peer)
       (request-gossip node peer)
+      ;; On modus there is no connection-owning thread to keep alive: read
+      ;; events-first either way, unregistering when the peer goes.
+      #+modus (progn keep-alive
+                     (p:start-read-loop peer :on-close (lambda () (unregister-peer node peer)))
+                     peer)
+      #-modus
       (if keep-alive
           (unwind-protect (p:run-read-loop peer)
             (unregister-peer node peer))
@@ -2569,7 +2597,7 @@
   (load-utxos node)
   (load-state node)
   (setf (node-listener-closer node)
-        (tr:expose (lambda (stream peer-plist)
+        (%expose (lambda (stream peer-plist)
                      (declare (ignore peer-plist))
                      (on-inbound node stream nil))
                    :backend :tcp :host "127.0.0.1" :port (node-port node)))

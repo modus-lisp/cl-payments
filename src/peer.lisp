@@ -25,7 +25,7 @@
   (:export
    #:peer #:peer-p #:peer-node-id #:peer-session #:peer-features
    #:peer-alive-p #:peer-connected-at #:peer-their-init #:peer-log #:peer-last-error
-   #:connect #:accept #:disconnect #:send-message #:on
+   #:connect #:accept #+modus #:accept-async #:disconnect #:send-message #:on
    #:start-read-loop #:run-read-loop
    #:ping #:send-warning #:send-error #:pong-required-p #:+max-pong-bytes+
    #:+msg-init+ #:+msg-error+ #:+msg-warning+ #:+msg-ping+ #:+msg-pong+
@@ -273,27 +273,64 @@
   ;; connect-time read timeout kills the loop on the first quiet gap and it looks
   ;; like the peer dropped us.
   (tp:noise-clear-timeout (peer-session p))
+  #+modus
+  (when (%modus-stream-p p)
+    ;; No thread to block: read events-first, then wait here, pumping, until the
+    ;; peer is gone -- for callers (tests) that want RUN-READ-LOOP's blocking shape.
+    (start-read-loop p)
+    (loop while (peer-alive-p p) do (cl-consensus.netloop:pause-for 0.25))
+    (return-from run-read-loop nil))
   (unwind-protect
-       (loop while (peer-alive-p p) do
-         (multiple-value-bind (type payload)
-             (w:decode-message (tp:noise-recv (peer-session p)))
-           (cond
-             ((= type +msg-ping+) (handle-ping p payload) (dispatch p type payload))
-             ((= type +msg-pong+) (dispatch p type payload))
-             ((= type +msg-warning+)
-              (peer-log p "warning: ~a" (decode-error payload))
-              (dispatch p type payload))
-             ((= type +msg-error+)
-              (peer-log p "error: ~a" (decode-error payload))
-              (dispatch p type payload)
-              ;; An `error` with an all-zero channel_id ends the connection.
-              (let ((chan (ignore-errors (w:r-bytes (w:make-reader payload) 32))))
-                (when (and chan (every #'zerop chan))
-                  (setf (peer-alive-p p) nil))))
-             (t (dispatch p type payload)))))
+       (loop while (peer-alive-p p) do (%handle-one-message p))
     (setf (peer-alive-p p) nil)))
 
-(defun start-read-loop (p)
+(defun %handle-one-message (p)
+  "Read one message from P and act on it: ping, error and warning here, the
+   rest to the registered handlers."
+  (multiple-value-bind (type payload)
+      (w:decode-message (tp:noise-recv (peer-session p)))
+    (cond
+      ((= type +msg-ping+) (handle-ping p payload) (dispatch p type payload))
+      ((= type +msg-pong+) (dispatch p type payload))
+      ((= type +msg-warning+)
+       (peer-log p "warning: ~a" (decode-error payload))
+       (dispatch p type payload))
+      ((= type +msg-error+)
+       (peer-log p "error: ~a" (decode-error payload))
+       (dispatch p type payload)
+       ;; An `error` with an all-zero channel_id ends the connection.
+       (let ((chan (ignore-errors (w:r-bytes (w:make-reader payload) 32))))
+         (when (and chan (every #'zerop chan))
+           (setf (peer-alive-p p) nil))))
+      (t (dispatch p type payload)))))
+
+#+modus
+(defun %modus-stream-p (p)
+  (cl-payments.modus-net:conn-stream-p (tp:noise-stream (peer-session p))))
+
+#+modus
+(defun %modus-drain (p on-close)
+  "P's connection has input: handle every message whose length header is in.
+   (A body still in flight is waited for, pumping.)  When the connection has
+   closed and nothing is left, P is dead and ON-CLOSE runs, once."
+  (let ((c (cl-payments.modus-net:stream-conn (tp:noise-stream (peer-session p)))))
+    (handler-case
+        (loop while (and (peer-alive-p p)
+                         (>= (cl-consensus.netloop:conn-available c) 18))   ; the encrypted length
+              do (%handle-one-message p))
+      (error (e)
+        (setf (peer-last-error p) e)
+        (peer-log p "read loop ended: ~a" e)
+        (setf (peer-alive-p p) nil)))
+    (when (or (not (peer-alive-p p))
+              (and (cl-consensus.netloop:netconn-eof c)
+                   (< (cl-consensus.netloop:conn-available c) 18)))
+      (when (peer-alive-p p) (setf (peer-alive-p p) nil))
+      (setf (cl-consensus.netloop:netconn-on-data c) nil)
+      (cl-consensus.netloop:net-close c)
+      (when on-close (funcall on-close)))))
+
+(defun start-read-loop (p &key on-close)
   "Run the read loop on its own thread, as cl-consensus's peer layer does, so a
    caller can drive the connection without owning it.
 
@@ -301,6 +338,15 @@
    torn down when that thread exits, so spawning the loop from an ephemeral
    worker gives you a connection that dies for no visible reason."
   (tp:noise-clear-timeout (peer-session p))
+  #+modus
+  (when (%modus-stream-p p)
+    ;; No read thread: the connection's ON-DATA handles messages as they arrive,
+    ;; on the owner thread, and ON-CLOSE runs when the peer goes away.
+    (let ((c (cl-payments.modus-net:stream-conn (tp:noise-stream (peer-session p)))))
+      (setf (cl-consensus.netloop:netconn-on-data c)
+            (lambda (c) (declare (ignore c)) (c:with-ec-scratch (%modus-drain p on-close))))
+      (c:with-ec-scratch (%modus-drain p on-close)))
+    (return-from start-read-loop p))
   (setf (peer-thread p)
         (bt:make-thread (lambda ()
                           ;; Each peer thread needs its OWN EC scratch: gossip
@@ -356,6 +402,22 @@
     (let ((p (%wrap session :features features :chain-hashes chain-hashes :log log)))
       (when read-loop (start-read-loop p))
       p)))
+
+#+modus
+(defun accept-async (stream local-privkey on-peer
+                     &key closer (features f:*default-features*) chain-hashes
+                          (log *standard-output*) on-error)
+  "ACCEPT for modus, driven by input: the handshake runs as bytes arrive (see
+   TP:ACCEPT-PEER-ASYNC), then `init' is exchanged and ON-PEER gets the peer,
+   which has no read loop yet -- the caller starts one (START-READ-LOOP)."
+  (tp:accept-peer-async stream local-privkey
+                        (lambda (session)
+                          (handler-case
+                              (funcall on-peer (%wrap session :features features
+                                                              :chain-hashes chain-hashes :log log))
+                            (error (e) (ignore-errors (tp:noise-close session))
+                              (when on-error (funcall on-error e)))))
+                        :closer closer :on-error on-error))
 
 (defun disconnect (p &optional reason)
   (when (and reason (peer-alive-p p))

@@ -18,13 +18,15 @@
   ;; memory (never a Lisp integer, never an ordinary heap vector) and is hashed
   ;; with natrium's streaming SHA-256 / HMAC / HKDF into fixed outputs.
   :depends-on ("natrium" "secp256k1-fast" "bordeaux-threads"
-               "cl-transport" "cl-consensus")
+               "cl-transport" "cl-consensus"
+               (:feature :modus "trivial-gray-streams"))   ; modus-net.lisp's stream
   :serial t
   :components
   ((:module "src"
     :serial t
     :components
-    ((:file "crypto")      ; BOLT #8 primitives: HKDF, ChaCha20-Poly1305, ECDH
+    ((:file "modus-net")   ; modus only: sockets on cl-consensus's net layer
+     (:file "crypto")      ; BOLT #8 primitives: HKDF, ChaCha20-Poly1305, ECDH
      (:file "wire")        ; BOLT #1: readers/writers, BigSize, TLV, message envelope
      (:file "transport")   ; BOLT #8: Noise_XK handshake + encrypted transport
      (:file "features")    ; BOLT #9: feature bits and their negotiation rules

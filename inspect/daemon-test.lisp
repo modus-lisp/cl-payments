@@ -59,7 +59,7 @@
    side eventually do the right thing'."
   (loop repeat (* 20 seconds)
         do (when (funcall pred) (return (ok label t)))
-           (sleep 0.05)
+           (cl-consensus.netloop:pause-for 0.05)
         finally (return (ok label nil (format nil "not within ~ds" seconds)))))
 
 (defun fresh-node (name port)

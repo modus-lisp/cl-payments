@@ -77,6 +77,41 @@
 (defvar *last-server-key* nil)
 (defvar *last-client-key* nil)
 
+#+modus
+(defun call-with-pair (fn &key client-features server-features)
+  "CALL-WITH-PAIR on modus: one thread is both ends.  The listener's callback
+   runs as the net layer is pumped and the responder's handshake runs as its
+   bytes arrive (p:accept-async), so the client below can dial it without
+   either side blocking the other."
+  (let* ((port (free-port))
+         (server-key (setf *last-server-key* (c:generate-key)))
+         (client-key (setf *last-client-key* (c:generate-key)))
+         (server-peer nil)
+         (server-err nil))
+    (cl-payments.modus-net:expose
+     (lambda (stream peer-plist)
+       (declare (ignore peer-plist))
+       (p:accept-async stream server-key
+                       (lambda (pr) (setf server-peer pr) (p:start-read-loop pr))
+                       :features server-features :log nil
+                       :on-error (lambda (e) (setf server-err e))))
+     :host "127.0.0.1" :port port)
+    (let ((client (p:connect "127.0.0.1" port
+                             (c:compressed-pubkey (c:pubkey-of server-key))
+                             client-key
+                             :features client-features
+                             :log nil :read-loop t)))
+      (cl-consensus.netloop:wait-until (lambda () (or server-peer server-err)) :timeout 20)
+      (when server-err (error "responder failed: ~a" server-err))
+      (unwind-protect
+           (progn
+             (dolist (pr (list client server-peer))
+               (when (and pr (p:peer-last-error pr))
+                 (format t "~&        (read loop: ~a)~%" (p:peer-last-error pr))))
+             (funcall fn client server-peer))
+        (ignore-errors (p:disconnect client))))))
+
+#-modus
 (defun call-with-pair (fn &key client-features server-features)
   (let* ((port (free-port))
          (server-key (setf *last-server-key* (c:generate-key)))
@@ -161,12 +196,12 @@
       (p:on server :pong (lambda (pr pl) (declare (ignore pr pl)) (incf server-pongs)))
       (p:ping client :num-pong-bytes 64)
       (p:ping server :num-pong-bytes 16)
-      (sleep 3)
+      (cl-consensus.netloop:pause-for 3)
       (ok "client got a pong from the server" (= client-pongs 1))
       (ok "server got a pong from the client" (= server-pongs 1))
       ;; Above the framing limit a pong cannot be sent, so silence is correct.
       (p:ping client :num-pong-bytes 65532)
-      (sleep 2)
+      (cl-consensus.netloop:pause-for 2)
       (ok "a ping above the amplification limit is not answered" (= client-pongs 1)))))
 
 (defun test-large-messages ()
@@ -178,11 +213,11 @@
       ;; the message type and the AEAD tag.
       (let ((big (make-array 65000 :element-type '(unsigned-byte 8) :initial-element 7)))
         (p:send-message client 32000 big)
-        (sleep 3)
+        (cl-consensus.netloop:pause-for 3)
         (ok "a 65000-byte payload arrives intact" (eql got 65000)))
       (setf got nil)
       (p:send-message client 32000 #())
-      (sleep 2)
+      (cl-consensus.netloop:pause-for 2)
       (ok "a zero-length payload arrives" (eql got 0)))))
 
 (defun test-key-rotation ()
@@ -196,7 +231,7 @@
       ;; decryption failure exactly at message 1000, not before.
       (dotimes (i 1100)
         (p:send-message client 32001 (c:octets (vector (mod i 256)))))
-      (loop repeat 60 until (>= n 1100) do (sleep 0.5))
+      (loop repeat 60 until (>= n 1100) do (cl-consensus.netloop:pause-for 0.5))
       (ok "all 1100 messages decrypted (rotation stayed in sync)" (= n 1100))
       (ok "sender's nonce wrapped past the rotation point"
           (< (tp:noise-sn (p:peer-session client)) 1100))
@@ -208,13 +243,13 @@
   (with-pair (client server)
     ;; The dial timeout is 10s.  If it leaks into the read loop, this kills the
     ;; connection and it presents as the peer dropping us.
-    (sleep 14)
+    (cl-consensus.netloop:pause-for 14)
     (ok "still alive after 14s of silence"
         (and (p:peer-alive-p client) (p:peer-alive-p server)))
     (let ((pongs 0))
       (p:on client :pong (lambda (pr pl) (declare (ignore pr pl)) (incf pongs)))
       (p:ping client)
-      (sleep 3)
+      (cl-consensus.netloop:pause-for 3)
       (ok "and still usable" (= pongs 1)))))
 
 (defun test-error-propagation ()
@@ -223,13 +258,13 @@
     (let ((seen nil))
       (p:on client :warning (lambda (pr pl) (declare (ignore pr)) (setf seen pl)))
       (p:send-warning server "just a warning")
-      (sleep 2)
+      (cl-consensus.netloop:pause-for 2)
       (ok "a warning is delivered" (not (null seen)))
       (ok "a warning does NOT close the connection" (p:peer-alive-p client))))
   (with-pair (client server)
     ;; An `error` with an all-zero channel_id means the whole connection.
     (p:send-error server "fatal, going away")
-    (sleep 3)
+    (cl-consensus.netloop:pause-for 3)
     (ok "an error with a zero channel_id closes the connection"
         (not (p:peer-alive-p client)))))
 

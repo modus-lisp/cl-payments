@@ -39,7 +39,7 @@
    #:noise-send #:noise-recv #:noise-close #:noise-clear-timeout #:noise-wipe
    ;; driving it over a stream
    #:handshake-as-initiator #:handshake-as-responder
-   #:connect-peer #:accept-peer
+   #:connect-peer #:accept-peer #+modus #:accept-peer-async
    ;; conditions
    #:transport-error #:handshake-error #:peer-closed
    ;; constants
@@ -469,13 +469,57 @@
    TRANSPORT is passed through to cl-transport, so :tor dials .onion peers with
    no change here — the same arrangement cl-consensus's peer layer uses."
   (multiple-value-bind (stream closer)
-      (tr:dial host port :transport transport :timeout timeout)
+      #+modus (if (eq transport :direct)
+                  (cl-payments.modus-net:dial host port :timeout timeout)
+                  (tr:dial host port :transport transport :timeout timeout))
+      #-modus (tr:dial host port :transport transport :timeout timeout)
     (handler-bind ((error (lambda (e) (declare (ignore e))
                             (ignore-errors (funcall closer)))))
       (let ((session (handshake-as-initiator stream local-privkey
                                              (c:octets remote-node-id))))
         (setf (noise-closer session) closer)
         session))))
+
+#+modus
+(defun accept-peer-async (stream local-privkey on-session &key closer on-error)
+  "ACCEPT-PEER driven by input, for modus: the responder's acts run as their
+   bytes arrive, on the owner thread, and ON-SESSION gets the session.  It does
+   not wait, because on modus the initiator may be this same thread (a node
+   dialling itself, a loopback test) and a blocking read here would hold the
+   act-three it needs on the stack above."
+  (let* ((c (cl-payments.modus-net:stream-conn stream))
+         (hs (make-responder-handshake local-privkey))
+         (stage :act-one))
+    (flet ((fail (e)
+             (handshake-wipe hs)
+             (setf (cl-consensus.netloop:netconn-on-data c) nil)
+             (ignore-errors (close stream))
+             (when on-error (funcall on-error e))))
+      (setf (cl-consensus.netloop:netconn-on-data c)
+            (lambda (c)
+              (handler-case
+                  (c:with-ec-scratch
+                   (when (and (eq stage :act-one)
+                              (>= (cl-consensus.netloop:conn-available c) +act-one-size+))
+                     (act-one-read hs (%read-exactly stream +act-one-size+))
+                     (write-sequence (act-two-write hs) stream)
+                     (force-output stream)
+                     (setf stage :act-three))
+                   (when (and (eq stage :act-three)
+                              (>= (cl-consensus.netloop:conn-available c) +act-three-size+))
+                     (let ((session (act-three-read hs (%read-exactly stream +act-three-size+))))
+                       (handshake-wipe hs)
+                       (setf stage :done
+                             (cl-consensus.netloop:netconn-on-data c) nil
+                             (noise-stream session) stream
+                             (noise-closer session) closer)
+                       (funcall on-session session)))
+                   (when (and (not (eq stage :done)) (cl-consensus.netloop:netconn-eof c))
+                     (error 'peer-closed)))
+                (error (e) (fail e)))))
+      ;; Bytes may already be buffered.
+      (funcall (cl-consensus.netloop:netconn-on-data c) c))
+    nil))
 
 (defun accept-peer (stream local-privkey &key closer)
   "Complete the responder side of the handshake on an already-accepted STREAM."

@@ -8,6 +8,9 @@
 ;;;;   CLP_PORT     port to listen on                        (default 9935)
 ;;;;   CLP_NETWORK  mainnet | testnet | signet | regtest     (default signet)
 ;;;;   CLP_BITCOIN_CLI  "bitcoin-cli -signet -datadir=..." — the chain view (optional)
+;;;;   CLP_BITCOIN_RPC  host:port of bitcoind's JSON-RPC — the chain view without a
+;;;;                    subprocess (what modus uses); with CLP_BITCOIN_COOKIE, the
+;;;;                    path of bitcoind's .cookie
 ;;;;   CLP_CONTROL_PORT localhost control socket, one form per line (optional)
 ;;;;   CLP_FUNDING_DEPTH confirmations before a funding counts (default 3)
 ;;;;   CLP_TOWERS       comma-separated host:port control sockets of watchtowers
@@ -38,24 +41,46 @@
     (format s "~d~%" (sb-posix:getpid)))
   ;; A chain view, if we were told where bitcoind is.  Without one the daemon
   ;; still runs — it just cannot confirm fundings, see closes, or punish.
-  (let ((cli (env "CLP_BITCOIN_CLI")))
-    (when cli
-      (setf (cl-payments.node:node-chain node) (cl-payments.chain:make-bitcoind cli))
-      (format t "~&chain view: ~a~%" cli)))
+  (let ((cli (env "CLP_BITCOIN_CLI")) (rpc (env "CLP_BITCOIN_RPC")))
+    (cond
+      (rpc
+       (let ((colon (position #\: rpc :from-end t)))
+         (setf (cl-payments.node:node-chain node)
+               (cl-payments.chain:make-bitcoind-rpc (subseq rpc 0 colon) (parse-integer (subseq rpc (1+ colon)))
+                                                    :cookie-file (env "CLP_BITCOIN_COOKIE")))
+         (format t "~&chain view: JSON-RPC ~a~%" rpc)))
+      (cli
+       (setf (cl-payments.node:node-chain node) (cl-payments.chain:make-bitcoind cli))
+       (format t "~&chain view: ~a~%" cli))))
   (let ((d (env "CLP_FUNDING_DEPTH"))) (when d (setf (cl-payments.node:node-funding-depth node) (parse-integer d))))
   (let ((towers (env "CLP_TOWERS")))
     (when towers
       (setf (cl-payments.node:node-towers node) (uiop:split-string towers :separator ","))
       (format t "~&towers: ~a~%" towers)))
   (cl-payments.node:start node)
-  (when (cl-payments.node:node-chain node) (cl-payments.node:start-watcher node))
+  #-modus (when (cl-payments.node:node-chain node) (cl-payments.node:start-watcher node))
   ;; The control socket: one s-expression per line on localhost.
   (let ((cp (env "CLP_CONTROL_PORT")))
     (when cp (cl-payments.node:start-control-server node (parse-integer cp))))
   ;; Commands arrive as files; see RUN-COMMAND-LOOP.  Its own thread, so the
-  ;; main one stays free to keep the process alive.
+  ;; main one stays free to keep the process alive.  (Not on modus: the control
+  ;; socket is the command channel there.)
+  #-modus
   (bordeaux-threads:make-thread (lambda () (cl-payments.node:run-command-loop node))
                                 :name "clp-commands")
+  ;; modus: this thread IS the node.  Dial, then pump the net layer (which runs
+  ;; every peer's and the control socket's handlers) and tick the watcher.
+  #+modus
+  (let ((uri (env "CLP_CONNECT")))
+    (when uri
+      (handler-case (cl-payments.node:connect-to node uri)
+        (error (e) (format t "~&outbound to ~a failed: ~a~%" uri e))))
+    (loop
+      (cl-consensus.netloop:pause-for 3)
+      (when (cl-payments.node:node-chain node)
+        (handler-case (cl-payments.node::watch-once node)
+          (error (e) (format t "~&watcher: ~a~%" e))))))
+  #-modus
   (let ((uri (env "CLP_CONNECT")))
     (when uri
       ;; Dial on its OWN thread: this one has to stay free to keep the process

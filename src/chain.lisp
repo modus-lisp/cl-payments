@@ -21,7 +21,7 @@
   (:export
    #:chain-height #:chain-block-txs #:chain-txout-unspent-p #:chain-broadcast
    #:chain-confirmations #:chain-tx-position #:chain-feerate #:chain-error
-   #:bitcoind #:make-bitcoind
+   #:bitcoind #:make-bitcoind #:make-bitcoind-rpc
    #:mock-chain #:make-mock-chain #:mock-mine #:mock-mempool))
 
 (in-package #:cl-payments.chain)
@@ -52,8 +52,10 @@
 ;;; ----------------------------------------------------------------------------
 
 (defclass bitcoind ()
-  ((command :initarg :command :reader bitcoind-command
-            :documentation "bitcoin-cli and its fixed arguments, as a list.")))
+  ((command :initarg :command :initform nil :reader bitcoind-command
+            :documentation "bitcoin-cli and its fixed arguments, as a list.")
+   (rpc :initarg :rpc :initform nil :reader bitcoind-rpc
+        :documentation "(host port authorization) to speak JSON-RPC directly, or NIL.")))
 
 (defun make-bitcoind (command-string)
   "COMMAND-STRING like \"/path/bitcoin-cli -signet -datadir=/x\"."
@@ -63,6 +65,8 @@
   "Run bitcoin-cli.  On failure the error carries bitcoind's own message —
    \"non-BIP68-final\", \"bad-txns-inputs-missingorspent\" — which is the only
    thing that distinguishes a sweep sent too early from one sent too late."
+  (when (bitcoind-rpc chain)
+    (return-from %cli (apply #'%rpc chain args)))
   (multiple-value-bind (out err code)
       (uiop:run-program (append (bitcoind-command chain) (remove "" args :test #'string=))
                         :output :string :error-output :string :ignore-error-status t)
@@ -71,11 +75,18 @@
         (error 'chain-error :detail (format nil "bitcoin-cli ~a: ~a" (first args)
                                             (string-trim '(#\Newline #\Space) err))))))
 
+(defun %json-value-start (json key)
+  "Where KEY's value starts in JSON -- after `\"key\":` and any spaces (bitcoin-cli
+   pretty-prints `\"key\": v`, the RPC answers `\"key\":v`) -- or NIL."
+  (let* ((k (format nil "\"~a\":" key)) (at (search k json)))
+    (when at
+      (position #\Space json :start (+ at (length k)) :test-not #'char=))))
+
 (defun %json-field (json key)
   "One string or number field out of flat JSON, without a JSON dependency."
-  (let* ((k (format nil "\"~a\": " key)) (at (search k json)))
-    (when at
-      (let ((start (+ at (length k))))
+  (let ((start (%json-value-start json key)))
+    (when start
+      (progn
         (if (char= (char json start) #\")
             (subseq json (1+ start) (position #\" json :start (1+ start)))
             (parse-integer json :start start :junk-allowed t))))))
@@ -111,11 +122,89 @@
 
 (defun %json-decimal (json key)
   "A decimal-number field as satoshis, or NIL."
-  (let* ((k (format nil "\"~a\": " key)) (at (search k json)))
-    (when at
-      (let* ((start (+ at (length k)))
-             (end (position-if-not (lambda (ch) (or (digit-char-p ch) (char= ch #\.))) json :start start)))
+  (let ((start (%json-value-start json key)))
+    (when start
+      (let* ((end (position-if-not (lambda (ch) (or (digit-char-p ch) (char= ch #\.))) json :start start)))
         (ignore-errors (%btc->sat (subseq json start end)))))))
+
+
+;;; bitcoind's JSON-RPC, spoken directly.  For a Lisp that cannot run a
+;;; subprocess (modus has no fork), and one fewer moving part anywhere.  %CLI
+;;; calls it with bitcoin-cli's arguments and gets bitcoin-cli's answer back: the
+;;; RESULT's own text, taken out of the response unparsed, so a decimal stays the
+;;; exact string %BTC->SAT expects.
+
+(defun make-bitcoind-rpc (host port &key cookie-file user password)
+  "A chain view over bitcoind's JSON-RPC at HOST:PORT, authenticated by its
+   COOKIE-FILE (datadir/<chain>/.cookie) or USER and PASSWORD."
+  (let ((cred (if cookie-file
+                  (string-trim '(#\Newline #\Return #\Space)
+                               (with-open-file (s cookie-file) (read-line s)))
+                  (format nil "~a:~a" user password))))
+    (make-instance 'bitcoind :rpc (list host port (%base64 (map 'vector #'char-code cred))))))
+
+(defun %base64 (octets)
+  (let ((alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        (out (make-string-output-stream)))
+    (loop for i from 0 below (length octets) by 3
+          for n = (min 3 (- (length octets) i))
+          for w = (logior (ash (aref octets i) 16)
+                          (ash (if (> n 1) (aref octets (+ i 1)) 0) 8)
+                          (if (> n 2) (aref octets (+ i 2)) 0))
+          do (dotimes (k 4)
+               (write-char (if (<= k n) (char alphabet (ldb (byte 6 (- 18 (* 6 k))) w)) #\=) out)))
+    (get-output-stream-string out)))
+
+(defun %rpc-param (arg)
+  "A bitcoin-cli argument as the JSON value the RPC wants: a short integer or a
+   boolean as itself, anything else (a txid, an address, hex) as a string."
+  (cond ((string= arg "true") "true")
+        ((string= arg "false") "false")
+        ((and (plusp (length arg)) (< (length arg) 16) (every #'digit-char-p arg)) arg)
+        (t (format nil "\"~a\"" arg))))
+
+(defun %http-post (host port authorization body)
+  "POST BODY to http://HOST:PORT/ and return the response body as a string."
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+        (octets (map '(vector (unsigned-byte 8)) #'char-code body)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address host) port)
+           (let* ((head (format nil "POST / HTTP/1.1~c~cHost: ~a:~d~c~cAuthorization: Basic ~a~c~cContent-Type: text/plain~c~cContent-Length: ~d~c~cConnection: close~c~c~c~c"
+                                #\Return #\Newline host port #\Return #\Newline authorization #\Return #\Newline
+                                #\Return #\Newline (length octets) #\Return #\Newline #\Return #\Newline #\Return #\Newline))
+                  (req (concatenate '(vector (unsigned-byte 8)) (map 'vector #'char-code head) octets)))
+             (let ((off 0))
+               (loop while (< off (length req))
+                     do (incf off (sb-bsd-sockets:socket-send sock (subseq req off) (- (length req) off))))))
+           (let ((buf (make-array 65536 :element-type '(unsigned-byte 8)))
+                 (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer t)))
+             (loop (let ((n (nth-value 1 (sb-bsd-sockets:socket-receive sock buf 65536))))
+                     (when (or (null n) (zerop n)) (return))
+                     (loop for i below n do (vector-push-extend (aref buf i) out))))
+             (let* ((text (map 'string #'code-char out))
+                    (split (search (format nil "~c~c~c~c" #\Return #\Newline #\Return #\Newline) text)))
+               (unless split (error 'chain-error :detail "bitcoind: malformed HTTP response"))
+               (subseq text (+ split 4)))))
+      (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+
+(defun %rpc (chain method &rest args)
+  (destructuring-bind (host port auth) (bitcoind-rpc chain)
+    (let* ((body (format nil "{\"jsonrpc\":\"1.0\",\"id\":\"clp\",\"method\":\"~a\",\"params\":[~{~a~^,~}]}"
+                         method (mapcar #'%rpc-param (remove "" args :test #'string=))))
+           (reply (%http-post host port auth body))
+           (r (search "\"result\":" reply))
+           (e (search ",\"error\":" reply :from-end t)))
+      (unless (and r e) (error 'chain-error :detail (format nil "bitcoind ~a: ~a" method reply)))
+      (let ((err (subseq reply (+ e 9))))
+        (unless (eql 0 (search "null" err))
+          (error 'chain-error :detail (format nil "bitcoin-cli ~a: ~a" method
+                                              (or (ignore-errors (%json-field err "message")) err)))))
+      (let ((result (string-trim " " (subseq reply (+ r 9) e))))
+        (cond ((string= result "null") "")
+              ((and (plusp (length result)) (char= (char result 0) #\"))
+               (subseq result 1 (1- (length result))))
+              (t result))))))
 
 (defmethod chain-feerate ((chain bitcoind))
   ;; estimatesmartfee answers in BTC/kvB, or with an "errors" field when it has
